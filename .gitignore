@@ -1,0 +1,4 @@
+/target
+
+# gnosis index artifacts (durable db + derived ANN indexes)
+.gnosis/

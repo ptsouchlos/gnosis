@@ -1,0 +1,12 @@
+[package]
+name = "gnosis"
+version = "0.1.0"
+edition = "2024"
+description = "Local semantic search and related-notes for a markdown knowledge base"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
