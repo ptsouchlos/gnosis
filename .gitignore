@@ -2,3 +2,6 @@
 
 # gnosis index artifacts (durable db + derived ANN indexes)
 .gnosis/
+
+# fastembed model cache, in case it ever falls back to the cwd default
+.fastembed_cache/
