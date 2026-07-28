@@ -1,3 +1,4 @@
+mod chunk;
 mod cli;
 mod config;
 mod store;
