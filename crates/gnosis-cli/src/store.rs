@@ -1,3 +1,8 @@
+//! This module defines how we store documents and chunks into a database.
+//! For now this is done with vanilla SQLite.
+
+// TODO: In the future consider using something like [sqlite-vec](https://github.com/asg017/sqlite-vec)
+// for faster vector search/retrieval.
 use std::collections::HashMap;
 use std::path::Path;
 
