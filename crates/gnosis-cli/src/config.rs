@@ -10,9 +10,11 @@ pub const CONFIG_FILE: &str = "gnosis.toml";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Root directory of the knowledge base to index.
-    pub vault: PathBuf,
-    /// Directory (relative to `vault`) holding the SQLite db and ANN indexes.
+    /// Knowledge-base roots to index. In local mode this is a single entry
+    /// (defaulting to "."); in global mode it may list several vaults.
+    pub vaults: Vec<PathBuf>,
+    /// Directory (relative to the config location) holding the SQLite db and
+    /// ANN indexes.
     pub db_dir: PathBuf,
     pub embed: EmbedConfig,
     pub chunk: ChunkConfig,
@@ -70,7 +72,7 @@ pub struct ObsidianConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            vault: PathBuf::from("."),
+            vaults: vec![PathBuf::from(".")],
             db_dir: PathBuf::from(".gnosis"),
             embed: EmbedConfig::default(),
             chunk: ChunkConfig::default(),
@@ -164,15 +166,5 @@ impl Config {
     /// Serialize the config to TOML.
     pub fn to_toml(&self) -> Result<String> {
         toml::to_string_pretty(self).context("serializing config")
-    }
-
-    /// Absolute path to the database/index directory.
-    pub fn db_dir(&self) -> PathBuf {
-        self.vault.join(&self.db_dir)
-    }
-
-    /// Path to the SQLite database file.
-    pub fn db_path(&self) -> PathBuf {
-        self.db_dir().join("gnosis.db")
     }
 }
