@@ -4,12 +4,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
-use crate::chunk::chunk_markdown;
 use crate::embed::{Embedder, TextEmbedder};
 use crate::parse::parse_markdown;
 use crate::store::{ChunkWrite, DocWrite, Store};
 use crate::walk::{self, DocKind};
 use crate::workspace::Workspace;
+use chunker;
 
 /// Outcome of an indexing run.
 #[derive(Debug, Default)]
@@ -109,7 +109,7 @@ fn index_file(
 ) -> Result<usize> {
     let content = String::from_utf8_lossy(bytes);
     let parsed = parse_markdown(std::path::Path::new(path_str), &content);
-    let chunks = chunk_markdown(&parsed.body, chunk_cfg.max_tokens, chunk_cfg.overlap);
+    let chunks = chunker::chunk_markdown(&parsed.body, chunk_cfg.max_tokens, chunk_cfg.overlap);
 
     // Prepend the heading trail so chunks carry their structural context.
     let texts: Vec<String> = chunks

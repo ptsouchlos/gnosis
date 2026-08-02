@@ -1,3 +1,10 @@
 [workspace]
 members = ["crates/gnosis-cli"]
 resolver = "3"
+
+[workspace.dependencies]
+# Workspace member crates
+chunker = { path = "crates/gnosis-chunker" }
+
+# dependencies
+pulldown-cmark = "0.13.4"

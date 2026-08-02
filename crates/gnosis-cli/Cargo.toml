@@ -9,6 +9,8 @@ name = "gnosis"
 path = "src/main.rs"
 
 [dependencies]
+chunker = { workspace = true }
+
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -17,5 +19,4 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 fastembed = "5.17.2"
 ignore = "0.4.26"
 blake3 = "1.8.5"
-pulldown-cmark = "0.13.4"
 dirs = "6.0.0"
