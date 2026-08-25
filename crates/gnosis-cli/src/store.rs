@@ -3,11 +3,11 @@
 
 // TODO: In the future consider using something like [sqlite-vec](https://github.com/asg017/sqlite-vec)
 // for faster vector search/retrieval.
-use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use search::{Candidate, Hit};
 
 /// Bumped whenever the schema changes in a backward-incompatible way.
 pub const SCHEMA_VERSION: i64 = 1;
@@ -35,34 +35,6 @@ pub struct ChunkWrite {
     pub text: Option<String>,
     pub heading_path: String,
     pub vector: Vec<f32>,
-}
-
-/// One ranked search result (best chunk per document).
-#[derive(Debug)]
-pub struct SearchHit {
-    pub path: String,
-    pub title: String,
-    pub source_root: String,
-    pub heading_path: String,
-    pub text: String,
-    pub score: f32,
-}
-
-/// Encode an f32 vector as little-endian bytes for BLOB storage.
-fn vec_to_blob(v: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(v.len() * 4);
-    for x in v {
-        bytes.extend_from_slice(&x.to_le_bytes());
-    }
-    bytes
-}
-
-/// Decode a little-endian f32 BLOB back into a vector.
-fn blob_to_vec(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
 }
 
 /// Wraps the SQLite connection that is gnosis's durable source of truth.
@@ -292,7 +264,7 @@ impl Store {
                     c.modality,
                     c.text,
                     c.heading_path,
-                    vec_to_blob(&c.vector),
+                    search::vec_to_blob(&c.vector),
                 ],
             )?;
         }
@@ -324,7 +296,7 @@ impl Store {
         query: &[f32],
         limit: usize,
         from: Option<&[String]>,
-    ) -> Result<Vec<SearchHit>> {
+    ) -> Result<Vec<Hit>> {
         let mut sql = String::from(
             "SELECT d.path, d.title, d.source_root, c.heading_path, c.text, c.vector
              FROM chunks c JOIN documents d ON d.id = c.doc_id
@@ -340,57 +312,29 @@ impl Store {
 
         let mut stmt = self.conn.prepare(&sql)?;
         let map_row = |r: &rusqlite::Row<'_>| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, Option<String>>(4)?,
-                r.get::<_, Vec<u8>>(5)?,
-            ))
+            Ok(Candidate {
+                path: r.get::<_, String>(0)?,
+                title: r.get::<_, String>(1)?,
+                source_root: r.get::<_, String>(2)?,
+                heading_path: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                text: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                vector: search::blob_to_vec(&r.get::<_, Vec<u8>>(5)?),
+            })
         };
-        let rows = match filter {
-            Some(roots) => stmt.query_map(rusqlite::params_from_iter(roots), map_row)?,
-            None => stmt.query_map([], map_row)?,
+        let candidates: Vec<Candidate> = match filter {
+            Some(roots) => stmt
+                .query_map(rusqlite::params_from_iter(roots), map_row)?
+                .collect::<rusqlite::Result<_>>()?,
+            None => stmt.query_map([], map_row)?.collect::<rusqlite::Result<_>>()?,
         };
 
-        let mut best: HashMap<String, SearchHit> = HashMap::new();
-        for row in rows {
-            let (path, title, source_root, heading_path, text, blob) = row?;
-            let score = dot(query, &blob_to_vec(&blob));
-            let entry = best.entry(path.clone()).or_insert_with(|| SearchHit {
-                path,
-                title,
-                source_root,
-                heading_path: String::new(),
-                text: String::new(),
-                score: f32::NEG_INFINITY,
-            });
-            if score > entry.score {
-                entry.score = score;
-                entry.heading_path = heading_path.unwrap_or_default();
-                entry.text = text.unwrap_or_default();
-            }
-        }
-
-        let mut hits: Vec<SearchHit> = best.into_values().collect();
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
-        hits.truncate(limit);
-        Ok(hits)
+        Ok(search::rank(query, candidates, limit))
     }
 }
 
 /// Build `?,?,...` placeholders for an SQL `IN` clause of length `n`.
 fn in_placeholders(n: usize) -> String {
     std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
-}
-
-/// Dot product of two equal-length vectors (0.0 on length mismatch).
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() {
-        return 0.0;
-    }
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
 #[cfg(test)]

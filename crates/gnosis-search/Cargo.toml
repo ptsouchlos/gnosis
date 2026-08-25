@@ -1,0 +1,5 @@
+[package]
+name = "search"
+version = "0.1.0"
+edition = "2024"
+description = "Vector scoring and ranking shared across gnosis front-ends"

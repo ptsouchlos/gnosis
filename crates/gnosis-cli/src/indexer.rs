@@ -5,11 +5,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 
 use crate::embed::{Embedder, TextEmbedder};
-use crate::parse::parse_markdown;
 use crate::store::{ChunkWrite, DocWrite, Store};
 use crate::walk::{self, DocKind};
 use crate::workspace::Workspace;
 use chunker;
+use parse::parse_markdown;
 
 /// Outcome of an indexing run.
 #[derive(Debug, Default)]

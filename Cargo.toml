@@ -5,6 +5,8 @@ resolver = "3"
 [workspace.dependencies]
 # Workspace member crates
 chunker = { path = "crates/gnosis-chunker" }
+parse = { path = "crates/gnosis-parse" }
+search = { path = "crates/gnosis-search" }
 
 # dependencies
 pulldown-cmark = "0.13.4"

@@ -3,7 +3,6 @@ mod commands;
 mod config;
 mod embed;
 mod indexer;
-mod parse;
 mod store;
 mod walk;
 mod workspace;
