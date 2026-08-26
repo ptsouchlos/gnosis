@@ -1,0 +1,9 @@
+[infra]
+remote = "https://github.com/ptsouchlos/infra"
+commit_hash = "79932afc417d21900038dcd8f8154c3661c15f76"
+folder = "infra"
+allow_untracked = false
+include = [
+    "just/**",
+    "rust/**",
+]
