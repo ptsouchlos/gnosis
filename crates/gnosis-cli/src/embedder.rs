@@ -3,19 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
-/// An embedder produces L2-normalized vectors for a single vector space,
-/// so cosine similarity reduces to a dot product.
-pub trait Embedder {
-    /// The vector space this embedder feeds (e.g. "text", "image").
-    fn space(&self) -> &str;
-    /// Dimensionality of the produced vectors.
-    fn dim(&self) -> usize;
-    /// Identifier of the underlying model, stored in `meta` to guard against
-    /// mixing vectors from different models in one index.
-    fn model_id(&self) -> &str;
-    /// Embed a batch of inputs, preserving order.
-    fn embed(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>>;
-}
+pub use embed::Embedder;
 
 /// Text embedder backed by a local fastembed (ONNX) model.
 pub struct TextEmbedder {

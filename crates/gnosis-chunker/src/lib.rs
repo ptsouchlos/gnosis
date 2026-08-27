@@ -1,4 +1,22 @@
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
+use serde::{Deserialize, Serialize};
+
+/// Chunking configuration: target chunk size and overlap, in ~tokens (words).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChunkConfig {
+    pub max_tokens: usize,
+    pub overlap: usize,
+}
+
+impl Default for ChunkConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens: 384,
+            overlap: 64,
+        }
+    }
+}
 
 /// A unit of text to embed, with the heading trail it came from.
 #[derive(Debug, Clone)]
@@ -141,6 +159,13 @@ fn window(text: &str, max_tokens: usize, overlap: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn chunk_config_default_matches_previous_values() {
+        let cfg = super::ChunkConfig::default();
+        assert_eq!(cfg.max_tokens, 384);
+        assert_eq!(cfg.overlap, 64);
+    }
+
     #[test]
     fn test_window() {
         let text = "The quick brown fox jumps over the lazy dog";

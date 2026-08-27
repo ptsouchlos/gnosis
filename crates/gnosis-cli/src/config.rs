@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use chunker::ChunkConfig;
+use embed::EmbedConfig;
 use serde::{Deserialize, Serialize};
 
 /// Default config file name, looked up relative to the current directory.
@@ -21,33 +23,6 @@ pub struct Config {
     pub pdf: PdfConfig,
     pub ignore: IgnoreConfig,
     pub obsidian: ObsidianConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct EmbedConfig {
-    pub text: TextEmbedConfig,
-    pub image: ImageEmbedConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct TextEmbedConfig {
-    pub model: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ImageEmbedConfig {
-    pub enabled: bool,
-    pub model: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ChunkConfig {
-    pub max_tokens: usize,
-    pub overlap: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,41 +54,6 @@ impl Default for Config {
             pdf: PdfConfig::default(),
             ignore: IgnoreConfig::default(),
             obsidian: ObsidianConfig::default(),
-        }
-    }
-}
-
-impl Default for EmbedConfig {
-    fn default() -> Self {
-        Self {
-            text: TextEmbedConfig::default(),
-            image: ImageEmbedConfig::default(),
-        }
-    }
-}
-
-impl Default for TextEmbedConfig {
-    fn default() -> Self {
-        Self {
-            model: "bge-small-en-v1.5".to_string(),
-        }
-    }
-}
-
-impl Default for ImageEmbedConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            model: "clip-vit-b-32".to_string(),
-        }
-    }
-}
-
-impl Default for ChunkConfig {
-    fn default() -> Self {
-        Self {
-            max_tokens: 384,
-            overlap: 64,
         }
     }
 }

@@ -2,7 +2,8 @@
 name = "chunker"
 version = "0.1.0"
 edition = "2024"
-description = "Local semantic search and related-notes for a markdown knowledge base"
+description = "Markdown chunking shared across gnosis front-ends"
 
 [dependencies]
 pulldown-cmark = { workspace = true }
+serde = { workspace = true }

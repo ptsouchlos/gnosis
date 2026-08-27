@@ -1,0 +1,9 @@
+[package]
+name = "embed"
+version = "0.1.0"
+edition = "2024"
+description = "Embedder trait and embedding config shared across gnosis front-ends"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }

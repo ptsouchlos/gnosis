@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
-use crate::embed::{Embedder, TextEmbedder};
+use crate::embedder::{Embedder, TextEmbedder};
 use crate::store::{ChunkWrite, DocWrite, Store};
 use crate::walk::{self, DocKind};
 use crate::workspace::Workspace;
@@ -105,7 +105,7 @@ fn index_file(
     source_root: &str,
     kind: DocKind,
     bytes: &[u8],
-    chunk_cfg: &crate::config::ChunkConfig,
+    chunk_cfg: &chunker::ChunkConfig,
 ) -> Result<usize> {
     let content = String::from_utf8_lossy(bytes);
     let parsed = parse_markdown(std::path::Path::new(path_str), &content);

@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::embed::{Embedder, TextEmbedder};
+use crate::embedder::{Embedder, TextEmbedder};
 use crate::store::Store;
 use crate::workspace::{Workspace, expand_tilde};
 
