@@ -1,6 +1,8 @@
-//! This module defines how we store documents and chunks into a database.
-//! For now this is done with vanilla SQLite.
-
+//! SQLite-backed [`Store`] implementation. Native (depends on `rusqlite`), so
+//! it lives in the CLI binary crate rather than the `store` interface crate —
+//! mirrors how `embedder.rs`'s `TextEmbedder` (native, fastembed/ort-backed)
+//! stays out of the `embed` interface crate.
+//!
 // TODO: In the future consider using something like [sqlite-vec](https://github.com/asg017/sqlite-vec)
 // for faster vector search/retrieval.
 use std::path::Path;
@@ -8,50 +10,18 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use search::{Candidate, Hit};
+use store::{DocWrite, Stats};
+pub use store::Store;
 
 /// Bumped whenever the schema changes in a backward-incompatible way.
 pub const SCHEMA_VERSION: i64 = 1;
 
-/// A document about to be written, with its parsed chunks.
-pub struct DocWrite<'a> {
-    pub path: &'a str,
-    pub kind: &'a str,
-    /// Canonical vault root this document was discovered under.
-    pub source_root: &'a str,
-    pub content_hash: &'a [u8],
-    pub mtime: i64,
-    pub title: &'a str,
-    pub frontmatter: Option<&'a str>,
-    pub indexed_at: i64,
-    pub chunks: &'a [ChunkWrite],
-    pub links: &'a [String],
-}
-
-/// A single chunk to persist, including its embedding.
-pub struct ChunkWrite {
-    pub ord: usize,
-    pub space: String,
-    pub modality: String,
-    pub text: Option<String>,
-    pub heading_path: String,
-    pub vector: Vec<f32>,
-}
-
-/// Wraps the SQLite connection that is gnosis's durable source of truth.
-pub struct Store {
+/// SQLite-backed [`Store`]; gnosis's durable source of truth.
+pub struct SqliteStore {
     conn: Connection,
 }
 
-/// Summary counts for the `status` command.
-#[derive(Debug, Default)]
-pub struct Stats {
-    pub documents: i64,
-    pub chunks_text: i64,
-    pub chunks_image: i64,
-    pub indexed_at: Option<i64>,
-}
-
-impl Store {
+impl SqliteStore {
     /// Open (creating if needed) the database at `path`, ensuring the parent
     /// directory exists and the schema is initialized.
     pub fn open(path: &Path) -> Result<Self> {
@@ -64,7 +34,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
 
-        let store = Store { conn };
+        let store = SqliteStore { conn };
         store.init_schema()?;
         Ok(store)
     }
@@ -114,9 +84,10 @@ impl Store {
         self.set_meta("schema_version", &SCHEMA_VERSION.to_string())?;
         Ok(())
     }
+}
 
-    /// Insert or update a meta key/value pair.
-    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+impl Store for SqliteStore {
+    fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -125,8 +96,7 @@ impl Store {
         Ok(())
     }
 
-    /// Fetch a meta value by key, if present.
-    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
+    fn get_meta(&self, key: &str) -> Result<Option<String>> {
         let value = self
             .conn
             .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
@@ -136,8 +106,7 @@ impl Store {
         Ok(value)
     }
 
-    /// Compute summary statistics for `status`.
-    pub fn stats(&self) -> Result<Stats> {
+    fn stats(&self) -> Result<Stats> {
         let documents = self
             .conn
             .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))?;
@@ -165,8 +134,7 @@ impl Store {
         })
     }
 
-    /// Existing content hash for `path`, if the document is already indexed.
-    pub fn document_hash(&self, path: &str) -> Result<Option<Vec<u8>>> {
+    fn document_hash(&self, path: &str) -> Result<Option<Vec<u8>>> {
         let hash = self
             .conn
             .query_row(
@@ -178,10 +146,7 @@ impl Store {
         Ok(hash)
     }
 
-    /// Document paths whose `source_root` is among `roots` (used to scope
-    /// deletion detection to the vaults walked in a run). Empty `roots` matches
-    /// nothing.
-    pub fn paths_for_roots(&self, roots: &[String]) -> Result<Vec<String>> {
+    fn paths_for_roots(&self, roots: &[String]) -> Result<Vec<String>> {
         if roots.is_empty() {
             return Ok(Vec::new());
         }
@@ -196,8 +161,7 @@ impl Store {
         Ok(paths)
     }
 
-    /// Document counts grouped by source vault, for `status`.
-    pub fn counts_by_root(&self) -> Result<Vec<(String, i64)>> {
+    fn counts_by_root(&self) -> Result<Vec<(String, i64)>> {
         let mut stmt = self.conn.prepare(
             "SELECT source_root, COUNT(*) FROM documents
              GROUP BY source_root ORDER BY source_root",
@@ -208,17 +172,14 @@ impl Store {
         Ok(rows)
     }
 
-    /// Delete every document (chunks/links cascade) belonging to `root`.
-    /// Returns the number of documents removed.
-    pub fn delete_by_root(&self, root: &str) -> Result<usize> {
+    fn delete_by_root(&self, root: &str) -> Result<usize> {
         let n = self
             .conn
             .execute("DELETE FROM documents WHERE source_root = ?1", [root])?;
         Ok(n)
     }
 
-    /// Insert or replace a document and all its chunks/links in one transaction.
-    pub fn replace_document(&mut self, doc: &DocWrite<'_>) -> Result<()> {
+    fn replace_document(&mut self, doc: &DocWrite<'_>) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO documents
@@ -280,23 +241,13 @@ impl Store {
         Ok(())
     }
 
-    /// Delete a document (chunks/links cascade) by path.
-    pub fn delete_document(&self, path: &str) -> Result<()> {
+    fn delete_document(&self, path: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM documents WHERE path = ?1", [path])?;
         Ok(())
     }
 
-    /// Brute-force cosine search over the text space. Vectors are stored
-    /// normalized, so a dot product is the cosine similarity. Returns the best
-    /// chunk per document, ranked descending, capped at `limit`. When `from` is
-    /// given, results are restricted to those source vault roots.
-    pub fn search_text(
-        &self,
-        query: &[f32],
-        limit: usize,
-        from: Option<&[String]>,
-    ) -> Result<Vec<Hit>> {
+    fn search_text(&self, query: &[f32], limit: usize, from: Option<&[String]>) -> Result<Vec<Hit>> {
         let mut sql = String::from(
             "SELECT d.path, d.title, d.source_root, c.heading_path, c.text, c.vector
              FROM chunks c JOIN documents d ON d.id = c.doc_id
@@ -341,7 +292,7 @@ fn in_placeholders(n: usize) -> String {
 mod tests {
     use super::*;
 
-    fn write_doc(store: &mut Store, path: &str, root: &str) {
+    fn write_doc(store: &mut SqliteStore, path: &str, root: &str) {
         store
             .replace_document(&DocWrite {
                 path,
@@ -367,7 +318,7 @@ mod tests {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
 
-        let mut store = Store::open(&path).unwrap();
+        let mut store = SqliteStore::open(&path).unwrap();
         write_doc(&mut store, "/a/1.md", "/a");
         write_doc(&mut store, "/a/2.md", "/a");
         write_doc(&mut store, "/b/1.md", "/b");

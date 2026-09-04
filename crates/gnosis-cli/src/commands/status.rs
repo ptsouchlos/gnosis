@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::store::Store;
+use crate::store::{SqliteStore, Store};
 use crate::workspace::Workspace;
 
 /// Show index statistics.
@@ -16,7 +16,7 @@ pub fn execute(ws: &Workspace, _args: StatusArgs) -> Result<()> {
         return Ok(());
     }
 
-    let store = Store::open(&ws.db_path)?;
+    let store = SqliteStore::open(&ws.db_path)?;
     let stats = store.stats()?;
     let text_model = store
         .get_meta("model.text")?

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use crate::store::Store;
+use crate::store::{SqliteStore, Store};
 use crate::workspace::{Workspace, expand_tilde};
 
 /// Remove a vault from the index and delete its documents.
@@ -32,7 +32,7 @@ pub fn execute(mut ws: Workspace, args: ForgetArgs) -> Result<()> {
     // Delete its documents from the database, if one exists.
     let mut removed_docs = 0;
     if ws.db_path.exists() {
-        let store = Store::open(&ws.db_path)?;
+        let store = SqliteStore::open(&ws.db_path)?;
         removed_docs = store.delete_by_root(&canon_str)?;
     }
 

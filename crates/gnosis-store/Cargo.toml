@@ -1,0 +1,9 @@
+[package]
+name = "store"
+version = "0.1.0"
+edition = "2024"
+description = "Durable document/chunk storage interface for gnosis"
+
+[dependencies]
+anyhow = { workspace = true }
+search = { workspace = true }

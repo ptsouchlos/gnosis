@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::embedder::{Embedder, TextEmbedder};
-use crate::store::Store;
+use crate::store::{SqliteStore, Store};
 use crate::workspace::{Workspace, expand_tilde};
 
 /// Semantic search over the indexed content.
@@ -36,7 +36,7 @@ pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
         );
     }
 
-    let store = Store::open(&ws.db_path)?;
+    let store = SqliteStore::open(&ws.db_path)?;
     let mut embedder = TextEmbedder::new(&ws.config.embed.text.model)?;
     let query_vec = embedder
         .embed(&[args.query.clone()])?
