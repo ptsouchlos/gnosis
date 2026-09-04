@@ -1,7 +1,7 @@
 mod cli;
 mod commands;
 mod config;
-mod embed;
+mod embedder;
 mod indexer;
 mod store;
 mod walk;

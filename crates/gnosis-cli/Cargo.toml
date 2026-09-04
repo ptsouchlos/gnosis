@@ -10,12 +10,13 @@ path = "src/main.rs"
 
 [dependencies]
 chunker = { workspace = true }
+embed = { workspace = true }
 parse = { workspace = true }
 search = { workspace = true }
 
-anyhow = "1"
+anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true }
 toml = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
 fastembed = "5.17.2"
