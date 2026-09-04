@@ -1,5 +1,13 @@
 [workspace]
-members = ["crates/gnosis-cli"]
+members = [
+    "crates/gnosis-cli",
+    "crates/gnosis-chunker",
+    "crates/gnosis-embed",
+    "crates/gnosis-parse",
+    "crates/gnosis-search",
+    "crates/gnosis-store",
+    "crates/gnosis-walk",
+]
 resolver = "3"
 
 [workspace.dependencies]
@@ -8,6 +16,8 @@ chunker = { path = "crates/gnosis-chunker" }
 embed = { path = "crates/gnosis-embed" }
 parse = { path = "crates/gnosis-parse" }
 search = { path = "crates/gnosis-search" }
+store = { path = "crates/gnosis-store" }
+walk = { path = "crates/gnosis-walk" }
 
 # dependencies
 anyhow = "1"

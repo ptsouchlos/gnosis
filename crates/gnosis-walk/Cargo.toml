@@ -1,0 +1,8 @@
+[package]
+name = "walk"
+version = "0.1.0"
+edition = "2024"
+description = "Vault file discovery interface for gnosis"
+
+[dependencies]
+anyhow = { workspace = true }

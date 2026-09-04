@@ -5,11 +5,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 
 use crate::embedder::{Embedder, TextEmbedder};
-use crate::store::{ChunkWrite, DocWrite, Store};
-use crate::walk::{self, DocKind};
+use crate::store::{SqliteStore, Store};
+use crate::walk::{FsWalker, Walker};
 use crate::workspace::Workspace;
 use chunker;
 use parse::parse_markdown;
+use store::{ChunkWrite, DocWrite};
+use walk::DocKind;
 
 /// Outcome of an indexing run.
 #[derive(Debug, Default)]
@@ -26,7 +28,8 @@ pub struct IndexReport {
 /// one vault never removes another's documents from a shared database.
 pub fn run(ws: &Workspace, roots: &[PathBuf], force: bool) -> Result<IndexReport> {
     let cfg = &ws.config;
-    let mut store = Store::open(&ws.db_path)?;
+    let mut store = SqliteStore::open(&ws.db_path)?;
+    let walker = FsWalker;
 
     let mut embedder = TextEmbedder::new(&cfg.embed.text.model)?;
     guard_model(&store, &embedder, force)?;
@@ -48,7 +51,7 @@ pub fn run(ws: &Workspace, roots: &[PathBuf], force: bool) -> Result<IndexReport
         let root_str = root_canon.to_string_lossy().to_string();
         walked_roots.push(root_str.clone());
 
-        let found = walk::discover(&root_canon, &cfg.ignore.globs)?;
+        let found = walker.discover(&root_canon, &cfg.ignore.globs)?;
         report.scanned += found.len();
 
         for file in &found {
@@ -99,7 +102,7 @@ pub fn run(ws: &Workspace, roots: &[PathBuf], force: bool) -> Result<IndexReport
 
 /// Parse, chunk, embed, and persist a single markdown file. Returns chunk count.
 fn index_file(
-    store: &mut Store,
+    store: &mut SqliteStore,
     embedder: &mut TextEmbedder,
     path_str: &str,
     source_root: &str,
@@ -159,7 +162,7 @@ fn index_file(
 }
 
 /// Refuse to mix vectors from a different model into an existing index.
-fn guard_model(store: &Store, embedder: &TextEmbedder, force: bool) -> Result<()> {
+fn guard_model(store: &SqliteStore, embedder: &TextEmbedder, force: bool) -> Result<()> {
     if force {
         return Ok(());
     }

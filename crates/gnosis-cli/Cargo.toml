@@ -13,6 +13,8 @@ chunker = { workspace = true }
 embed = { workspace = true }
 parse = { workspace = true }
 search = { workspace = true }
+store = { workspace = true }
+walk = { workspace = true }
 
 anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }
