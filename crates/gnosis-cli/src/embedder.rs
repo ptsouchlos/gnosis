@@ -30,6 +30,12 @@ impl TextEmbedder {
     }
 }
 
+/// Build the configured text embedder as a trait object, so callers (e.g. the
+/// `index` crate) stay agnostic to which concrete backend is in use.
+pub fn build_text_embedder(model_name: &str) -> Result<Box<dyn Embedder>> {
+    Ok(Box::new(TextEmbedder::new(model_name)?))
+}
+
 /// Stable per-user cache directory for downloaded models, so fastembed doesn't
 /// litter a `.fastembed_cache` in the current working directory. Falls back to
 /// fastembed's default when no cache dir can be determined.

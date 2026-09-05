@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::embedder::{Embedder, TextEmbedder};
+use crate::embedder::build_text_embedder;
 use crate::store::{SqliteStore, Store};
 use crate::workspace::{Workspace, expand_tilde};
 
@@ -37,7 +37,7 @@ pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
     }
 
     let store = SqliteStore::open(&ws.db_path)?;
-    let mut embedder = TextEmbedder::new(&ws.config.embed.text.model)?;
+    let mut embedder = build_text_embedder(&ws.config.embed.text.model)?;
     let query_vec = embedder
         .embed(&[args.query.clone()])?
         .into_iter()

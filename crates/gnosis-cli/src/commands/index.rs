@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
-use crate::indexer;
+use crate::embedder::build_text_embedder;
+use crate::fs::StdFs;
+use crate::store::SqliteStore;
+use crate::walk::FsWalker;
 use crate::workspace::{Workspace, expand_tilde};
 
 /// Build or incrementally update the index.
@@ -17,7 +20,21 @@ pub fn execute(mut ws: Workspace, args: IndexArgs) -> Result<()> {
     let roots = resolve_roots(&mut ws, args.path)?;
 
     println!("Indexing {} vault(s)…", roots.len());
-    let report = indexer::run(&ws, &roots, false)?;
+    let mut store = SqliteStore::open(&ws.db_path)?;
+    let mut embedder = build_text_embedder(&ws.config.embed.text.model)?;
+    let mut indexer_args = index::IndexerArgs {
+        store: &mut store,
+        walker: &FsWalker,
+        fs_reader: &StdFs,
+        embedder: embedder.as_mut(),
+    };
+    let report = index::run(
+        &mut indexer_args,
+        &roots,
+        &ws.config.ignore.globs,
+        &ws.config.chunk,
+        false,
+    )?;
     println!(
         "Done: {} scanned, {} (re)indexed, {} unchanged, {} removed, {} chunks.",
         report.scanned, report.indexed, report.skipped, report.deleted, report.chunks

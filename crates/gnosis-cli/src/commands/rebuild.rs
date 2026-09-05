@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, bail};
 
-use crate::indexer;
+use crate::embedder::build_text_embedder;
+use crate::fs::StdFs;
+use crate::store::SqliteStore;
+use crate::walk::FsWalker;
 use crate::workspace::Workspace;
 
 /// Force a full re-embed and rebuild of the index.
@@ -22,7 +25,21 @@ pub fn execute(ws: &Workspace, _args: RebuildArgs) -> Result<()> {
     }
 
     println!("Rebuilding index from scratch…");
-    let report = indexer::run(ws, &roots, true)?;
+    let mut store = SqliteStore::open(&ws.db_path)?;
+    let mut embedder = build_text_embedder(&ws.config.embed.text.model)?;
+    let mut indexer_args = index::IndexerArgs {
+        store: &mut store,
+        walker: &FsWalker,
+        fs_reader: &StdFs,
+        embedder: embedder.as_mut(),
+    };
+    let report = index::run(
+        &mut indexer_args,
+        &roots,
+        &ws.config.ignore.globs,
+        &ws.config.chunk,
+        true,
+    )?;
     println!("Done: {} indexed, {} chunks.", report.indexed, report.chunks);
     Ok(())
 }
