@@ -1,0 +1,15 @@
+[package]
+name = "index"
+version = "0.1.0"
+edition = "2024"
+description = "Indexing pipeline orchestration for gnosis, generic over Store/Walker/Embedder/FileReader"
+
+[dependencies]
+anyhow = { workspace = true }
+chunker = { workspace = true }
+embed = { workspace = true }
+fs = { workspace = true }
+parse = { workspace = true }
+store = { workspace = true }
+walk = { workspace = true }
+blake3 = "1.8.5"

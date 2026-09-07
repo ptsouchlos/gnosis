@@ -1,17 +1,16 @@
+//! Indexing pipeline orchestration: walk, parse, chunk, embed, and persist.
+//! Generic over [`Store`]/[`Walker`]/[`FileReader`]/[`Embedder`] so it carries
+//! no native dependencies of its own — native-ness comes only from whichever
+//! concrete implementations the caller supplies.
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
-
-use crate::embedder::{Embedder, TextEmbedder};
-use crate::store::{SqliteStore, Store};
-use crate::walk::{FsWalker, Walker};
-use crate::workspace::Workspace;
-use chunker;
-use parse::parse_markdown;
-use store::{ChunkWrite, DocWrite};
-use walk::DocKind;
+use anyhow::{Result, bail};
+use embed::Embedder;
+use fs::FileReader;
+use store::{ChunkWrite, DocWrite, Store};
+use walk::{DocKind, Walker};
 
 /// Outcome of an indexing run.
 #[derive(Debug, Default)]
@@ -23,25 +22,37 @@ pub struct IndexReport {
     pub chunks: usize,
 }
 
+/// The trait-object backends an indexing run needs. Bundled so `run` doesn't
+/// take four separate `dyn` parameters alongside its plain-data ones.
+pub struct IndexerArgs<'a> {
+    pub store: &'a mut dyn Store,
+    pub walker: &'a dyn Walker,
+    pub fs_reader: &'a dyn FileReader,
+    pub embedder: &'a mut dyn Embedder,
+}
+
 /// Walk each root in `roots`, (re)embed changed documents, and prune deleted
 /// ones. Pruning is scoped to the source vaults walked in this run, so indexing
 /// one vault never removes another's documents from a shared database.
-pub fn run(ws: &Workspace, roots: &[PathBuf], force: bool) -> Result<IndexReport> {
-    let cfg = &ws.config;
-    let mut store = SqliteStore::open(&ws.db_path)?;
-    let walker = FsWalker;
-
-    let mut embedder = TextEmbedder::new(&cfg.embed.text.model)?;
-    guard_model(&store, &embedder, force)?;
-    store.set_meta("model.text", embedder.model_id())?;
-    store.set_meta("dim.text", &embedder.dim().to_string())?;
+pub fn run(
+    args: &mut IndexerArgs,
+    roots: &[PathBuf],
+    ignore_globs: &[String],
+    chunk_cfg: &chunker::ChunkConfig,
+    force: bool,
+) -> Result<IndexReport> {
+    guard_model(&*args.store, &*args.embedder, force)?;
+    args.store
+        .set_meta("model.text", args.embedder.model_id())?;
+    args.store
+        .set_meta("dim.text", &args.embedder.dim().to_string())?;
 
     let mut report = IndexReport::default();
     let mut seen: HashSet<String> = HashSet::new();
     let mut walked_roots: Vec<String> = Vec::new();
 
     for root in roots {
-        let root_canon = match std::fs::canonicalize(root) {
+        let root_canon = match args.fs_reader.canonicalize(root) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("warning: skipping vault {} ({e})", root.display());
@@ -51,12 +62,11 @@ pub fn run(ws: &Workspace, roots: &[PathBuf], force: bool) -> Result<IndexReport
         let root_str = root_canon.to_string_lossy().to_string();
         walked_roots.push(root_str.clone());
 
-        let found = walker.discover(&root_canon, &cfg.ignore.globs)?;
+        let found = args.walker.discover(&root_canon, ignore_globs)?;
         report.scanned += found.len();
 
         for file in &found {
-            let path = std::fs::canonicalize(&file.path)
-                .with_context(|| format!("resolving {}", file.path.display()))?;
+            let path = args.fs_reader.canonicalize(&file.path)?;
             let path_str = path.to_string_lossy().to_string();
 
             // Dedupe across overlapping roots; first root wins.
@@ -64,35 +74,27 @@ pub fn run(ws: &Workspace, roots: &[PathBuf], force: bool) -> Result<IndexReport
                 continue;
             }
 
-            let bytes = std::fs::read(&path).with_context(|| format!("reading {path_str}"))?;
+            let bytes = args.fs_reader.read(&path)?;
             let hash = blake3::hash(&bytes);
 
             if !force
-                && let Some(existing) = store.document_hash(&path_str)?
+                && let Some(existing) = args.store.document_hash(&path_str)?
                 && existing.as_slice() == hash.as_bytes()
             {
                 report.skipped += 1;
                 continue;
             }
 
-            let n = index_file(
-                &mut store,
-                &mut embedder,
-                &path_str,
-                &root_str,
-                file.kind,
-                &bytes,
-                &cfg.chunk,
-            )?;
+            let n = index_file(args, &path_str, &root_str, file.kind, &bytes, chunk_cfg)?;
             report.indexed += 1;
             report.chunks += n;
         }
     }
 
     // Prune only documents belonging to the roots walked in this run.
-    for path in store.paths_for_roots(&walked_roots)? {
+    for path in args.store.paths_for_roots(&walked_roots)? {
         if !seen.contains(&path) {
-            store.delete_document(&path)?;
+            args.store.delete_document(&path)?;
             report.deleted += 1;
         }
     }
@@ -102,8 +104,7 @@ pub fn run(ws: &Workspace, roots: &[PathBuf], force: bool) -> Result<IndexReport
 
 /// Parse, chunk, embed, and persist a single markdown file. Returns chunk count.
 fn index_file(
-    store: &mut SqliteStore,
-    embedder: &mut TextEmbedder,
+    args: &mut IndexerArgs,
     path_str: &str,
     source_root: &str,
     kind: DocKind,
@@ -111,7 +112,7 @@ fn index_file(
     chunk_cfg: &chunker::ChunkConfig,
 ) -> Result<usize> {
     let content = String::from_utf8_lossy(bytes);
-    let parsed = parse_markdown(std::path::Path::new(path_str), &content);
+    let parsed = parse::parse_markdown(Path::new(path_str), &content);
     let chunks = chunker::chunk_markdown(&parsed.body, chunk_cfg.max_tokens, chunk_cfg.overlap);
 
     // Prepend the heading trail so chunks carry their structural context.
@@ -126,7 +127,7 @@ fn index_file(
         })
         .collect();
 
-    let vectors = embedder.embed(&texts)?;
+    let vectors = args.embedder.embed(&texts)?;
 
     let chunk_writes: Vec<ChunkWrite> = chunks
         .iter()
@@ -142,10 +143,10 @@ fn index_file(
         .collect();
 
     let hash = blake3::hash(bytes);
-    let mtime = file_mtime(path_str);
+    let mtime = args.fs_reader.mtime(Path::new(path_str));
     let indexed_at = now_unix();
 
-    store.replace_document(&DocWrite {
+    args.store.replace_document(&DocWrite {
         path: path_str,
         kind: kind.as_str(),
         source_root,
@@ -162,7 +163,7 @@ fn index_file(
 }
 
 /// Refuse to mix vectors from a different model into an existing index.
-fn guard_model(store: &SqliteStore, embedder: &TextEmbedder, force: bool) -> Result<()> {
+fn guard_model(store: &dyn Store, embedder: &dyn Embedder, force: bool) -> Result<()> {
     if force {
         return Ok(());
     }
@@ -176,15 +177,6 @@ fn guard_model(store: &SqliteStore, embedder: &TextEmbedder, force: bool) -> Res
         );
     }
     Ok(())
-}
-
-fn file_mtime(path: &str) -> i64 {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 fn now_unix() -> i64 {

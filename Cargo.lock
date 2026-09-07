@@ -850,6 +850,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -980,14 +987,14 @@ name = "gnosis-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "blake3",
  "chunker",
  "clap",
  "dirs",
  "embed",
  "fastembed",
+ "fs",
  "ignore",
- "parse",
+ "index",
  "rusqlite",
  "search",
  "serde",
@@ -1376,6 +1383,20 @@ name = "imgref"
 version = "1.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "89194689a993ab15268672e99e7b0e19da2da3268ac682e8f02d29d4d1434cd7"
+
+[[package]]
+name = "index"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "chunker",
+ "embed",
+ "fs",
+ "parse",
+ "store",
+ "walk",
+]
 
 [[package]]
 name = "indexmap"

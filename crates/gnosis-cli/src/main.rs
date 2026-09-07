@@ -2,7 +2,7 @@ mod cli;
 mod commands;
 mod config;
 mod embedder;
-mod indexer;
+mod fs;
 mod store;
 mod walk;
 mod workspace;

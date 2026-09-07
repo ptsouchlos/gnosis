@@ -1,0 +1,8 @@
+[package]
+name = "fs"
+version = "0.1.0"
+edition = "2024"
+description = "File access interface for gnosis's indexing pipeline"
+
+[dependencies]
+anyhow = { workspace = true }
