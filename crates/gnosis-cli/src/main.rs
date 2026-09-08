@@ -3,6 +3,7 @@ mod commands;
 mod config;
 mod embedder;
 mod fs;
+mod progress;
 mod store;
 mod walk;
 mod workspace;
