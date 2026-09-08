@@ -1,0 +1,5 @@
+[package]
+name = "progress"
+version = "0.1.0"
+edition = "2024"
+description = "Progress-reporting interface for gnosis's indexing pipeline"

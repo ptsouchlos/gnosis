@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Result, bail};
 use embed::Embedder;
 use fs::FileReader;
+use progress::Progress;
 use store::{ChunkWrite, DocWrite, Store};
 use walk::{DocKind, Walker};
 
@@ -29,6 +30,7 @@ pub struct IndexerArgs<'a> {
     pub walker: &'a dyn Walker,
     pub fs_reader: &'a dyn FileReader,
     pub embedder: &'a mut dyn Embedder,
+    pub progress: &'a dyn Progress,
 }
 
 /// Walk each root in `roots`, (re)embed changed documents, and prune deleted
@@ -64,6 +66,7 @@ pub fn run(
 
         let found = args.walker.discover(&root_canon, ignore_globs)?;
         report.scanned += found.len();
+        args.progress.inc_total(found.len() as u64);
 
         for file in &found {
             let path = args.fs_reader.canonicalize(&file.path)?;
@@ -71,6 +74,7 @@ pub fn run(
 
             // Dedupe across overlapping roots; first root wins.
             if !seen.insert(path_str.clone()) {
+                args.progress.inc(1);
                 continue;
             }
 
@@ -82,15 +86,16 @@ pub fn run(
                 && existing.as_slice() == hash.as_bytes()
             {
                 report.skipped += 1;
+                args.progress.inc(1);
                 continue;
             }
 
             let n = index_file(args, &path_str, &root_str, file.kind, &bytes, chunk_cfg)?;
             report.indexed += 1;
             report.chunks += n;
+            args.progress.inc(1);
         }
     }
-
     // Prune only documents belonging to the roots walked in this run.
     for path in args.store.paths_for_roots(&walked_roots)? {
         if !seen.contains(&path) {
@@ -98,6 +103,7 @@ pub fn run(
             report.deleted += 1;
         }
     }
+    args.progress.finish();
 
     Ok(report)
 }

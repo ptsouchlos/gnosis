@@ -6,6 +6,7 @@ members = [
     "crates/gnosis-fs",
     "crates/gnosis-index",
     "crates/gnosis-parse",
+    "crates/gnosis-progress",
     "crates/gnosis-search",
     "crates/gnosis-store",
     "crates/gnosis-walk",
@@ -19,6 +20,7 @@ embed = { path = "crates/gnosis-embed" }
 fs = { path = "crates/gnosis-fs" }
 index = { path = "crates/gnosis-index" }
 parse = { path = "crates/gnosis-parse" }
+progress = { path = "crates/gnosis-progress" }
 search = { path = "crates/gnosis-search" }
 store = { path = "crates/gnosis-store" }
 walk = { path = "crates/gnosis-walk" }

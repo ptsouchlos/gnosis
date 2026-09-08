@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::embedder::build_text_embedder;
 use crate::fs::StdFs;
+use crate::progress::IndicatifProgress;
 use crate::store::SqliteStore;
 use crate::walk::FsWalker;
 use crate::workspace::Workspace;
@@ -27,11 +28,13 @@ pub fn execute(ws: &Workspace, _args: RebuildArgs) -> Result<()> {
     println!("Rebuilding index from scratch…");
     let mut store = SqliteStore::open(&ws.db_path)?;
     let mut embedder = build_text_embedder(&ws.config.embed.text.model)?;
+    let progress = IndicatifProgress::new();
     let mut indexer_args = index::IndexerArgs {
         store: &mut store,
         walker: &FsWalker,
         fs_reader: &StdFs,
         embedder: embedder.as_mut(),
+        progress: &progress,
     };
     let report = index::run(
         &mut indexer_args,
