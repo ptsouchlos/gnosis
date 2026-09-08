@@ -1013,6 +1013,7 @@ dependencies = [
  "rusqlite",
  "search",
  "serde",
+ "serde_json",
  "store",
  "toml",
  "walk",
@@ -2507,6 +2508,9 @@ dependencies = [
 [[package]]
 name = "search"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "security-framework"

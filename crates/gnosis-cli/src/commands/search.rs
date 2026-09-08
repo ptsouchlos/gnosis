@@ -28,11 +28,24 @@ pub struct SearchArgs {
     pub json: bool,
 }
 
+/// Vector spaces gnosis currently indexes. `--in` is validated against this
+/// rather than silently ignored, so requesting an unsupported space (e.g.
+/// "image", before image ingestion exists) fails clearly.
+const SUPPORTED_SPACES: &[&str] = &["text"];
+
 pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
     if !ws.db_path.exists() {
         bail!(
             "no index found at {} — run `gnosis index`",
             ws.db_path.display()
+        );
+    }
+
+    if let Some(unsupported) = args.r#in.iter().find(|s| !SUPPORTED_SPACES.contains(&s.as_str())) {
+        bail!(
+            "unsupported space '{unsupported}' — only {} {} indexed today",
+            SUPPORTED_SPACES.join(", "),
+            if SUPPORTED_SPACES.len() == 1 { "is" } else { "are" }
         );
     }
 
@@ -54,6 +67,15 @@ pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
     let from_ref = (!from.is_empty()).then_some(from.as_slice());
 
     let hits = store.search_text(&query_vec, args.limit, from_ref)?;
+
+    if args.json {
+        // Full data regardless of --full: JSON output is for programmatic
+        // consumers, not terminal readability, and a script piping --json
+        // output shouldn't have to special-case an empty non-JSON message.
+        println!("{}", serde_json::to_string(&hits)?);
+        return Ok(());
+    }
+
     if hits.is_empty() {
         println!("No results.");
         return Ok(());
