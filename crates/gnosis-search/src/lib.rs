@@ -29,9 +29,48 @@ pub struct Hit {
 /// best-scoring chunk per document path, and return the top `limit` sorted
 /// descending by score.
 pub fn rank(query: &[f32], candidates: impl IntoIterator<Item = Candidate>, limit: usize) -> Vec<Hit> {
+    rank_by(|v| dot(query, v), candidates, &[], limit)
+}
+
+/// Like [`rank`], but scores each candidate against the best (max) cosine
+/// similarity across several query vectors instead of one — e.g. a
+/// document's own chunks, for `related`. `exclude_paths` is filtered before
+/// truncation to `limit`, not after, so an excluded document (e.g. the
+/// source itself) never displaces a genuinely eligible one.
+pub fn rank_multi(
+    queries: &[Vec<f32>],
+    candidates: impl IntoIterator<Item = Candidate>,
+    exclude_paths: &[String],
+    limit: usize,
+) -> Vec<Hit> {
+    rank_by(
+        |v| {
+            queries
+                .iter()
+                .map(|q| dot(q, v))
+                .fold(f32::NEG_INFINITY, f32::max)
+        },
+        candidates,
+        exclude_paths,
+        limit,
+    )
+}
+
+/// Shared aggregation for [`rank`]/[`rank_multi`]: score each candidate with
+/// `score_fn`, keep the best-scoring chunk per document path (excluding
+/// `exclude_paths`), and return the top `limit` sorted descending by score.
+fn rank_by(
+    score_fn: impl Fn(&[f32]) -> f32,
+    candidates: impl IntoIterator<Item = Candidate>,
+    exclude_paths: &[String],
+    limit: usize,
+) -> Vec<Hit> {
     let mut best: HashMap<String, Hit> = HashMap::new();
     for c in candidates {
-        let score = dot(query, &c.vector);
+        if exclude_paths.iter().any(|p| p == &c.path) {
+            continue;
+        }
+        let score = score_fn(&c.vector);
         let entry = best.entry(c.path.clone()).or_insert_with(|| Hit {
             path: c.path,
             title: c.title,

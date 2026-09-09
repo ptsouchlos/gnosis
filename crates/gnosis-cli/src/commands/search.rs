@@ -107,7 +107,7 @@ pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
 }
 
 /// Short label for a source vault: its final path component.
-fn root_label(root: &str) -> &str {
+pub(crate) fn root_label(root: &str) -> &str {
     Path::new(root)
         .file_name()
         .and_then(|s| s.to_str())
