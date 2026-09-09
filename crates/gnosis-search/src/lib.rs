@@ -14,7 +14,7 @@ pub struct Candidate {
 }
 
 /// One ranked search result (best chunk per document).
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct Hit {
     pub path: String,
     pub title: String,
