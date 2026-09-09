@@ -3,3 +3,6 @@ name = "parse"
 version = "0.1.0"
 edition = "2024"
 description = "Markdown frontmatter/title/wikilink parsing shared across gnosis front-ends"
+
+[dependencies]
+serde_norway = "0.9.42"

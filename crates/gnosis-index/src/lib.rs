@@ -163,6 +163,7 @@ fn index_file(
         indexed_at,
         chunks: &chunk_writes,
         links: &parsed.links,
+        tags: &parsed.tags,
     })?;
 
     Ok(chunk_writes.len())

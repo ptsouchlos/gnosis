@@ -22,7 +22,6 @@ pub struct Config {
     pub chunk: ChunkConfig,
     pub pdf: PdfConfig,
     pub ignore: IgnoreConfig,
-    pub obsidian: ObsidianConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,13 +36,6 @@ pub struct IgnoreConfig {
     pub globs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ObsidianConfig {
-    /// Auto-detect Obsidian features (wikilinks, frontmatter) per file.
-    pub auto: bool,
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -53,7 +45,6 @@ impl Default for Config {
             chunk: ChunkConfig::default(),
             pdf: PdfConfig::default(),
             ignore: IgnoreConfig::default(),
-            obsidian: ObsidianConfig::default(),
         }
     }
 }
@@ -71,14 +62,9 @@ impl Default for IgnoreConfig {
                 "node_modules/**".to_string(),
                 ".git/**".to_string(),
                 ".gnosis/**".to_string(),
+                ".obsidian/**".to_string(),
             ],
         }
-    }
-}
-
-impl Default for ObsidianConfig {
-    fn default() -> Self {
-        Self { auto: true }
     }
 }
 
