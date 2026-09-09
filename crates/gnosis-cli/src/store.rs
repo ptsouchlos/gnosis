@@ -84,6 +84,42 @@ impl SqliteStore {
         self.set_meta("schema_version", &SCHEMA_VERSION.to_string())?;
         Ok(())
     }
+
+    /// Fetch every text-space chunk as a scoring candidate, optionally
+    /// scoped to `from` vault roots. Shared by `search_text`/`related_text`.
+    fn text_candidates(&self, from: Option<&[String]>) -> Result<Vec<Candidate>> {
+        let mut sql = String::from(
+            "SELECT d.path, d.title, d.source_root, c.heading_path, c.text, c.vector
+             FROM chunks c JOIN documents d ON d.id = c.doc_id
+             WHERE c.space = 'text' AND c.vector IS NOT NULL",
+        );
+        let filter = from.filter(|f| !f.is_empty());
+        if let Some(roots) = filter {
+            sql.push_str(&format!(
+                " AND d.source_root IN ({})",
+                in_placeholders(roots.len())
+            ));
+        }
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let map_row = |r: &rusqlite::Row<'_>| {
+            Ok(Candidate {
+                path: r.get::<_, String>(0)?,
+                title: r.get::<_, String>(1)?,
+                source_root: r.get::<_, String>(2)?,
+                heading_path: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                text: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                vector: search::blob_to_vec(&r.get::<_, Vec<u8>>(5)?),
+            })
+        };
+        let candidates: Vec<Candidate> = match filter {
+            Some(roots) => stmt
+                .query_map(rusqlite::params_from_iter(roots), map_row)?
+                .collect::<rusqlite::Result<_>>()?,
+            None => stmt.query_map([], map_row)?.collect::<rusqlite::Result<_>>()?,
+        };
+        Ok(candidates)
+    }
 }
 
 impl Store for SqliteStore {
@@ -248,38 +284,56 @@ impl Store for SqliteStore {
     }
 
     fn search_text(&self, query: &[f32], limit: usize, from: Option<&[String]>) -> Result<Vec<Hit>> {
-        let mut sql = String::from(
-            "SELECT d.path, d.title, d.source_root, c.heading_path, c.text, c.vector
-             FROM chunks c JOIN documents d ON d.id = c.doc_id
-             WHERE c.space = 'text' AND c.vector IS NOT NULL",
-        );
-        let filter = from.filter(|f| !f.is_empty());
-        if let Some(roots) = filter {
-            sql.push_str(&format!(
-                " AND d.source_root IN ({})",
-                in_placeholders(roots.len())
-            ));
-        }
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let map_row = |r: &rusqlite::Row<'_>| {
-            Ok(Candidate {
-                path: r.get::<_, String>(0)?,
-                title: r.get::<_, String>(1)?,
-                source_root: r.get::<_, String>(2)?,
-                heading_path: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                text: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                vector: search::blob_to_vec(&r.get::<_, Vec<u8>>(5)?),
-            })
-        };
-        let candidates: Vec<Candidate> = match filter {
-            Some(roots) => stmt
-                .query_map(rusqlite::params_from_iter(roots), map_row)?
-                .collect::<rusqlite::Result<_>>()?,
-            None => stmt.query_map([], map_row)?.collect::<rusqlite::Result<_>>()?,
-        };
-
+        let candidates = self.text_candidates(from)?;
         Ok(search::rank(query, candidates, limit))
+    }
+
+    fn text_chunk_vectors(&self, path: &str) -> Result<Vec<Vec<f32>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.vector FROM chunks c JOIN documents d ON d.id = c.doc_id
+             WHERE c.space = 'text' AND c.vector IS NOT NULL AND d.path = ?1",
+        )?;
+        let vectors = stmt
+            .query_map([path], |r| r.get::<_, Vec<u8>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|b| search::blob_to_vec(&b))
+            .collect();
+        Ok(vectors)
+    }
+
+    fn linked_targets(&self, path: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.dst_path FROM links l JOIN documents d ON d.id = l.src_doc
+             WHERE d.path = ?1",
+        )?;
+        let targets = stmt
+            .query_map([path], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(targets)
+    }
+
+    fn all_paths(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT path FROM documents")?;
+        let paths = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(paths)
+    }
+
+    fn related_text(
+        &self,
+        query_vectors: &[Vec<f32>],
+        exclude_paths: &[String],
+        limit: usize,
+    ) -> Result<Vec<Hit>> {
+        let candidates = self.text_candidates(None)?;
+        Ok(search::rank_multi(
+            query_vectors,
+            candidates,
+            exclude_paths,
+            limit,
+        ))
     }
 }
 

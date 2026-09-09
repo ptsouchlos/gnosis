@@ -76,4 +76,24 @@ pub trait Store {
     /// chunk per document, ranked descending, capped at `limit`. When `from` is
     /// given, results are restricted to those source vault roots.
     fn search_text(&self, query: &[f32], limit: usize, from: Option<&[String]>) -> Result<Vec<Hit>>;
+
+    /// A document's own text-space chunk vectors — the query set for `related`.
+    fn text_chunk_vectors(&self, path: &str) -> Result<Vec<Vec<f32>>>;
+
+    /// Raw wikilink target texts this document links out to (unresolved —
+    /// `[[Some Note]]` yields `"Some Note"`, not a document path).
+    fn linked_targets(&self, path: &str) -> Result<Vec<String>>;
+
+    /// Every indexed document's path, for resolving link targets to paths.
+    fn all_paths(&self) -> Result<Vec<String>>;
+
+    /// Rank other documents by best chunk-to-chunk cosine similarity against
+    /// `query_vectors` (the max across all of them per candidate), excluding
+    /// `exclude_paths` before truncation to `limit`.
+    fn related_text(
+        &self,
+        query_vectors: &[Vec<f32>],
+        exclude_paths: &[String],
+        limit: usize,
+    ) -> Result<Vec<Hit>>;
 }
