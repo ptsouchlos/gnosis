@@ -5,13 +5,15 @@
 //!
 // TODO: In the future consider using something like [sqlite-vec](https://github.com/asg017/sqlite-vec)
 // for faster vector search/retrieval.
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use search::{Candidate, Hit};
 use store::{DocWrite, Stats};
 pub use store::Store;
+use usearch::{Index, IndexOptions, Key, MetricKind, ScalarKind};
 
 /// Bumped whenever the schema changes in a backward-incompatible way.
 pub const SCHEMA_VERSION: i64 = 1;
@@ -19,6 +21,11 @@ pub const SCHEMA_VERSION: i64 = 1;
 /// SQLite-backed [`Store`]; gnosis's durable source of truth.
 pub struct SqliteStore {
     conn: Connection,
+    /// On-disk ANN index for the text space, sibling to the database file
+    /// (`<db_dir>/index/text.usearch`). Always reconstructable from SQLite
+    /// via `rebuild_text_index` — a missing or stale file just means
+    /// queries fall back to the brute-force path, never data loss.
+    text_index_path: PathBuf,
 }
 
 impl SqliteStore {
@@ -34,7 +41,16 @@ impl SqliteStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
 
-        let store = SqliteStore { conn };
+        let text_index_path = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("index")
+            .join("text.usearch");
+
+        let store = SqliteStore {
+            conn,
+            text_index_path,
+        };
         store.init_schema()?;
         Ok(store)
     }
@@ -119,6 +135,128 @@ impl SqliteStore {
             None => stmt.query_map([], map_row)?.collect::<rusqlite::Result<_>>()?,
         };
         Ok(candidates)
+    }
+
+    /// Fetch full candidate metadata for a set of chunk ids (e.g. from an
+    /// ANN search), optionally filtered to `from` vault roots in Rust
+    /// (simpler than mixing heterogeneous SQL param types for what's
+    /// already a small, over-fetched set).
+    fn candidates_by_ids(&self, ids: &[u64], from: Option<&[String]>) -> Result<Vec<Candidate>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT d.path, d.title, d.source_root, c.heading_path, c.text, c.vector
+             FROM chunks c JOIN documents d ON d.id = c.doc_id
+             WHERE c.id IN ({})",
+            in_placeholders(ids.len())
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let id_params: Vec<i64> = ids.iter().map(|id| *id as i64).collect();
+        let map_row = |r: &rusqlite::Row<'_>| {
+            Ok(Candidate {
+                path: r.get::<_, String>(0)?,
+                title: r.get::<_, String>(1)?,
+                source_root: r.get::<_, String>(2)?,
+                heading_path: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                text: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                vector: search::blob_to_vec(&r.get::<_, Vec<u8>>(5)?),
+            })
+        };
+        let candidates: Vec<Candidate> = stmt
+            .query_map(rusqlite::params_from_iter(&id_params), map_row)?
+            .collect::<rusqlite::Result<_>>()?;
+
+        let filter = from.filter(|f| !f.is_empty());
+        Ok(match filter {
+            Some(roots) => candidates
+                .into_iter()
+                .filter(|c| roots.contains(&c.source_root))
+                .collect(),
+            None => candidates,
+        })
+    }
+
+    /// Prefilter candidates via the on-disk ANN index for one or more query
+    /// vectors (unioned across queries). `None` when no index exists yet,
+    /// or an existing one fails to load (treated as "not built" rather
+    /// than a hard error — reconstructable via `rebuild_text_index`, so a
+    /// stale/corrupt file should degrade to the brute-force path, not
+    /// break search). `k` is how many neighbors to request per query;
+    /// callers pick the over-fetch factor since ANN can't filter by vault
+    /// root or excluded path itself.
+    fn ann_candidates(
+        &self,
+        queries: &[Vec<f32>],
+        k: usize,
+        from: Option<&[String]>,
+    ) -> Result<Option<Vec<Candidate>>> {
+        if !self.text_index_path.exists() {
+            return Ok(None);
+        }
+        let Some(path_str) = self.text_index_path.to_str() else {
+            return Ok(None);
+        };
+        let index = match Index::restore(path_str) {
+            Ok(index) => index,
+            Err(_) => return Ok(None),
+        };
+
+        let mut ids: HashSet<u64> = HashSet::new();
+        for q in queries {
+            let matches = index.search(q, k)?;
+            ids.extend(matches.keys);
+        }
+        let ids: Vec<u64> = ids.into_iter().collect();
+
+        Ok(Some(self.candidates_by_ids(&ids, from)?))
+    }
+
+    /// Rebuild the on-disk ANN index for the text space from the current
+    /// SQLite contents. Always safe to call — the index is fully derived
+    /// from SQLite, so a stale or missing index is a (re)build, never data
+    /// loss. No-ops (removing any existing index file) when there are zero
+    /// text chunks, so queries correctly fall back to the brute-force path
+    /// rather than querying an empty/stale index.
+    pub fn rebuild_text_index(&mut self) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, vector FROM chunks WHERE space = 'text' AND vector IS NOT NULL")?;
+        let rows: Vec<(i64, Vec<f32>)> = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|(id, blob)| (id, search::blob_to_vec(&blob)))
+            .collect();
+
+        if rows.is_empty() {
+            let _ = std::fs::remove_file(&self.text_index_path);
+            return Ok(());
+        }
+
+        let dimensions = rows[0].1.len();
+        let options = IndexOptions {
+            dimensions,
+            metric: MetricKind::IP,
+            quantization: ScalarKind::F32,
+            ..Default::default()
+        };
+        let index = Index::new(&options)?;
+        index.reserve(rows.len())?;
+        for (id, vector) in &rows {
+            index.add(*id as Key, vector)?;
+        }
+
+        if let Some(parent) = self.text_index_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let path_str = self
+            .text_index_path
+            .to_str()
+            .context("index path is not valid UTF-8")?;
+        index.save(path_str)?;
+        Ok(())
     }
 }
 
@@ -284,6 +422,13 @@ impl Store for SqliteStore {
     }
 
     fn search_text(&self, query: &[f32], limit: usize, from: Option<&[String]>) -> Result<Vec<Hit>> {
+        // Over-fetch when filtering by root, since ANN can't apply that
+        // filter itself.
+        let k = if from.is_some() { limit * 5 } else { limit };
+        let queries = [query.to_vec()];
+        if let Some(candidates) = self.ann_candidates(&queries, k, from)? {
+            return Ok(search::rank(query, candidates, limit));
+        }
         let candidates = self.text_candidates(from)?;
         Ok(search::rank(query, candidates, limit))
     }
@@ -327,6 +472,19 @@ impl Store for SqliteStore {
         exclude_paths: &[String],
         limit: usize,
     ) -> Result<Vec<Hit>> {
+        // Always over-fetch: exclude_paths includes the source document
+        // itself, and its own chunks are guaranteed to be the top ANN
+        // matches for their own queries, so a tight k would leave too few
+        // results after exclusion.
+        let k = limit * 5;
+        if let Some(candidates) = self.ann_candidates(query_vectors, k, None)? {
+            return Ok(search::rank_multi(
+                query_vectors,
+                candidates,
+                exclude_paths,
+                limit,
+            ));
+        }
         let candidates = self.text_candidates(None)?;
         Ok(search::rank_multi(
             query_vectors,

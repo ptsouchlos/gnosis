@@ -42,6 +42,9 @@ pub fn execute(mut ws: Workspace, args: IndexArgs) -> Result<()> {
         "Done: {} scanned, {} (re)indexed, {} unchanged, {} removed, {} chunks.",
         report.scanned, report.indexed, report.skipped, report.deleted, report.chunks
     );
+
+    store.rebuild_text_index()?;
+    println!("Updated search index.");
     Ok(())
 }
 

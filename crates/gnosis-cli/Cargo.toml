@@ -27,4 +27,5 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 fastembed = "5.17.2"
 ignore = "0.4.26"
 indicatif = "0.17"
+usearch = "2"
 dirs = "6.0.0"

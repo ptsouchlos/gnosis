@@ -32,8 +32,11 @@ pub fn execute(mut ws: Workspace, args: ForgetArgs) -> Result<()> {
     // Delete its documents from the database, if one exists.
     let mut removed_docs = 0;
     if ws.db_path.exists() {
-        let store = SqliteStore::open(&ws.db_path)?;
+        let mut store = SqliteStore::open(&ws.db_path)?;
         removed_docs = store.delete_by_root(&canon_str)?;
+        if removed_docs > 0 {
+            store.rebuild_text_index()?;
+        }
     }
 
     println!(
