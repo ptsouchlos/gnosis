@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::commands::search::root_label;
-use crate::store::{SqliteStore, Store};
+use crate::store::{SqliteStore, Store, TextQuery};
 use crate::workspace::{Workspace, expand_tilde};
 
 /// List notes related to a given file.
@@ -17,6 +17,10 @@ pub struct RelatedArgs {
     /// Include items already linked from the source (Obsidian vaults).
     #[arg(long)]
     pub include_linked: bool,
+    /// Restrict to documents having any of these tags (repeatable; matches
+    /// any, not all).
+    #[arg(long)]
+    pub tag: Vec<String>,
     /// Emit results as JSON.
     #[arg(long)]
     pub json: bool,
@@ -48,12 +52,21 @@ pub fn execute(ws: &Workspace, args: RelatedArgs) -> Result<()> {
     if !args.include_linked {
         let targets = store.linked_targets(&path)?;
         if !targets.is_empty() {
-            let all_paths = store.all_paths()?;
-            exclude.extend(resolve_link_targets(&targets, &all_paths));
+            let all_meta = store.all_document_meta()?;
+            exclude.extend(resolve_link_targets(&targets, &all_meta));
         }
     }
 
-    let hits = store.related_text(&queries, &exclude, args.limit)?;
+    let tags_ref = (!args.tag.is_empty()).then_some(args.tag.as_slice());
+    let hits = store.related_text(
+        &queries,
+        &exclude,
+        args.limit,
+        &TextQuery {
+            from: None,
+            tags: tags_ref,
+        },
+    )?;
 
     if args.json {
         // Full data regardless of terminal formatting — see search.rs's
@@ -90,22 +103,24 @@ pub fn execute(ws: &Workspace, args: RelatedArgs) -> Result<()> {
 }
 
 /// Resolve raw wikilink target texts to indexed document paths by matching
-/// against each candidate's filename stem, case-insensitively — Obsidian's
-/// own default link-resolution behavior (by filename, not by any custom
-/// title). Not full Obsidian-compatible resolution: no folder-path
-/// disambiguation, no alias support beyond what `gnosis-parse` already
-/// strips.
-fn resolve_link_targets(targets: &[String], all_paths: &[String]) -> Vec<String> {
-    all_paths
+/// against each candidate's filename stem (Obsidian's own default
+/// link-resolution behavior — by filename, not any custom title) or its
+/// frontmatter `aliases:`, case-insensitively. Not full Obsidian-compatible
+/// resolution: no folder-path disambiguation.
+fn resolve_link_targets(targets: &[String], all_meta: &[(String, Option<String>)]) -> Vec<String> {
+    all_meta
         .iter()
-        .filter(|p| {
-            let stem = Path::new(p).file_stem().and_then(|s| s.to_str());
-            stem.is_some_and(|stem| {
-                targets
+        .filter(|(path, frontmatter)| {
+            let stem = Path::new(path).file_stem().and_then(|s| s.to_str());
+            let stem_matches =
+                stem.is_some_and(|stem| targets.iter().any(|t| t.eq_ignore_ascii_case(stem)));
+            let alias_matches = frontmatter.as_deref().is_some_and(|fm| {
+                parse::extract_aliases(fm)
                     .iter()
-                    .any(|t| t.eq_ignore_ascii_case(stem))
-            })
+                    .any(|a| targets.iter().any(|t| t.eq_ignore_ascii_case(a)))
+            });
+            stem_matches || alias_matches
         })
-        .cloned()
+        .map(|(path, _)| path.clone())
         .collect()
 }

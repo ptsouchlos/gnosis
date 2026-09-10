@@ -18,6 +18,7 @@ pub struct DocWrite<'a> {
     pub indexed_at: i64,
     pub chunks: &'a [ChunkWrite],
     pub links: &'a [String],
+    pub tags: &'a [String],
 }
 
 /// A single chunk to persist, including its embedding.
@@ -37,6 +38,19 @@ pub struct Stats {
     pub chunks_text: i64,
     pub chunks_image: i64,
     pub indexed_at: Option<i64>,
+}
+
+/// Filters applied when ranking text-space queries (`search_text`/
+/// `related_text`). Bundled since both are optional, independent filter
+/// dimensions applied together (AND between fields, OR within a field's
+/// list) — mirrors how `IndexerArgs` bundles trait objects.
+#[derive(Default)]
+pub struct TextQuery<'a> {
+    /// Restrict to these vault roots. Empty/absent = no restriction.
+    pub from: Option<&'a [String]>,
+    /// Restrict to documents having any of these tags. Empty/absent = no
+    /// restriction.
+    pub tags: Option<&'a [String]>,
 }
 
 /// Durable storage for gnosis's indexed documents, chunks, and links.
@@ -72,10 +86,10 @@ pub trait Store {
     fn delete_document(&self, path: &str) -> Result<()>;
 
     /// Brute-force cosine search over the text space. Vectors are stored
-    /// normalized, so a dot product is the cosine similarity. Returns the best
-    /// chunk per document, ranked descending, capped at `limit`. When `from` is
-    /// given, results are restricted to those source vault roots.
-    fn search_text(&self, query: &[f32], limit: usize, from: Option<&[String]>) -> Result<Vec<Hit>>;
+    /// normalized, so a dot product is the cosine similarity. Returns the
+    /// best chunk per document, ranked descending, capped at `limit`,
+    /// restricted per `filter`.
+    fn search_text(&self, query: &[f32], limit: usize, filter: &TextQuery) -> Result<Vec<Hit>>;
 
     /// A document's own text-space chunk vectors — the query set for `related`.
     fn text_chunk_vectors(&self, path: &str) -> Result<Vec<Vec<f32>>>;
@@ -84,16 +98,18 @@ pub trait Store {
     /// `[[Some Note]]` yields `"Some Note"`, not a document path).
     fn linked_targets(&self, path: &str) -> Result<Vec<String>>;
 
-    /// Every indexed document's path, for resolving link targets to paths.
-    fn all_paths(&self) -> Result<Vec<String>>;
+    /// Every indexed document's path and raw frontmatter, for resolving
+    /// link targets to paths (by filename stem or frontmatter alias).
+    fn all_document_meta(&self) -> Result<Vec<(String, Option<String>)>>;
 
     /// Rank other documents by best chunk-to-chunk cosine similarity against
     /// `query_vectors` (the max across all of them per candidate), excluding
-    /// `exclude_paths` before truncation to `limit`.
+    /// `exclude_paths` before truncation to `limit`, restricted per `filter`.
     fn related_text(
         &self,
         query_vectors: &[Vec<f32>],
         exclude_paths: &[String],
         limit: usize,
+        filter: &TextQuery,
     ) -> Result<Vec<Hit>>;
 }

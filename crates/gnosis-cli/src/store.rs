@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use search::{Candidate, Hit};
 use store::{DocWrite, Stats};
-pub use store::Store;
+pub use store::{Store, TextQuery};
 use usearch::{Index, IndexOptions, Key, MetricKind, ScalarKind};
 
 /// Bumped whenever the schema changes in a backward-incompatible way.
@@ -90,6 +90,13 @@ impl SqliteStore {
             );
             CREATE INDEX IF NOT EXISTS idx_links_src ON links(src_doc);
 
+            CREATE TABLE IF NOT EXISTS tags (
+                doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                tag    TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tags_doc ON tags(doc_id);
+            CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
+
             CREATE TABLE IF NOT EXISTS meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -101,19 +108,42 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Fetch every text-space chunk as a scoring candidate, optionally
-    /// scoped to `from` vault roots. Shared by `search_text`/`related_text`.
-    fn text_candidates(&self, from: Option<&[String]>) -> Result<Vec<Candidate>> {
+    /// Every document path having any of `tags`, for Rust-side filtering
+    /// (mirrors how `from`/root filtering avoids mixing heterogeneous SQL
+    /// param types in `candidates_by_ids`).
+    fn paths_with_any_tag(&self, tags: &[String]) -> Result<HashSet<String>> {
+        let sql = format!(
+            "SELECT DISTINCT d.path FROM tags t JOIN documents d ON d.id = t.doc_id
+             WHERE t.tag IN ({})",
+            in_placeholders(tags.len())
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let paths = stmt
+            .query_map(rusqlite::params_from_iter(tags), |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        Ok(paths)
+    }
+
+    /// Fetch every text-space chunk as a scoring candidate, scoped per
+    /// `filter`. Shared by `search_text`/`related_text`.
+    fn text_candidates(&self, filter: &TextQuery) -> Result<Vec<Candidate>> {
         let mut sql = String::from(
             "SELECT d.path, d.title, d.source_root, c.heading_path, c.text, c.vector
              FROM chunks c JOIN documents d ON d.id = c.doc_id
              WHERE c.space = 'text' AND c.vector IS NOT NULL",
         );
-        let filter = from.filter(|f| !f.is_empty());
-        if let Some(roots) = filter {
+        let roots = filter.from.filter(|f| !f.is_empty());
+        if let Some(roots) = roots {
             sql.push_str(&format!(
                 " AND d.source_root IN ({})",
                 in_placeholders(roots.len())
+            ));
+        }
+        let tags = filter.tags.filter(|t| !t.is_empty());
+        if let Some(tags) = tags {
+            sql.push_str(&format!(
+                " AND d.id IN (SELECT doc_id FROM tags WHERE tag IN ({}))",
+                in_placeholders(tags.len())
             ));
         }
 
@@ -128,20 +158,18 @@ impl SqliteStore {
                 vector: search::blob_to_vec(&r.get::<_, Vec<u8>>(5)?),
             })
         };
-        let candidates: Vec<Candidate> = match filter {
-            Some(roots) => stmt
-                .query_map(rusqlite::params_from_iter(roots), map_row)?
-                .collect::<rusqlite::Result<_>>()?,
-            None => stmt.query_map([], map_row)?.collect::<rusqlite::Result<_>>()?,
-        };
+        let params: Vec<&String> = roots.into_iter().flatten().chain(tags.into_iter().flatten()).collect();
+        let candidates: Vec<Candidate> = stmt
+            .query_map(rusqlite::params_from_iter(params), map_row)?
+            .collect::<rusqlite::Result<_>>()?;
         Ok(candidates)
     }
 
     /// Fetch full candidate metadata for a set of chunk ids (e.g. from an
-    /// ANN search), optionally filtered to `from` vault roots in Rust
-    /// (simpler than mixing heterogeneous SQL param types for what's
-    /// already a small, over-fetched set).
-    fn candidates_by_ids(&self, ids: &[u64], from: Option<&[String]>) -> Result<Vec<Candidate>> {
+    /// ANN search), filtered in Rust per `filter` (simpler than mixing
+    /// heterogeneous SQL param types for what's already a small,
+    /// over-fetched set).
+    fn candidates_by_ids(&self, ids: &[u64], filter: &TextQuery) -> Result<Vec<Candidate>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -163,18 +191,18 @@ impl SqliteStore {
                 vector: search::blob_to_vec(&r.get::<_, Vec<u8>>(5)?),
             })
         };
-        let candidates: Vec<Candidate> = stmt
+        let mut candidates: Vec<Candidate> = stmt
             .query_map(rusqlite::params_from_iter(&id_params), map_row)?
             .collect::<rusqlite::Result<_>>()?;
 
-        let filter = from.filter(|f| !f.is_empty());
-        Ok(match filter {
-            Some(roots) => candidates
-                .into_iter()
-                .filter(|c| roots.contains(&c.source_root))
-                .collect(),
-            None => candidates,
-        })
+        if let Some(roots) = filter.from.filter(|f| !f.is_empty()) {
+            candidates.retain(|c| roots.contains(&c.source_root));
+        }
+        if let Some(tags) = filter.tags.filter(|t| !t.is_empty()) {
+            let allowed = self.paths_with_any_tag(tags)?;
+            candidates.retain(|c| allowed.contains(&c.path));
+        }
+        Ok(candidates)
     }
 
     /// Prefilter candidates via the on-disk ANN index for one or more query
@@ -184,12 +212,12 @@ impl SqliteStore {
     /// stale/corrupt file should degrade to the brute-force path, not
     /// break search). `k` is how many neighbors to request per query;
     /// callers pick the over-fetch factor since ANN can't filter by vault
-    /// root or excluded path itself.
+    /// root, tag, or excluded path itself.
     fn ann_candidates(
         &self,
         queries: &[Vec<f32>],
         k: usize,
-        from: Option<&[String]>,
+        filter: &TextQuery,
     ) -> Result<Option<Vec<Candidate>>> {
         if !self.text_index_path.exists() {
             return Ok(None);
@@ -209,7 +237,7 @@ impl SqliteStore {
         }
         let ids: Vec<u64> = ids.into_iter().collect();
 
-        Ok(Some(self.candidates_by_ids(&ids, from)?))
+        Ok(Some(self.candidates_by_ids(&ids, filter)?))
     }
 
     /// Rebuild the on-disk ANN index for the text space from the current
@@ -411,6 +439,14 @@ impl Store for SqliteStore {
             )?;
         }
 
+        tx.execute("DELETE FROM tags WHERE doc_id = ?1", [doc_id])?;
+        for tag in doc.tags {
+            tx.execute(
+                "INSERT INTO tags (doc_id, tag) VALUES (?1, ?2)",
+                rusqlite::params![doc_id, tag],
+            )?;
+        }
+
         tx.commit()?;
         Ok(())
     }
@@ -421,15 +457,19 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    fn search_text(&self, query: &[f32], limit: usize, from: Option<&[String]>) -> Result<Vec<Hit>> {
-        // Over-fetch when filtering by root, since ANN can't apply that
-        // filter itself.
-        let k = if from.is_some() { limit * 5 } else { limit };
+    fn search_text(&self, query: &[f32], limit: usize, filter: &TextQuery) -> Result<Vec<Hit>> {
+        // Over-fetch when filtering by root or tag, since ANN can't apply
+        // either filter itself.
+        let k = if filter.from.is_some() || filter.tags.is_some() {
+            limit * 5
+        } else {
+            limit
+        };
         let queries = [query.to_vec()];
-        if let Some(candidates) = self.ann_candidates(&queries, k, from)? {
+        if let Some(candidates) = self.ann_candidates(&queries, k, filter)? {
             return Ok(search::rank(query, candidates, limit));
         }
-        let candidates = self.text_candidates(from)?;
+        let candidates = self.text_candidates(filter)?;
         Ok(search::rank(query, candidates, limit))
     }
 
@@ -458,12 +498,12 @@ impl Store for SqliteStore {
         Ok(targets)
     }
 
-    fn all_paths(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT path FROM documents")?;
-        let paths = stmt
-            .query_map([], |r| r.get::<_, String>(0))?
+    fn all_document_meta(&self) -> Result<Vec<(String, Option<String>)>> {
+        let mut stmt = self.conn.prepare("SELECT path, frontmatter FROM documents")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(paths)
+        Ok(rows)
     }
 
     fn related_text(
@@ -471,13 +511,14 @@ impl Store for SqliteStore {
         query_vectors: &[Vec<f32>],
         exclude_paths: &[String],
         limit: usize,
+        filter: &TextQuery,
     ) -> Result<Vec<Hit>> {
         // Always over-fetch: exclude_paths includes the source document
         // itself, and its own chunks are guaranteed to be the top ANN
         // matches for their own queries, so a tight k would leave too few
         // results after exclusion.
         let k = limit * 5;
-        if let Some(candidates) = self.ann_candidates(query_vectors, k, None)? {
+        if let Some(candidates) = self.ann_candidates(query_vectors, k, filter)? {
             return Ok(search::rank_multi(
                 query_vectors,
                 candidates,
@@ -485,7 +526,7 @@ impl Store for SqliteStore {
                 limit,
             ));
         }
-        let candidates = self.text_candidates(None)?;
+        let candidates = self.text_candidates(filter)?;
         Ok(search::rank_multi(
             query_vectors,
             candidates,
@@ -517,6 +558,7 @@ mod tests {
                 indexed_at: 0,
                 chunks: &[],
                 links: &[],
+                tags: &[],
             })
             .unwrap();
     }

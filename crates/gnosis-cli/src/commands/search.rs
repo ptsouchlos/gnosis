@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::embedder::build_text_embedder;
-use crate::store::{SqliteStore, Store};
+use crate::store::{SqliteStore, Store, TextQuery};
 use crate::workspace::{Workspace, expand_tilde};
 
 /// Semantic search over the indexed content.
@@ -17,6 +17,10 @@ pub struct SearchArgs {
     /// Restrict to documents from these vault roots (repeatable).
     #[arg(long)]
     pub from: Vec<PathBuf>,
+    /// Restrict to documents having any of these tags (repeatable; matches
+    /// any, not all).
+    #[arg(long)]
+    pub tag: Vec<String>,
     /// Maximum number of results.
     #[arg(long, default_value_t = 10)]
     pub limit: usize,
@@ -65,8 +69,16 @@ pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
         .map(|c| c.to_string_lossy().to_string())
         .collect();
     let from_ref = (!from.is_empty()).then_some(from.as_slice());
+    let tags_ref = (!args.tag.is_empty()).then_some(args.tag.as_slice());
 
-    let hits = store.search_text(&query_vec, args.limit, from_ref)?;
+    let hits = store.search_text(
+        &query_vec,
+        args.limit,
+        &TextQuery {
+            from: from_ref,
+            tags: tags_ref,
+        },
+    )?;
 
     if args.json {
         // Full data regardless of --full: JSON output is for programmatic
