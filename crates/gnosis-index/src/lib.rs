@@ -25,11 +25,16 @@ pub struct IndexReport {
 
 /// The embedders an indexing run needs, one per space. `image`/`image_text`
 /// are `None` when `[embed.image] enabled = false` — a text-only vault
-/// indexes exactly as it did before this field existed.
+/// indexes exactly as it did before this field existed. `image`/`image_text`
+/// are owned (not borrowed like `text`) so the caller can move freshly-built
+/// `Box<dyn Embedder>`s straight in — borrowing from separate sibling
+/// `Option<Box<dyn Embedder>>` locals here instead runs into a real rustc
+/// dropck limitation (conservative drop-order analysis across sibling
+/// trait-object-holding locals sharing a borrowing struct).
 pub struct EmbedderSet<'a> {
     pub text: &'a mut dyn Embedder,
-    pub image: Option<&'a mut dyn Embedder>,
-    pub image_text: Option<&'a mut dyn Embedder>,
+    pub image: Option<Box<dyn Embedder>>,
+    pub image_text: Option<Box<dyn Embedder>>,
 }
 
 /// The trait-object backends an indexing run needs. Bundled so `run` doesn't
@@ -181,7 +186,7 @@ fn index_markdown_file(
         .collect();
 
     if let Some(image_text) = &mut args.embedders.image_text {
-        chunk_writes.push(title_proxy_chunk(image_text, chunk_writes.len(), &parsed.title)?);
+        chunk_writes.push(title_proxy_chunk(image_text.as_mut(), chunk_writes.len(), &parsed.title)?);
     }
 
     let hash = blake3::hash(bytes);
@@ -244,7 +249,7 @@ fn index_image_file(
     }];
 
     if let Some(image_text) = &mut args.embedders.image_text {
-        chunk_writes.push(title_proxy_chunk(image_text, 1, &title)?);
+        chunk_writes.push(title_proxy_chunk(image_text.as_mut(), 1, &title)?);
     }
 
     let (width, height) = args
@@ -280,7 +285,7 @@ fn index_image_file(
 /// mechanism that lets `related` traverse from an image to a text document
 /// (and vice versa) without ever comparing incompatible vector spaces
 /// directly. See `docs/gnosis/image-support.md`.
-fn title_proxy_chunk(image_text: &mut &mut dyn Embedder, ord: usize, title: &str) -> Result<ChunkWrite> {
+fn title_proxy_chunk(image_text: &mut dyn Embedder, ord: usize, title: &str) -> Result<ChunkWrite> {
     let vector = image_text
         .embed(&[title.to_string()])?
         .into_iter()

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 
-use crate::embedder::build_text_embedder;
+use crate::embedder::{build_clip_text_embedder, build_image_embedder, build_text_embedder};
 use crate::fs::StdFs;
 use crate::progress::IndicatifProgress;
 use crate::store::SqliteStore;
@@ -27,13 +27,24 @@ pub fn execute(ws: &Workspace, _args: RebuildArgs) -> Result<()> {
 
     println!("Rebuilding index from scratch…");
     let mut store = SqliteStore::open(&ws.db_path)?;
-    let mut embedder = build_text_embedder(&ws.config.embed.text.model)?;
+    let mut text_embedder = build_text_embedder(&ws.config.embed.text.model)?;
+    let image_enabled = ws.config.embed.image.enabled;
+    let image_embedder = image_enabled
+        .then(|| build_image_embedder(&ws.config.embed.image.model))
+        .transpose()?;
+    let image_text_embedder = image_enabled
+        .then(|| build_clip_text_embedder(&ws.config.embed.image.model))
+        .transpose()?;
     let progress = IndicatifProgress::new();
     let mut indexer_args = index::IndexerArgs {
         store: &mut store,
         walker: &FsWalker,
         fs_reader: &StdFs,
-        embedder: embedder.as_mut(),
+        embedders: index::EmbedderSet {
+            text: text_embedder.as_mut(),
+            image: image_embedder,
+            image_text: image_text_embedder,
+        },
         progress: &progress,
     };
     let report = index::run(
@@ -46,6 +57,9 @@ pub fn execute(ws: &Workspace, _args: RebuildArgs) -> Result<()> {
     println!("Done: {} indexed, {} chunks.", report.indexed, report.chunks);
 
     store.rebuild_index("text")?;
+    if image_enabled {
+        store.rebuild_index("image")?;
+    }
     println!("Updated search index.");
     Ok(())
 }
