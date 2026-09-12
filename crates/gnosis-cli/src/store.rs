@@ -21,11 +21,12 @@ pub const SCHEMA_VERSION: i64 = 1;
 /// SQLite-backed [`Store`]; gnosis's durable source of truth.
 pub struct SqliteStore {
     conn: Connection,
-    /// On-disk ANN index for the text space, sibling to the database file
-    /// (`<db_dir>/index/text.usearch`). Always reconstructable from SQLite
-    /// via `rebuild_text_index` — a missing or stale file just means
-    /// queries fall back to the brute-force path, never data loss.
-    text_index_path: PathBuf,
+    /// Directory holding one on-disk ANN index per space
+    /// (`<db_dir>/index/<space>.usearch`), sibling to the database file.
+    /// Always reconstructable from SQLite via `rebuild_index` — a missing
+    /// or stale file just means queries fall back to the brute-force path,
+    /// never data loss.
+    index_dir: PathBuf,
 }
 
 impl SqliteStore {
@@ -41,18 +42,19 @@ impl SqliteStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
 
-        let text_index_path = path
+        let index_dir = path
             .parent()
             .unwrap_or_else(|| Path::new("."))
-            .join("index")
-            .join("text.usearch");
+            .join("index");
 
-        let store = SqliteStore {
-            conn,
-            text_index_path,
-        };
+        let store = SqliteStore { conn, index_dir };
         store.init_schema()?;
         Ok(store)
+    }
+
+    /// Path to one space's on-disk ANN index file.
+    fn index_path(&self, space: &str) -> PathBuf {
+        self.index_dir.join(format!("{space}.usearch"))
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -67,7 +69,9 @@ impl SqliteStore {
                 mtime        INTEGER NOT NULL,
                 title        TEXT,
                 frontmatter  TEXT,                    -- JSON
-                indexed_at   INTEGER NOT NULL
+                indexed_at   INTEGER NOT NULL,
+                width        INTEGER,                 -- image documents only
+                height       INTEGER                  -- image documents only
             );
             CREATE INDEX IF NOT EXISTS idx_documents_root ON documents(source_root);
 
@@ -104,7 +108,29 @@ impl SqliteStore {
             "#,
         )?;
 
+        self.ensure_column("documents", "width", "width INTEGER")?;
+        self.ensure_column("documents", "height", "height INTEGER")?;
+
         self.set_meta("schema_version", &SCHEMA_VERSION.to_string())?;
+        Ok(())
+    }
+
+    /// Add `column` to `table` if it isn't already present. `CREATE TABLE IF
+    /// NOT EXISTS` only helps brand-new databases; existing ones need an
+    /// explicit, idempotent `ALTER TABLE` — SQLite has no `ADD COLUMN IF NOT
+    /// EXISTS`.
+    fn ensure_column(&self, table: &str, column: &str, ddl: &str) -> Result<()> {
+        let exists = self
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|c| c == column);
+        if !exists {
+            self.conn
+                .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {ddl}"))?;
+        }
         Ok(())
     }
 
@@ -124,13 +150,19 @@ impl SqliteStore {
         Ok(paths)
     }
 
-    /// Fetch every text-space chunk as a scoring candidate, scoped per
-    /// `filter`. Shared by `search_text`/`related_text`.
-    fn text_candidates(&self, filter: &TextQuery) -> Result<Vec<Candidate>> {
+    /// Every chunk in `space` as a scoring candidate, scoped per `filter`.
+    /// Shared by `search_space`/`related_space`. Params are kept as a single
+    /// homogeneous `Vec<String>` (space, then roots, then tags) bound via
+    /// `params_from_iter` against fully anonymous `?` placeholders — mirrors
+    /// exactly how the pre-existing root/tag filtering already worked here,
+    /// just with `space` folded into the same list instead of being a fixed
+    /// SQL literal.
+    fn space_candidates(&self, space: &str, filter: &TextQuery) -> Result<Vec<Candidate>> {
         let mut sql = String::from(
-            "SELECT d.path, d.title, d.source_root, c.heading_path, c.text, c.vector
+            "SELECT d.path, d.title, d.source_root, c.heading_path, c.text, c.vector,
+                    d.width, d.height, c.modality
              FROM chunks c JOIN documents d ON d.id = c.doc_id
-             WHERE c.space = 'text' AND c.vector IS NOT NULL",
+             WHERE c.space = ? AND c.vector IS NOT NULL",
         );
         let roots = filter.from.filter(|f| !f.is_empty());
         if let Some(roots) = roots {
@@ -148,17 +180,10 @@ impl SqliteStore {
         }
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let map_row = |r: &rusqlite::Row<'_>| {
-            Ok(Candidate {
-                path: r.get::<_, String>(0)?,
-                title: r.get::<_, String>(1)?,
-                source_root: r.get::<_, String>(2)?,
-                heading_path: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                text: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                vector: search::blob_to_vec(&r.get::<_, Vec<u8>>(5)?),
-            })
-        };
-        let params: Vec<&String> = roots.into_iter().flatten().chain(tags.into_iter().flatten()).collect();
+        let map_row = space_candidate_row_mapper();
+        let mut params: Vec<String> = vec![space.to_string()];
+        params.extend(roots.into_iter().flatten().cloned());
+        params.extend(tags.into_iter().flatten().cloned());
         let candidates: Vec<Candidate> = stmt
             .query_map(rusqlite::params_from_iter(params), map_row)?
             .collect::<rusqlite::Result<_>>()?;
@@ -174,23 +199,15 @@ impl SqliteStore {
             return Ok(Vec::new());
         }
         let sql = format!(
-            "SELECT d.path, d.title, d.source_root, c.heading_path, c.text, c.vector
+            "SELECT d.path, d.title, d.source_root, c.heading_path, c.text, c.vector,
+                    d.width, d.height, c.modality
              FROM chunks c JOIN documents d ON d.id = c.doc_id
              WHERE c.id IN ({})",
             in_placeholders(ids.len())
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let id_params: Vec<i64> = ids.iter().map(|id| *id as i64).collect();
-        let map_row = |r: &rusqlite::Row<'_>| {
-            Ok(Candidate {
-                path: r.get::<_, String>(0)?,
-                title: r.get::<_, String>(1)?,
-                source_root: r.get::<_, String>(2)?,
-                heading_path: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                text: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                vector: search::blob_to_vec(&r.get::<_, Vec<u8>>(5)?),
-            })
-        };
+        let map_row = space_candidate_row_mapper();
         let mut candidates: Vec<Candidate> = stmt
             .query_map(rusqlite::params_from_iter(&id_params), map_row)?
             .collect::<rusqlite::Result<_>>()?;
@@ -205,24 +222,26 @@ impl SqliteStore {
         Ok(candidates)
     }
 
-    /// Prefilter candidates via the on-disk ANN index for one or more query
-    /// vectors (unioned across queries). `None` when no index exists yet,
-    /// or an existing one fails to load (treated as "not built" rather
-    /// than a hard error — reconstructable via `rebuild_text_index`, so a
-    /// stale/corrupt file should degrade to the brute-force path, not
-    /// break search). `k` is how many neighbors to request per query;
-    /// callers pick the over-fetch factor since ANN can't filter by vault
-    /// root, tag, or excluded path itself.
+    /// Prefilter candidates via one space's on-disk ANN index for one or
+    /// more query vectors (unioned across queries). `None` when no index
+    /// exists yet, or an existing one fails to load (treated as "not built"
+    /// rather than a hard error — reconstructable via `rebuild_index`, so a
+    /// stale/corrupt file should degrade to the brute-force path, not break
+    /// search). `k` is how many neighbors to request per query; callers
+    /// pick the over-fetch factor since ANN can't filter by vault root,
+    /// tag, or modality itself.
     fn ann_candidates(
         &self,
+        space: &str,
         queries: &[Vec<f32>],
         k: usize,
         filter: &TextQuery,
     ) -> Result<Option<Vec<Candidate>>> {
-        if !self.text_index_path.exists() {
+        let index_path = self.index_path(space);
+        if !index_path.exists() {
             return Ok(None);
         }
-        let Some(path_str) = self.text_index_path.to_str() else {
+        let Some(path_str) = index_path.to_str() else {
             return Ok(None);
         };
         let index = match Index::restore(path_str) {
@@ -240,25 +259,26 @@ impl SqliteStore {
         Ok(Some(self.candidates_by_ids(&ids, filter)?))
     }
 
-    /// Rebuild the on-disk ANN index for the text space from the current
-    /// SQLite contents. Always safe to call — the index is fully derived
-    /// from SQLite, so a stale or missing index is a (re)build, never data
-    /// loss. No-ops (removing any existing index file) when there are zero
-    /// text chunks, so queries correctly fall back to the brute-force path
-    /// rather than querying an empty/stale index.
-    pub fn rebuild_text_index(&mut self) -> Result<()> {
+    /// Rebuild the on-disk ANN index for `space` from the current SQLite
+    /// contents. Always safe to call — the index is fully derived from
+    /// SQLite, so a stale or missing index is a (re)build, never data loss.
+    /// No-ops (removing any existing index file) when there are zero chunks
+    /// in this space, so queries correctly fall back to the brute-force
+    /// path rather than querying an empty/stale index.
+    pub fn rebuild_index(&mut self, space: &str) -> Result<()> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, vector FROM chunks WHERE space = 'text' AND vector IS NOT NULL")?;
+            .prepare("SELECT id, vector FROM chunks WHERE space = ?1 AND vector IS NOT NULL")?;
         let rows: Vec<(i64, Vec<f32>)> = stmt
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))?
+            .query_map([space], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()
             .map(|(id, blob)| (id, search::blob_to_vec(&blob)))
             .collect();
 
+        let index_path = self.index_path(space);
         if rows.is_empty() {
-            let _ = std::fs::remove_file(&self.text_index_path);
+            let _ = std::fs::remove_file(&index_path);
             return Ok(());
         }
 
@@ -275,16 +295,33 @@ impl SqliteStore {
             index.add(*id as Key, vector)?;
         }
 
-        if let Some(parent) = self.text_index_path.parent() {
+        if let Some(parent) = index_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let path_str = self
-            .text_index_path
+        let path_str = index_path
             .to_str()
             .context("index path is not valid UTF-8")?;
         index.save(path_str)?;
         Ok(())
+    }
+}
+
+/// Shared row → `Candidate` mapper for the two candidate-fetching queries,
+/// both of which select the same nine columns in the same order.
+fn space_candidate_row_mapper() -> impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<Candidate> {
+    |r: &rusqlite::Row<'_>| {
+        Ok(Candidate {
+            path: r.get::<_, String>(0)?,
+            title: r.get::<_, String>(1)?,
+            source_root: r.get::<_, String>(2)?,
+            heading_path: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            text: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            vector: search::blob_to_vec(&r.get::<_, Vec<u8>>(5)?),
+            width: r.get::<_, Option<i64>>(6)?,
+            height: r.get::<_, Option<i64>>(7)?,
+            modality: r.get::<_, String>(8)?,
+        })
     }
 }
 
@@ -385,8 +422,8 @@ impl Store for SqliteStore {
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO documents
-                (path, kind, source_root, content_hash, mtime, title, frontmatter, indexed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                (path, kind, source_root, content_hash, mtime, title, frontmatter, indexed_at, width, height)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(path) DO UPDATE SET
                 kind = excluded.kind,
                 source_root = excluded.source_root,
@@ -394,7 +431,9 @@ impl Store for SqliteStore {
                 mtime = excluded.mtime,
                 title = excluded.title,
                 frontmatter = excluded.frontmatter,
-                indexed_at = excluded.indexed_at",
+                indexed_at = excluded.indexed_at,
+                width = excluded.width,
+                height = excluded.height",
             rusqlite::params![
                 doc.path,
                 doc.kind,
@@ -404,6 +443,8 @@ impl Store for SqliteStore {
                 doc.title,
                 doc.frontmatter,
                 doc.indexed_at,
+                doc.width,
+                doc.height,
             ],
         )?;
 
@@ -457,29 +498,34 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    fn search_text(&self, query: &[f32], limit: usize, filter: &TextQuery) -> Result<Vec<Hit>> {
-        // Over-fetch when filtering by root or tag, since ANN can't apply
-        // either filter itself.
-        let k = if filter.from.is_some() || filter.tags.is_some() {
+    fn search_space(&self, space: &str, query: &[f32], limit: usize, filter: &TextQuery) -> Result<Vec<Hit>> {
+        // Over-fetch when filtering by root/tag (ANN can't apply either),
+        // or when searching the image space (the modality post-filter below
+        // can drop a meaningful fraction of the ANN-returned candidates).
+        let k = if filter.from.is_some() || filter.tags.is_some() || space == "image" {
             limit * 5
         } else {
             limit
         };
         let queries = [query.to_vec()];
-        if let Some(candidates) = self.ann_candidates(&queries, k, filter)? {
-            return Ok(search::rank(query, candidates, limit));
+        let mut candidates = if let Some(candidates) = self.ann_candidates(space, &queries, k, filter)? {
+            candidates
+        } else {
+            self.space_candidates(space, filter)?
+        };
+        if space == "image" {
+            candidates.retain(|c| c.modality == "image");
         }
-        let candidates = self.text_candidates(filter)?;
         Ok(search::rank(query, candidates, limit))
     }
 
-    fn text_chunk_vectors(&self, path: &str) -> Result<Vec<Vec<f32>>> {
+    fn chunk_vectors(&self, path: &str, space: &str) -> Result<Vec<Vec<f32>>> {
         let mut stmt = self.conn.prepare(
             "SELECT c.vector FROM chunks c JOIN documents d ON d.id = c.doc_id
-             WHERE c.space = 'text' AND c.vector IS NOT NULL AND d.path = ?1",
+             WHERE c.space = ?1 AND c.vector IS NOT NULL AND d.path = ?2",
         )?;
         let vectors = stmt
-            .query_map([path], |r| r.get::<_, Vec<u8>>(0))?
+            .query_map(rusqlite::params![space, path], |r| r.get::<_, Vec<u8>>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()
             .map(|b| search::blob_to_vec(&b))
@@ -506,8 +552,9 @@ impl Store for SqliteStore {
         Ok(rows)
     }
 
-    fn related_text(
+    fn related_space(
         &self,
+        space: &str,
         query_vectors: &[Vec<f32>],
         exclude_paths: &[String],
         limit: usize,
@@ -518,7 +565,7 @@ impl Store for SqliteStore {
         // matches for their own queries, so a tight k would leave too few
         // results after exclusion.
         let k = limit * 5;
-        if let Some(candidates) = self.ann_candidates(query_vectors, k, filter)? {
+        if let Some(candidates) = self.ann_candidates(space, query_vectors, k, filter)? {
             return Ok(search::rank_multi(
                 query_vectors,
                 candidates,
@@ -526,7 +573,7 @@ impl Store for SqliteStore {
                 limit,
             ));
         }
-        let candidates = self.text_candidates(filter)?;
+        let candidates = self.space_candidates(space, filter)?;
         Ok(search::rank_multi(
             query_vectors,
             candidates,
@@ -544,6 +591,7 @@ fn in_placeholders(n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use store::ChunkWrite;
 
     fn write_doc(store: &mut SqliteStore, path: &str, root: &str) {
         store
@@ -559,8 +607,177 @@ mod tests {
                 chunks: &[],
                 links: &[],
                 tags: &[],
+                width: None,
+                height: None,
             })
             .unwrap();
+    }
+
+    /// Each test gets its own directory (not just its own `.db` filename) —
+    /// `SqliteStore` derives its ANN index directory from the db path's
+    /// *parent*, so tests sharing a parent directory would silently share
+    /// (and corrupt each other's) `index/text.usearch`/`index/image.usearch`
+    /// files. Returns the directory so callers can `remove_dir_all` it.
+    fn temp_store() -> (SqliteStore, PathBuf) {
+        let dir = std::env::temp_dir()
+            .join(format!("gnosis-store-space-test-{}-{}", std::process::id(), rand_suffix()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gnosis.db");
+        (SqliteStore::open(&path).unwrap(), dir)
+    }
+
+    fn rand_suffix() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos() as u64
+    }
+
+    fn write_full_doc(
+        store: &mut SqliteStore,
+        path: &str,
+        kind: &str,
+        chunks: &[ChunkWrite],
+        width: Option<i64>,
+        height: Option<i64>,
+    ) {
+        store
+            .replace_document(&DocWrite {
+                path,
+                kind,
+                source_root: "/vault",
+                content_hash: path.as_bytes(),
+                mtime: 0,
+                title: path,
+                frontmatter: None,
+                indexed_at: 0,
+                chunks,
+                links: &[],
+                tags: &[],
+                width,
+                height,
+            })
+            .unwrap();
+    }
+
+    fn chunk(space: &str, modality: &str, text: Option<&str>, vector: Vec<f32>) -> ChunkWrite {
+        ChunkWrite {
+            ord: 0,
+            space: space.to_string(),
+            modality: modality.to_string(),
+            text: text.map(str::to_string),
+            heading_path: String::new(),
+            vector,
+        }
+    }
+
+    #[test]
+    fn search_space_excludes_title_proxy_rows() {
+        let (mut store, path) = temp_store();
+        write_full_doc(
+            &mut store,
+            "/vault/photo.png",
+            "image",
+            &[chunk("image", "image", None, vec![1.0, 0.0])],
+            Some(800),
+            Some(600),
+        );
+        write_full_doc(
+            &mut store,
+            "/vault/note.md",
+            "markdown",
+            &[chunk("image", "text_title", Some("note"), vec![1.0, 0.0])],
+            None,
+            None,
+        );
+
+        let hits = store
+            .search_space("image", &[1.0, 0.0], 10, &TextQuery::default())
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "/vault/photo.png");
+        assert_eq!(hits[0].width, Some(800));
+        assert_eq!(hits[0].height, Some(600));
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn related_space_includes_title_proxy_rows() {
+        let (mut store, path) = temp_store();
+        write_full_doc(
+            &mut store,
+            "/vault/photo.png",
+            "image",
+            &[chunk("image", "image", None, vec![1.0, 0.0])],
+            Some(800),
+            Some(600),
+        );
+        write_full_doc(
+            &mut store,
+            "/vault/note.md",
+            "markdown",
+            &[chunk("image", "text_title", Some("note"), vec![1.0, 0.0])],
+            None,
+            None,
+        );
+
+        let hits = store
+            .related_space("image", &[vec![1.0, 0.0]], &[], 10, &TextQuery::default())
+            .unwrap();
+
+        let mut paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["/vault/note.md", "/vault/photo.png"]);
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn chunk_vectors_scoped_to_space() {
+        let (mut store, path) = temp_store();
+        write_full_doc(
+            &mut store,
+            "/vault/note.md",
+            "markdown",
+            &[
+                chunk("text", "text", Some("body"), vec![0.5, 0.5]),
+                chunk("image", "text_title", Some("note"), vec![1.0, 0.0]),
+            ],
+            None,
+            None,
+        );
+
+        assert_eq!(store.chunk_vectors("/vault/note.md", "text").unwrap().len(), 1);
+        assert_eq!(store.chunk_vectors("/vault/note.md", "image").unwrap().len(), 1);
+        assert_eq!(
+            store.chunk_vectors("/vault/photo.png", "image").unwrap().len(),
+            0
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn rebuild_index_is_per_space() {
+        let (mut store, path) = temp_store();
+        write_full_doc(
+            &mut store,
+            "/vault/photo.png",
+            "image",
+            &[chunk("image", "image", None, vec![1.0, 0.0])],
+            Some(1),
+            Some(1),
+        );
+        store.rebuild_index("image").unwrap();
+        store.rebuild_index("text").unwrap(); // no text chunks — must no-op, not error
+
+        let hits = store
+            .search_space("image", &[1.0, 0.0], 10, &TextQuery::default())
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     /// `paths_for_roots` and `delete_by_root` must stay scoped to one vault, so

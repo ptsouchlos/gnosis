@@ -45,7 +45,7 @@ pub fn execute(ws: &Workspace, _args: RebuildArgs) -> Result<()> {
     )?;
     println!("Done: {} indexed, {} chunks.", report.indexed, report.chunks);
 
-    store.rebuild_text_index()?;
+    store.rebuild_index("text")?;
     println!("Updated search index.");
     Ok(())
 }

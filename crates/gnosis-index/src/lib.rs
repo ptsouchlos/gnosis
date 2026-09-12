@@ -164,6 +164,8 @@ fn index_file(
         chunks: &chunk_writes,
         links: &parsed.links,
         tags: &parsed.tags,
+        width: None,
+        height: None,
     })?;
 
     Ok(chunk_writes.len())

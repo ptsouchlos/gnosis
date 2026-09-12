@@ -43,7 +43,7 @@ pub fn execute(ws: &Workspace, args: RelatedArgs) -> Result<()> {
         bail!("{} is not indexed — run `gnosis index`", canon.display());
     }
 
-    let queries = store.text_chunk_vectors(&path)?;
+    let queries = store.chunk_vectors(&path, "text")?;
     if queries.is_empty() {
         bail!("{} has no text chunks to compare", canon.display());
     }
@@ -58,7 +58,8 @@ pub fn execute(ws: &Workspace, args: RelatedArgs) -> Result<()> {
     }
 
     let tags_ref = (!args.tag.is_empty()).then_some(args.tag.as_slice());
-    let hits = store.related_text(
+    let hits = store.related_space(
+        "text",
         &queries,
         &exclude,
         args.limit,

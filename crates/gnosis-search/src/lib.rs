@@ -15,6 +15,7 @@ pub struct Candidate {
     /// (or `None` for text documents / unknown dimensions).
     pub width: Option<i64>,
     pub height: Option<i64>,
+    pub modality: String,
 }
 
 /// One ranked search result (best chunk per document).
@@ -172,6 +173,7 @@ mod tests {
             vector,
             width: None,
             height: None,
+            modality: "text".to_string(),
         }
     }
 

@@ -71,7 +71,8 @@ pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
     let from_ref = (!from.is_empty()).then_some(from.as_slice());
     let tags_ref = (!args.tag.is_empty()).then_some(args.tag.as_slice());
 
-    let hits = store.search_text(
+    let hits = store.search_space(
+        "text",
         &query_vec,
         args.limit,
         &TextQuery {
