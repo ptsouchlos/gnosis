@@ -10,12 +10,14 @@ use anyhow::Result;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocKind {
     Markdown,
+    Image,
 }
 
 impl DocKind {
     pub fn as_str(self) -> &'static str {
         match self {
             DocKind::Markdown => "markdown",
+            DocKind::Image => "image",
         }
     }
 
@@ -23,6 +25,14 @@ impl DocKind {
     pub fn from_path(path: &Path) -> Option<Self> {
         match path.extension().and_then(|e| e.to_str()) {
             Some(ext) if ext.eq_ignore_ascii_case("md") => Some(DocKind::Markdown),
+            Some(ext)
+                if ext.eq_ignore_ascii_case("png")
+                    || ext.eq_ignore_ascii_case("jpg")
+                    || ext.eq_ignore_ascii_case("jpeg")
+                    || ext.eq_ignore_ascii_case("webp") =>
+            {
+                Some(DocKind::Image)
+            }
             _ => None,
         }
     }
@@ -40,4 +50,22 @@ pub trait Walker {
     /// Walk `root` for indexable files, honoring `.gitignore` and the
     /// configured ignore globs. Hidden files/dirs are skipped by default.
     fn discover(&self, root: &Path, ignore_globs: &[String]) -> Result<Vec<Found>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn classifies_markdown_and_image_extensions() {
+        assert_eq!(DocKind::from_path(Path::new("note.md")), Some(DocKind::Markdown));
+        assert_eq!(DocKind::from_path(Path::new("photo.PNG")), Some(DocKind::Image));
+        assert_eq!(DocKind::from_path(Path::new("photo.jpg")), Some(DocKind::Image));
+        assert_eq!(DocKind::from_path(Path::new("photo.JPEG")), Some(DocKind::Image));
+        assert_eq!(DocKind::from_path(Path::new("photo.webp")), Some(DocKind::Image));
+        assert_eq!(DocKind::from_path(Path::new("photo.gif")), None);
+        assert_eq!(DocKind::from_path(Path::new("readme.txt")), None);
+        assert_eq!(DocKind::Image.as_str(), "image");
+    }
 }
