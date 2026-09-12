@@ -1080,6 +1080,7 @@ dependencies = [
  "fastembed",
  "fs",
  "ignore",
+ "image",
  "index",
  "indicatif 0.17.11",
  "parse",
