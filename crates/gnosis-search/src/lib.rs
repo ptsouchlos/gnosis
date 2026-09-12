@@ -107,8 +107,12 @@ fn rank_by(
 /// passes through with its raw scores unchanged (today's exact behavior,
 /// preserved for callers that never touch image search). Two or more spaces
 /// get per-space min-max score normalization first — plain cosine scores
-/// aren't comparable across different embedding models — then are merged
-/// and truncated to `limit`.
+/// aren't comparable across different embedding models — then are merged.
+/// A document appearing in more than one space's results (e.g. a note has
+/// both a `text`-space chunk and an `image`-space title-proxy, so `related`
+/// can legitimately score it from both sides) is kept once, at its best
+/// score — a caller-visible duplicate listing would look like a bug, not a
+/// feature. Truncated to `limit` after dedup.
 pub fn merge_normalized(per_space: Vec<Vec<Hit>>, limit: usize) -> Vec<Hit> {
     if per_space.len() <= 1 {
         let mut hits = per_space.into_iter().next().unwrap_or_default();
@@ -116,7 +120,7 @@ pub fn merge_normalized(per_space: Vec<Vec<Hit>>, limit: usize) -> Vec<Hit> {
         return hits;
     }
 
-    let mut merged: Vec<Hit> = Vec::new();
+    let mut best: HashMap<String, Hit> = HashMap::new();
     for mut hits in per_space {
         if hits.is_empty() {
             continue;
@@ -127,8 +131,16 @@ pub fn merge_normalized(per_space: Vec<Vec<Hit>>, limit: usize) -> Vec<Hit> {
         for hit in &mut hits {
             hit.score = if range > f32::EPSILON { (hit.score - min) / range } else { 1.0 };
         }
-        merged.extend(hits);
+        for hit in hits {
+            match best.get(&hit.path) {
+                Some(existing) if existing.score >= hit.score => {}
+                _ => {
+                    best.insert(hit.path.clone(), hit);
+                }
+            }
+        }
     }
+    let mut merged: Vec<Hit> = best.into_values().collect();
     merged.sort_by(|a, b| b.score.total_cmp(&a.score));
     merged.truncate(limit);
     merged
@@ -273,5 +285,34 @@ mod tests {
                                 heading_path: String::new(), text: String::new(), score: 1.0,
                                 width: None, height: None }];
         assert_eq!(merge_normalized(vec![hits, other], 2).len(), 2);
+    }
+
+    #[test]
+    fn merge_normalized_dedups_a_document_scored_in_multiple_spaces() {
+        // A document with both a text-space chunk and an image-space
+        // title-proxy (any markdown note, once image mode is on) can
+        // legitimately score in both spaces' results for `related` — it
+        // must appear once, at its best normalized score, not twice.
+        let text_hits = vec![
+            Hit { path: "note.md".into(), title: "note".into(), source_root: "/r".into(),
+                  heading_path: String::new(), text: String::new(), score: 0.90,
+                  width: None, height: None },
+            Hit { path: "other.md".into(), title: "other".into(), source_root: "/r".into(),
+                  heading_path: String::new(), text: String::new(), score: 0.10,
+                  width: None, height: None },
+        ];
+        let image_hits = vec![
+            Hit { path: "note.md".into(), title: "note".into(), source_root: "/r".into(),
+                  heading_path: String::new(), text: String::new(), score: 0.20,
+                  width: None, height: None },
+            Hit { path: "img.png".into(), title: "img".into(), source_root: "/r".into(),
+                  heading_path: String::new(), text: String::new(), score: 0.05,
+                  width: Some(1), height: Some(1) },
+        ];
+        let merged = merge_normalized(vec![text_hits, image_hits], 10);
+        let note_hits: Vec<&Hit> = merged.iter().filter(|h| h.path == "note.md").collect();
+        assert_eq!(note_hits.len(), 1, "note.md must appear exactly once");
+        assert_eq!(note_hits[0].score, 1.0, "kept at its best (text-space) normalized score");
+        assert_eq!(merged.len(), 3);
     }
 }
