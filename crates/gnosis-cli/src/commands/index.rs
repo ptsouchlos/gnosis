@@ -15,6 +15,10 @@ pub struct IndexArgs {
     /// Vault path to index. Locally this overrides the configured vaults for
     /// this run; globally it registers (and indexes) the vault.
     pub path: Option<PathBuf>,
+    /// Stop immediately on the first file that fails to index (e.g. a
+    /// corrupt image), instead of skipping it and reporting it at the end.
+    #[arg(long)]
+    pub fail_fast: bool,
 }
 
 pub fn execute(mut ws: Workspace, args: IndexArgs) -> Result<()> {
@@ -48,11 +52,13 @@ pub fn execute(mut ws: Workspace, args: IndexArgs) -> Result<()> {
         &ws.config.ignore.globs,
         &ws.config.chunk,
         false,
+        args.fail_fast,
     )?;
     println!(
         "Done: {} scanned, {} (re)indexed, {} unchanged, {} removed, {} chunks.",
         report.scanned, report.indexed, report.skipped, report.deleted, report.chunks
     );
+    crate::commands::print_index_errors(&report.errors);
 
     store.rebuild_index("text")?;
     if image_enabled {

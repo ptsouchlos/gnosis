@@ -1487,6 +1487,7 @@ dependencies = [
  "fs",
  "parse",
  "progress",
+ "search",
  "store",
  "walk",
 ]

@@ -21,6 +21,18 @@ pub struct IndexReport {
     pub skipped: usize,
     pub deleted: usize,
     pub chunks: usize,
+    pub errors: Vec<IndexError>,
+}
+
+/// A file that failed to index. Currently only possible for images — a
+/// corrupt or unsupported file fails to open/decode; markdown has no
+/// equivalent failure mode (`chunk_markdown` is infallible over any UTF-8
+/// text). Indexing continues past these by default; `fail_fast` makes `run`
+/// return the error immediately instead of collecting it here.
+#[derive(Debug)]
+pub struct IndexError {
+    pub path: String,
+    pub message: String,
 }
 
 /// The embedders an indexing run needs, one per space. `image`/`image_text`
@@ -50,12 +62,21 @@ pub struct IndexerArgs<'a> {
 /// Walk each root in `roots`, (re)embed changed documents, and prune deleted
 /// ones. Pruning is scoped to the source vaults walked in this run, so indexing
 /// one vault never removes another's documents from a shared database.
+///
+/// A file that fails to read or index is, by default, skipped and recorded
+/// in the returned report's `errors` rather than aborting the whole run —
+/// today this only happens for images (a corrupt or unsupported file fails
+/// to open/decode). `fail_fast` makes `run` return that error immediately
+/// instead. Markdown files always propagate their errors immediately
+/// regardless of `fail_fast` — there's no equivalent soft failure mode to
+/// skip past for them.
 pub fn run(
     args: &mut IndexerArgs,
     roots: &[PathBuf],
     ignore_globs: &[String],
     chunk_cfg: &chunker::ChunkConfig,
     force: bool,
+    fail_fast: bool,
 ) -> Result<IndexReport> {
     guard_model(&*args.store, &args.embedders, force)?;
     args.store
@@ -100,21 +121,20 @@ pub fn run(
                 continue;
             }
 
-            let bytes = args.fs_reader.read(&path)?;
-            let hash = blake3::hash(&bytes);
-
-            if !force
-                && let Some(existing) = args.store.document_hash(&path_str)?
-                && existing.as_slice() == hash.as_bytes()
-            {
-                report.skipped += 1;
-                args.progress.inc(1);
-                continue;
+            match process_file(args, &path_str, &root_str, file.kind, chunk_cfg, force) {
+                Ok(Some(n)) => {
+                    report.indexed += 1;
+                    report.chunks += n;
+                }
+                Ok(None) => report.skipped += 1,
+                Err(e) if file.kind == DocKind::Image && !fail_fast => {
+                    report.errors.push(IndexError {
+                        path: path_str.clone(),
+                        message: e.to_string(),
+                    });
+                }
+                Err(e) => return Err(e),
             }
-
-            let n = index_file(args, &path_str, &root_str, file.kind, &bytes, chunk_cfg)?;
-            report.indexed += 1;
-            report.chunks += n;
             args.progress.inc(1);
         }
     }
@@ -128,6 +148,32 @@ pub fn run(
     args.progress.finish();
 
     Ok(report)
+}
+
+/// Read, hash, skip-check, and (if needed) index one discovered file.
+/// Returns `Ok(Some(chunk_count))` if (re)indexed, `Ok(None)` if skipped
+/// (unchanged since the last index), or `Err` if reading or indexing
+/// failed — the caller decides whether that's fatal or worth skipping past.
+fn process_file(
+    args: &mut IndexerArgs,
+    path_str: &str,
+    source_root: &str,
+    kind: DocKind,
+    chunk_cfg: &chunker::ChunkConfig,
+    force: bool,
+) -> Result<Option<usize>> {
+    let bytes = args.fs_reader.read(Path::new(path_str))?;
+    let hash = blake3::hash(&bytes);
+
+    if !force
+        && let Some(existing) = args.store.document_hash(path_str)?
+        && existing.as_slice() == hash.as_bytes()
+    {
+        return Ok(None);
+    }
+
+    let n = index_file(args, path_str, source_root, kind, &bytes, chunk_cfg)?;
+    Ok(Some(n))
 }
 
 /// Parse/embed/persist a single discovered file, dispatching on its kind.
@@ -334,4 +380,220 @@ fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use store::{Stats, TextQuery};
+    use walk::Found;
+
+    /// In-memory `Store` fake — just enough of the trait for `run` to
+    /// exercise (`document_hash`/`replace_document`/`get_meta`/`set_meta`/
+    /// `paths_for_roots`). Everything else is unreachable from `run` and
+    /// stubbed trivially.
+    #[derive(Default)]
+    struct FakeStore {
+        written: Vec<String>,
+    }
+
+    impl Store for FakeStore {
+        fn set_meta(&self, _key: &str, _value: &str) -> Result<()> {
+            Ok(())
+        }
+        fn get_meta(&self, _key: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn stats(&self) -> Result<Stats> {
+            Ok(Stats::default())
+        }
+        fn document_hash(&self, _path: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn paths_for_roots(&self, _roots: &[String]) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn counts_by_root(&self) -> Result<Vec<(String, i64)>> {
+            Ok(Vec::new())
+        }
+        fn delete_by_root(&self, _root: &str) -> Result<usize> {
+            Ok(0)
+        }
+        fn replace_document(&mut self, doc: &DocWrite<'_>) -> Result<()> {
+            self.written.push(doc.path.to_string());
+            Ok(())
+        }
+        fn delete_document(&self, _path: &str) -> Result<()> {
+            Ok(())
+        }
+        fn search_space(&self, _: &str, _: &[f32], _: usize, _: &TextQuery) -> Result<Vec<search::Hit>> {
+            Ok(Vec::new())
+        }
+        fn chunk_vectors(&self, _: &str, _: &str) -> Result<Vec<Vec<f32>>> {
+            Ok(Vec::new())
+        }
+        fn linked_targets(&self, _: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn all_document_meta(&self) -> Result<Vec<(String, Option<String>)>> {
+            Ok(Vec::new())
+        }
+        fn related_space(
+            &self,
+            _: &str,
+            _: &[Vec<f32>],
+            _: &[String],
+            _: usize,
+            _: &TextQuery,
+        ) -> Result<Vec<search::Hit>> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct FakeWalker {
+        files: Vec<(PathBuf, DocKind)>,
+    }
+
+    impl Walker for FakeWalker {
+        fn discover(&self, _root: &Path, _ignore_globs: &[String]) -> Result<Vec<Found>> {
+            Ok(self
+                .files
+                .iter()
+                .map(|(path, kind)| Found { path: path.clone(), kind: *kind })
+                .collect())
+        }
+    }
+
+    struct FakeFileReader;
+
+    impl FileReader for FakeFileReader {
+        fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
+            Ok(path.to_path_buf())
+        }
+        fn read(&self, _path: &Path) -> Result<Vec<u8>> {
+            Ok(b"# Heading\n\nbody text".to_vec())
+        }
+        fn mtime(&self, _path: &Path) -> i64 {
+            0
+        }
+        fn image_dimensions(&self, _path: &Path) -> Option<(u32, u32)> {
+            None
+        }
+    }
+
+    struct FakeTextEmbedder;
+
+    impl Embedder for FakeTextEmbedder {
+        fn space(&self) -> &str {
+            "text"
+        }
+        fn dim(&self) -> usize {
+            2
+        }
+        fn model_id(&self) -> &str {
+            "fake-text"
+        }
+        fn embed(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(inputs.iter().map(|_| vec![1.0, 0.0]).collect())
+        }
+    }
+
+    /// Simulates a corrupt/unsupported image: always fails to "decode".
+    struct FailingImageEmbedder;
+
+    impl Embedder for FailingImageEmbedder {
+        fn space(&self) -> &str {
+            "image"
+        }
+        fn dim(&self) -> usize {
+            2
+        }
+        fn model_id(&self) -> &str {
+            "fake-image"
+        }
+        fn embed(&mut self, _inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+            anyhow::bail!("simulated decode failure")
+        }
+    }
+
+    /// One markdown, one (failing) image, one more markdown — proves
+    /// processing continues past the failure to the next file.
+    fn three_file_walker() -> FakeWalker {
+        FakeWalker {
+            files: vec![
+                (PathBuf::from("/vault/a.md"), DocKind::Markdown),
+                (PathBuf::from("/vault/bad.png"), DocKind::Image),
+                (PathBuf::from("/vault/b.md"), DocKind::Markdown),
+            ],
+        }
+    }
+
+    #[test]
+    fn run_skips_failing_images_by_default_and_reports_them() {
+        let mut store = FakeStore::default();
+        let walker = three_file_walker();
+        let fs_reader = FakeFileReader;
+        let mut text_embedder = FakeTextEmbedder;
+        let progress = progress::NoopProgress;
+
+        let mut args = IndexerArgs {
+            store: &mut store,
+            walker: &walker,
+            fs_reader: &fs_reader,
+            embedders: EmbedderSet {
+                text: &mut text_embedder,
+                image: Some(Box::new(FailingImageEmbedder)),
+                image_text: None,
+            },
+            progress: &progress,
+        };
+
+        let report = run(
+            &mut args,
+            &[PathBuf::from("/vault")],
+            &[],
+            &chunker::ChunkConfig::default(),
+            false,
+            false,
+        )
+        .expect("a failing image must not abort the run by default");
+
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.indexed, 2, "both markdown files indexed despite the image failing");
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].path, "/vault/bad.png");
+        assert!(report.errors[0].message.contains("simulated decode failure"));
+    }
+
+    #[test]
+    fn run_fail_fast_aborts_immediately_on_first_error() {
+        let mut store = FakeStore::default();
+        let walker = three_file_walker();
+        let fs_reader = FakeFileReader;
+        let mut text_embedder = FakeTextEmbedder;
+        let progress = progress::NoopProgress;
+
+        let mut args = IndexerArgs {
+            store: &mut store,
+            walker: &walker,
+            fs_reader: &fs_reader,
+            embedders: EmbedderSet {
+                text: &mut text_embedder,
+                image: Some(Box::new(FailingImageEmbedder)),
+                image_text: None,
+            },
+            progress: &progress,
+        };
+
+        let result = run(
+            &mut args,
+            &[PathBuf::from("/vault")],
+            &[],
+            &chunker::ChunkConfig::default(),
+            false,
+            true,
+        );
+
+        assert!(result.is_err(), "fail_fast must propagate the image error instead of collecting it");
+    }
 }

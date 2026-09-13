@@ -14,3 +14,6 @@ progress = { workspace = true }
 store = { workspace = true }
 walk = { workspace = true }
 blake3 = "1.8.5"
+
+[dev-dependencies]
+search = { workspace = true }
