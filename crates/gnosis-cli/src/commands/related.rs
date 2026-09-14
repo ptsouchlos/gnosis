@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::commands::search::root_label;
+use crate::commands::search::{resolve_spaces, root_label};
 use crate::store::{SqliteStore, Store, TextQuery};
 use crate::workspace::{Workspace, expand_tilde};
 
@@ -11,6 +11,10 @@ use crate::workspace::{Workspace, expand_tilde};
 pub struct RelatedArgs {
     /// The file to find related items for.
     pub file: PathBuf,
+    /// Restrict to these vector spaces (e.g. text,image). Defaults to all
+    /// available — cross-modal by default.
+    #[arg(long, value_delimiter = ',')]
+    pub r#in: Vec<String>,
     /// Maximum number of results.
     #[arg(long, default_value_t = 10)]
     pub limit: usize,
@@ -43,10 +47,7 @@ pub fn execute(ws: &Workspace, args: RelatedArgs) -> Result<()> {
         bail!("{} is not indexed — run `gnosis index`", canon.display());
     }
 
-    let queries = store.text_chunk_vectors(&path)?;
-    if queries.is_empty() {
-        bail!("{} has no text chunks to compare", canon.display());
-    }
+    let spaces = resolve_spaces(ws, &args.r#in)?;
 
     let mut exclude = vec![path.clone()];
     if !args.include_linked {
@@ -58,15 +59,30 @@ pub fn execute(ws: &Workspace, args: RelatedArgs) -> Result<()> {
     }
 
     let tags_ref = (!args.tag.is_empty()).then_some(args.tag.as_slice());
-    let hits = store.related_text(
-        &queries,
-        &exclude,
-        args.limit,
-        &TextQuery {
-            from: None,
-            tags: tags_ref,
-        },
-    )?;
+    let filter = TextQuery {
+        from: None,
+        tags: tags_ref,
+    };
+
+    let mut per_space: Vec<Vec<search::Hit>> = Vec::with_capacity(spaces.len());
+    for space in &spaces {
+        let queries = store.chunk_vectors(&path, space)?;
+        if queries.is_empty() {
+            // This file has no vectors in this space (e.g. an image queried
+            // with `--in text`) — contributes nothing to the merge, not an
+            // error, unless every requested space is empty (checked below).
+            continue;
+        }
+        per_space.push(store.related_space(space, &queries, &exclude, args.limit, &filter)?);
+    }
+    if per_space.is_empty() {
+        bail!(
+            "{} has no chunks in any of [{}] to compare",
+            canon.display(),
+            spaces.join(", ")
+        );
+    }
+    let hits = search::merge_normalized(per_space, args.limit);
 
     if args.json {
         // Full data regardless of terminal formatting — see search.rs's

@@ -19,6 +19,9 @@ pub struct DocWrite<'a> {
     pub chunks: &'a [ChunkWrite],
     pub links: &'a [String],
     pub tags: &'a [String],
+    /// Pixel dimensions, populated only for image documents.
+    pub width: Option<i64>,
+    pub height: Option<i64>,
 }
 
 /// A single chunk to persist, including its embedding.
@@ -40,10 +43,10 @@ pub struct Stats {
     pub indexed_at: Option<i64>,
 }
 
-/// Filters applied when ranking text-space queries (`search_text`/
-/// `related_text`). Bundled since both are optional, independent filter
-/// dimensions applied together (AND between fields, OR within a field's
-/// list) — mirrors how `IndexerArgs` bundles trait objects.
+/// Filters applied when ranking a space (`search_space`/`related_space`).
+/// Bundled since both are optional, independent filter dimensions applied
+/// together (AND between fields, OR within a field's list) — mirrors how
+/// `IndexerArgs` bundles trait objects.
 #[derive(Default)]
 pub struct TextQuery<'a> {
     /// Restrict to these vault roots. Empty/absent = no restriction.
@@ -85,14 +88,19 @@ pub trait Store {
     /// Delete a document (chunks/links cascade) by path.
     fn delete_document(&self, path: &str) -> Result<()>;
 
-    /// Brute-force cosine search over the text space. Vectors are stored
-    /// normalized, so a dot product is the cosine similarity. Returns the
-    /// best chunk per document, ranked descending, capped at `limit`,
-    /// restricted per `filter`.
-    fn search_text(&self, query: &[f32], limit: usize, filter: &TextQuery) -> Result<Vec<Hit>>;
+    /// Brute-force/ANN cosine search over one vector space. Vectors are
+    /// stored normalized, so a dot product is the cosine similarity.
+    /// Returns the best chunk per document, ranked descending, capped at
+    /// `limit`, restricted per `filter`. For `space == "image"`, only
+    /// `modality = "image"` chunks are considered — title-proxy rows
+    /// (`modality = "text_title"`) are for `related_space` to traverse, not
+    /// for direct image search.
+    fn search_space(&self, space: &str, query: &[f32], limit: usize, filter: &TextQuery) -> Result<Vec<Hit>>;
 
-    /// A document's own text-space chunk vectors — the query set for `related`.
-    fn text_chunk_vectors(&self, path: &str) -> Result<Vec<Vec<f32>>>;
+    /// A document's own chunk vectors within one space — the query set for
+    /// `related`. Empty when the document has no chunks in that space (e.g.
+    /// an image file has none in `"text"`).
+    fn chunk_vectors(&self, path: &str, space: &str) -> Result<Vec<Vec<f32>>>;
 
     /// Raw wikilink target texts this document links out to (unresolved —
     /// `[[Some Note]]` yields `"Some Note"`, not a document path).
@@ -103,10 +111,14 @@ pub trait Store {
     fn all_document_meta(&self) -> Result<Vec<(String, Option<String>)>>;
 
     /// Rank other documents by best chunk-to-chunk cosine similarity against
-    /// `query_vectors` (the max across all of them per candidate), excluding
-    /// `exclude_paths` before truncation to `limit`, restricted per `filter`.
-    fn related_text(
+    /// `query_vectors` (the max across all of them per candidate) within one
+    /// space, excluding `exclude_paths` before truncation to `limit`,
+    /// restricted per `filter`. Unlike `search_space`, this considers every
+    /// modality in the space, so image-space `related` can surface both
+    /// real images and title-proxy documents.
+    fn related_space(
         &self,
+        space: &str,
         query_vectors: &[Vec<f32>],
         exclude_paths: &[String],
         limit: usize,

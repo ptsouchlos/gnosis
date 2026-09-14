@@ -16,4 +16,9 @@ pub trait FileReader {
 
     /// Last-modified time as unix seconds, or 0 if unavailable.
     fn mtime(&self, path: &Path) -> i64;
+
+    /// Pixel dimensions of an image file (width, height), or `None` if the
+    /// file can't be read or decoded as a supported image format. Read-only
+    /// metadata probe — does not decode full pixel data.
+    fn image_dimensions(&self, path: &Path) -> Option<(u32, u32)>;
 }
