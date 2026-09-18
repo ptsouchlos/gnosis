@@ -7,3 +7,4 @@ description = "Durable document/chunk storage interface for gnosis"
 [dependencies]
 anyhow = { workspace = true }
 search = { workspace = true }
+serde = { workspace = true }

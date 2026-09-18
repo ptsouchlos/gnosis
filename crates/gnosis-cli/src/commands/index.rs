@@ -2,10 +2,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
-use crate::embedder::{build_clip_text_embedder, build_image_embedder, build_text_embedder};
+use crate::commands::build_embedders;
 use crate::fs::StdFs;
 use crate::progress::IndicatifProgress;
-use crate::store::SqliteStore;
+use crate::store::{Space, SqliteStore};
 use crate::walk::FsWalker;
 use crate::workspace::{Workspace, expand_tilde};
 
@@ -26,23 +26,17 @@ pub fn execute(mut ws: Workspace, args: IndexArgs) -> Result<()> {
 
     println!("Indexing {} vault(s)…", roots.len());
     let mut store = SqliteStore::open(&ws.db_path)?;
-    let mut text_embedder = build_text_embedder(&ws.config.embed.text.model)?;
     let image_enabled = ws.config.embed.image.enabled;
-    let image_embedder = image_enabled
-        .then(|| build_image_embedder(&ws.config.embed.image.model))
-        .transpose()?;
-    let image_text_embedder = image_enabled
-        .then(|| build_clip_text_embedder(&ws.config.embed.image.model))
-        .transpose()?;
+    let mut embedders = build_embedders(&ws.config.embed)?;
     let progress = IndicatifProgress::new();
     let mut indexer_args = index::IndexerArgs {
         store: &mut store,
         walker: &FsWalker,
         fs_reader: &StdFs,
         embedders: index::EmbedderSet {
-            text: text_embedder.as_mut(),
-            image: image_embedder,
-            image_text: image_text_embedder,
+            text: embedders.text.as_mut(),
+            image: embedders.image,
+            image_text: embedders.image_text,
         },
         progress: &progress,
     };
@@ -60,9 +54,9 @@ pub fn execute(mut ws: Workspace, args: IndexArgs) -> Result<()> {
     );
     crate::commands::print_index_errors(&report.errors);
 
-    store.rebuild_index("text")?;
+    store.rebuild_index(Space::Text)?;
     if image_enabled {
-        store.rebuild_index("image")?;
+        store.rebuild_index(Space::Image)?;
     }
     println!("Updated search index.");
     Ok(())

@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::commands::search::{resolve_spaces, root_label};
+use crate::commands::search::{HIT_INDENT, resolve_spaces, root_label};
 use crate::store::{SqliteStore, Store, TextQuery};
 use crate::workspace::{Workspace, expand_tilde};
 
@@ -65,7 +65,7 @@ pub fn execute(ws: &Workspace, args: RelatedArgs) -> Result<()> {
     };
 
     let mut per_space: Vec<Vec<search::Hit>> = Vec::with_capacity(spaces.len());
-    for space in &spaces {
+    for space in spaces.iter().copied() {
         let queries = store.chunk_vectors(&path, space)?;
         if queries.is_empty() {
             // This file has no vectors in this space (e.g. an image queried
@@ -79,7 +79,7 @@ pub fn execute(ws: &Workspace, args: RelatedArgs) -> Result<()> {
         bail!(
             "{} has no chunks in any of [{}] to compare",
             canon.display(),
-            spaces.join(", ")
+            spaces.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
         );
     }
     let hits = search::merge_normalized(per_space, args.limit);
@@ -112,7 +112,7 @@ pub fn execute(ws: &Workspace, args: RelatedArgs) -> Result<()> {
             hit.path
         );
         if !hit.heading_path.is_empty() {
-            println!("      § {}", hit.heading_path);
+            println!("{HIT_INDENT}§ {}", hit.heading_path);
         }
     }
     Ok(())

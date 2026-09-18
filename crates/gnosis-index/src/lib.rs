@@ -385,7 +385,7 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use store::{Stats, TextQuery};
+    use store::{Space, Stats, TextQuery};
     use walk::Found;
 
     /// In-memory `Store` fake — just enough of the trait for `run` to
@@ -426,10 +426,10 @@ mod tests {
         fn delete_document(&self, _path: &str) -> Result<()> {
             Ok(())
         }
-        fn search_space(&self, _: &str, _: &[f32], _: usize, _: &TextQuery) -> Result<Vec<search::Hit>> {
+        fn search_space(&self, _: Space, _: &[f32], _: usize, _: &TextQuery) -> Result<Vec<search::Hit>> {
             Ok(Vec::new())
         }
-        fn chunk_vectors(&self, _: &str, _: &str) -> Result<Vec<Vec<f32>>> {
+        fn chunk_vectors(&self, _: &str, _: Space) -> Result<Vec<Vec<f32>>> {
             Ok(Vec::new())
         }
         fn linked_targets(&self, _: &str) -> Result<Vec<String>> {
@@ -440,7 +440,7 @@ mod tests {
         }
         fn related_space(
             &self,
-            _: &str,
+            _: Space,
             _: &[Vec<f32>],
             _: &[String],
             _: usize,

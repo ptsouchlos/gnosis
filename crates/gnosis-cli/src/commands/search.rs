@@ -3,8 +3,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::embedder::{build_clip_text_embedder, build_text_embedder};
-use crate::store::{SqliteStore, Store, TextQuery};
+use crate::store::{Space, SqliteStore, Store, TextQuery};
 use crate::workspace::{Workspace, expand_tilde};
+
+/// Left margin used for every indented detail line under a hit (heading
+/// path, image dimensions, text snippet) — shared so the columns line up
+/// regardless of which branch prints.
+pub(crate) const HIT_INDENT: &str = "      ";
 
 /// Semantic search over the indexed content.
 #[derive(Debug, clap::Args)]
@@ -32,28 +37,19 @@ pub struct SearchArgs {
     pub json: bool,
 }
 
-/// Vector spaces gnosis can index. `--in` is validated against this rather
-/// than silently ignored, so requesting an unsupported space fails clearly.
-pub(crate) const SUPPORTED_SPACES: &[&str] = &["text", "image"];
-
-/// Resolve `--in`: explicit spaces are validated against `SUPPORTED_SPACES`;
-/// an empty `--in` defaults to every space with content available — `text`
-/// always, `image` only when `[embed.image] enabled = true`.
-pub(crate) fn resolve_spaces(ws: &Workspace, requested: &[String]) -> Result<Vec<String>> {
+/// Resolve `--in`: explicit spaces are parsed and validated as `Space` (an
+/// unsupported name fails clearly via `Space::from_str`'s error); an empty
+/// `--in` defaults to every space with content available — `text` always,
+/// `image` only when `[embed.image] enabled = true`.
+pub(crate) fn resolve_spaces(ws: &Workspace, requested: &[String]) -> Result<Vec<Space>> {
     if requested.is_empty() {
-        let mut spaces = vec!["text".to_string()];
+        let mut spaces = vec![Space::Text];
         if ws.config.embed.image.enabled {
-            spaces.push("image".to_string());
+            spaces.push(Space::Image);
         }
         return Ok(spaces);
     }
-    if let Some(unsupported) = requested.iter().find(|s| !SUPPORTED_SPACES.contains(&s.as_str())) {
-        bail!(
-            "unsupported space '{unsupported}' — only {} are indexed",
-            SUPPORTED_SPACES.join(", ")
-        );
-    }
-    Ok(requested.to_vec())
+    requested.iter().map(|s| s.parse()).collect()
 }
 
 pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
@@ -82,9 +78,9 @@ pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
     };
 
     let mut per_space: Vec<Vec<search::Hit>> = Vec::with_capacity(spaces.len());
-    for space in &spaces {
-        let query_vec = match space.as_str() {
-            "text" => {
+    for space in spaces.iter().copied() {
+        let query_vec = match space {
+            Space::Text => {
                 let mut embedder = build_text_embedder(&ws.config.embed.text.model)?;
                 embedder
                     .embed(&[args.query.clone()])?
@@ -92,7 +88,7 @@ pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
                     .next()
                     .context("embedding produced no vector")?
             }
-            "image" => {
+            Space::Image => {
                 let mut embedder = build_clip_text_embedder(&ws.config.embed.image.model)?;
                 embedder
                     .embed(&[args.query.clone()])?
@@ -100,7 +96,6 @@ pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
                     .next()
                     .context("embedding produced no vector")?
             }
-            other => bail!("unsupported space '{other}'"),
         };
         per_space.push(store.search_space(space, &query_vec, args.limit, &filter)?);
     }
@@ -134,15 +129,15 @@ pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
             hit.path
         );
         if !hit.heading_path.is_empty() {
-            println!("      § {}", hit.heading_path);
+            println!("{HIT_INDENT}§ {}", hit.heading_path);
         }
         if args.full {
             match (hit.width, hit.height) {
-                (Some(w), Some(h)) => println!("      {w}x{h}"),
+                (Some(w), Some(h)) => println!("{HIT_INDENT}{w}x{h}"),
                 _ => {
                     let snippet: String = hit.text.chars().take(280).collect();
                     if !snippet.is_empty() {
-                        println!("      {snippet}");
+                        println!("{HIT_INDENT}{snippet}");
                     }
                 }
             }
