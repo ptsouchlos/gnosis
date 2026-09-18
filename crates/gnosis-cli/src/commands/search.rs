@@ -2,9 +2,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::embedder::build_text_embedder;
-use crate::store::{SqliteStore, Store, TextQuery};
+use crate::embedder::{build_clip_text_embedder, build_text_embedder};
+use crate::store::{Space, SqliteStore, Store, TextQuery};
 use crate::workspace::{Workspace, expand_tilde};
+
+/// Left margin used for every indented detail line under a hit (heading
+/// path, image dimensions, text snippet) — shared so the columns line up
+/// regardless of which branch prints.
+pub(crate) const HIT_INDENT: &str = "      ";
 
 /// Semantic search over the indexed content.
 #[derive(Debug, clap::Args)]
@@ -32,10 +37,20 @@ pub struct SearchArgs {
     pub json: bool,
 }
 
-/// Vector spaces gnosis currently indexes. `--in` is validated against this
-/// rather than silently ignored, so requesting an unsupported space (e.g.
-/// "image", before image ingestion exists) fails clearly.
-const SUPPORTED_SPACES: &[&str] = &["text"];
+/// Resolve `--in`: explicit spaces are parsed and validated as `Space` (an
+/// unsupported name fails clearly via `Space::from_str`'s error); an empty
+/// `--in` defaults to every space with content available — `text` always,
+/// `image` only when `[embed.image] enabled = true`.
+pub(crate) fn resolve_spaces(ws: &Workspace, requested: &[String]) -> Result<Vec<Space>> {
+    if requested.is_empty() {
+        let mut spaces = vec![Space::Text];
+        if ws.config.embed.image.enabled {
+            spaces.push(Space::Image);
+        }
+        return Ok(spaces);
+    }
+    requested.iter().map(|s| s.parse()).collect()
+}
 
 pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
     if !ws.db_path.exists() {
@@ -45,21 +60,8 @@ pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
         );
     }
 
-    if let Some(unsupported) = args.r#in.iter().find(|s| !SUPPORTED_SPACES.contains(&s.as_str())) {
-        bail!(
-            "unsupported space '{unsupported}' — only {} {} indexed today",
-            SUPPORTED_SPACES.join(", "),
-            if SUPPORTED_SPACES.len() == 1 { "is" } else { "are" }
-        );
-    }
-
+    let spaces = resolve_spaces(ws, &args.r#in)?;
     let store = SqliteStore::open(&ws.db_path)?;
-    let mut embedder = build_text_embedder(&ws.config.embed.text.model)?;
-    let query_vec = embedder
-        .embed(&[args.query.clone()])?
-        .into_iter()
-        .next()
-        .context("embedding produced no vector")?;
 
     // Resolve --from vault filters to canonical roots.
     let from: Vec<String> = args
@@ -70,15 +72,34 @@ pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
         .collect();
     let from_ref = (!from.is_empty()).then_some(from.as_slice());
     let tags_ref = (!args.tag.is_empty()).then_some(args.tag.as_slice());
+    let filter = TextQuery {
+        from: from_ref,
+        tags: tags_ref,
+    };
 
-    let hits = store.search_text(
-        &query_vec,
-        args.limit,
-        &TextQuery {
-            from: from_ref,
-            tags: tags_ref,
-        },
-    )?;
+    let mut per_space: Vec<Vec<search::Hit>> = Vec::with_capacity(spaces.len());
+    for space in spaces.iter().copied() {
+        let query_vec = match space {
+            Space::Text => {
+                let mut embedder = build_text_embedder(&ws.config.embed.text.model)?;
+                embedder
+                    .embed(&[args.query.clone()])?
+                    .into_iter()
+                    .next()
+                    .context("embedding produced no vector")?
+            }
+            Space::Image => {
+                let mut embedder = build_clip_text_embedder(&ws.config.embed.image.model)?;
+                embedder
+                    .embed(&[args.query.clone()])?
+                    .into_iter()
+                    .next()
+                    .context("embedding produced no vector")?
+            }
+        };
+        per_space.push(store.search_space(space, &query_vec, args.limit, &filter)?);
+    }
+    let hits = search::merge_normalized(per_space, args.limit);
 
     if args.json {
         // Full data regardless of --full: JSON output is for programmatic
@@ -108,11 +129,18 @@ pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
             hit.path
         );
         if !hit.heading_path.is_empty() {
-            println!("      § {}", hit.heading_path);
+            println!("{HIT_INDENT}§ {}", hit.heading_path);
         }
         if args.full {
-            let snippet: String = hit.text.chars().take(280).collect();
-            println!("      {snippet}");
+            match (hit.width, hit.height) {
+                (Some(w), Some(h)) => println!("{HIT_INDENT}{w}x{h}"),
+                _ => {
+                    let snippet: String = hit.text.chars().take(280).collect();
+                    if !snippet.is_empty() {
+                        println!("{HIT_INDENT}{snippet}");
+                    }
+                }
+            }
         }
     }
     Ok(())

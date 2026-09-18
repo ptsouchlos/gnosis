@@ -1080,6 +1080,7 @@ dependencies = [
  "fastembed",
  "fs",
  "ignore",
+ "image",
  "index",
  "indicatif 0.17.11",
  "parse",
@@ -1486,6 +1487,7 @@ dependencies = [
  "fs",
  "parse",
  "progress",
+ "search",
  "store",
  "walk",
 ]
@@ -2798,6 +2800,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "search",
+ "serde",
 ]
 
 [[package]]

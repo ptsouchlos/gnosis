@@ -2,8 +2,60 @@
 //! concrete backend's dependencies (e.g. `rusqlite`) so it can be depended on
 //! by non-native targets (e.g. a future wasm build) that need only the shape
 //! of the store, not a SQLite implementation.
-use anyhow::Result;
+use std::fmt;
+use std::str::FromStr;
+
+use anyhow::{Result, bail};
 use search::Hit;
+
+/// A vector space gnosis indexes into. Mirrors `walk::DocKind`'s
+/// as_str()/match shape — kept as a real enum (rather than raw `&str`s
+/// scattered across index names, `--in` validation, and match arms) so an
+/// unsupported space is a compile error almost everywhere but the CLI
+/// boundary, where `FromStr` turns it into one clear, user-facing error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Space {
+    Text,
+    Image,
+}
+
+impl Space {
+    /// Every space gnosis knows how to index, in a stable, user-facing order.
+    pub const ALL: &'static [Space] = &[Space::Text, Space::Image];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Space::Text => "text",
+            Space::Image => "image",
+        }
+    }
+}
+
+impl fmt::Display for Space {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Space {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "text" => Ok(Space::Text),
+            "image" => Ok(Space::Image),
+            other => bail!(
+                "unsupported space '{other}' — only {} are indexed",
+                Space::ALL
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+}
 
 /// A document about to be written, with its parsed chunks.
 pub struct DocWrite<'a> {
@@ -19,6 +71,9 @@ pub struct DocWrite<'a> {
     pub chunks: &'a [ChunkWrite],
     pub links: &'a [String],
     pub tags: &'a [String],
+    /// Pixel dimensions, populated only for image documents.
+    pub width: Option<i64>,
+    pub height: Option<i64>,
 }
 
 /// A single chunk to persist, including its embedding.
@@ -40,10 +95,10 @@ pub struct Stats {
     pub indexed_at: Option<i64>,
 }
 
-/// Filters applied when ranking text-space queries (`search_text`/
-/// `related_text`). Bundled since both are optional, independent filter
-/// dimensions applied together (AND between fields, OR within a field's
-/// list) — mirrors how `IndexerArgs` bundles trait objects.
+/// Filters applied when ranking a space (`search_space`/`related_space`).
+/// Bundled since both are optional, independent filter dimensions applied
+/// together (AND between fields, OR within a field's list) — mirrors how
+/// `IndexerArgs` bundles trait objects.
 #[derive(Default)]
 pub struct TextQuery<'a> {
     /// Restrict to these vault roots. Empty/absent = no restriction.
@@ -85,14 +140,19 @@ pub trait Store {
     /// Delete a document (chunks/links cascade) by path.
     fn delete_document(&self, path: &str) -> Result<()>;
 
-    /// Brute-force cosine search over the text space. Vectors are stored
-    /// normalized, so a dot product is the cosine similarity. Returns the
-    /// best chunk per document, ranked descending, capped at `limit`,
-    /// restricted per `filter`.
-    fn search_text(&self, query: &[f32], limit: usize, filter: &TextQuery) -> Result<Vec<Hit>>;
+    /// Brute-force/ANN cosine search over one vector space. Vectors are
+    /// stored normalized, so a dot product is the cosine similarity.
+    /// Returns the best chunk per document, ranked descending, capped at
+    /// `limit`, restricted per `filter`. For `Space::Image`, only
+    /// `modality = "image"` chunks are considered — title-proxy rows
+    /// (`modality = "text_title"`) are for `related_space` to traverse, not
+    /// for direct image search.
+    fn search_space(&self, space: Space, query: &[f32], limit: usize, filter: &TextQuery) -> Result<Vec<Hit>>;
 
-    /// A document's own text-space chunk vectors — the query set for `related`.
-    fn text_chunk_vectors(&self, path: &str) -> Result<Vec<Vec<f32>>>;
+    /// A document's own chunk vectors within one space — the query set for
+    /// `related`. Empty when the document has no chunks in that space (e.g.
+    /// an image file has none in `Space::Text`).
+    fn chunk_vectors(&self, path: &str, space: Space) -> Result<Vec<Vec<f32>>>;
 
     /// Raw wikilink target texts this document links out to (unresolved —
     /// `[[Some Note]]` yields `"Some Note"`, not a document path).
@@ -103,10 +163,14 @@ pub trait Store {
     fn all_document_meta(&self) -> Result<Vec<(String, Option<String>)>>;
 
     /// Rank other documents by best chunk-to-chunk cosine similarity against
-    /// `query_vectors` (the max across all of them per candidate), excluding
-    /// `exclude_paths` before truncation to `limit`, restricted per `filter`.
-    fn related_text(
+    /// `query_vectors` (the max across all of them per candidate) within one
+    /// space, excluding `exclude_paths` before truncation to `limit`,
+    /// restricted per `filter`. Unlike `search_space`, this considers every
+    /// modality in the space, so image-space `related` can surface both
+    /// real images and title-proxy documents.
+    fn related_space(
         &self,
+        space: Space,
         query_vectors: &[Vec<f32>],
         exclude_paths: &[String],
         limit: usize,

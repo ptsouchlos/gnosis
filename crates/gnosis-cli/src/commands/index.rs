@@ -2,10 +2,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
-use crate::embedder::build_text_embedder;
+use crate::commands::build_embedders;
 use crate::fs::StdFs;
 use crate::progress::IndicatifProgress;
-use crate::store::SqliteStore;
+use crate::store::{Space, SqliteStore};
 use crate::walk::FsWalker;
 use crate::workspace::{Workspace, expand_tilde};
 
@@ -15,6 +15,10 @@ pub struct IndexArgs {
     /// Vault path to index. Locally this overrides the configured vaults for
     /// this run; globally it registers (and indexes) the vault.
     pub path: Option<PathBuf>,
+    /// Stop immediately on the first file that fails to index (e.g. a
+    /// corrupt image), instead of skipping it and reporting it at the end.
+    #[arg(long)]
+    pub fail_fast: bool,
 }
 
 pub fn execute(mut ws: Workspace, args: IndexArgs) -> Result<()> {
@@ -22,13 +26,18 @@ pub fn execute(mut ws: Workspace, args: IndexArgs) -> Result<()> {
 
     println!("Indexing {} vault(s)…", roots.len());
     let mut store = SqliteStore::open(&ws.db_path)?;
-    let mut embedder = build_text_embedder(&ws.config.embed.text.model)?;
+    let image_enabled = ws.config.embed.image.enabled;
+    let mut embedders = build_embedders(&ws.config.embed)?;
     let progress = IndicatifProgress::new();
     let mut indexer_args = index::IndexerArgs {
         store: &mut store,
         walker: &FsWalker,
         fs_reader: &StdFs,
-        embedder: embedder.as_mut(),
+        embedders: index::EmbedderSet {
+            text: embedders.text.as_mut(),
+            image: embedders.image,
+            image_text: embedders.image_text,
+        },
         progress: &progress,
     };
     let report = index::run(
@@ -37,13 +46,18 @@ pub fn execute(mut ws: Workspace, args: IndexArgs) -> Result<()> {
         &ws.config.ignore.globs,
         &ws.config.chunk,
         false,
+        args.fail_fast,
     )?;
     println!(
         "Done: {} scanned, {} (re)indexed, {} unchanged, {} removed, {} chunks.",
         report.scanned, report.indexed, report.skipped, report.deleted, report.chunks
     );
+    crate::commands::print_index_errors(&report.errors);
 
-    store.rebuild_text_index()?;
+    store.rebuild_index(Space::Text)?;
+    if image_enabled {
+        store.rebuild_index(Space::Image)?;
+    }
     println!("Updated search index.");
     Ok(())
 }

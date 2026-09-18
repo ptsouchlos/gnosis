@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use crate::store::{SqliteStore, Store};
+use crate::store::{Space, SqliteStore, Store};
 use crate::workspace::{Workspace, expand_tilde};
 
 /// Remove a vault from the index and delete its documents.
@@ -35,7 +35,10 @@ pub fn execute(mut ws: Workspace, args: ForgetArgs) -> Result<()> {
         let mut store = SqliteStore::open(&ws.db_path)?;
         removed_docs = store.delete_by_root(&canon_str)?;
         if removed_docs > 0 {
-            store.rebuild_text_index()?;
+            store.rebuild_index(Space::Text)?;
+            if ws.config.embed.image.enabled {
+                store.rebuild_index(Space::Image)?;
+            }
         }
     }
 
