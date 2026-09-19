@@ -22,12 +22,24 @@ pub struct Config {
     pub chunk: ChunkConfig,
     pub pdf: PdfConfig,
     pub ignore: IgnoreConfig,
+    pub ann: AnnConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PdfConfig {
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnnConfig {
+    /// On-disk ANN index vector precision: "f32" (full precision, today's
+    /// default), "f16" (half precision, ~2x smaller), or "i8" (8-bit,
+    /// ~4x smaller, most recall loss). SQLite always stores full f32
+    /// vectors regardless, so `gnosis rebuild` can always safely regenerate
+    /// the index at a new quantization.
+    pub quantization: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +57,7 @@ impl Default for Config {
             chunk: ChunkConfig::default(),
             pdf: PdfConfig::default(),
             ignore: IgnoreConfig::default(),
+            ann: AnnConfig::default(),
         }
     }
 }
@@ -52,6 +65,12 @@ impl Default for Config {
 impl Default for PdfConfig {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+impl Default for AnnConfig {
+    fn default() -> Self {
+        Self { quantization: "f32".to_string() }
     }
 }
 

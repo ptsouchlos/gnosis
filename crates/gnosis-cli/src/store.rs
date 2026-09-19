@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use search::{Candidate, Hit};
 use store::{DocWrite, Stats};
@@ -269,7 +269,7 @@ impl SqliteStore {
     /// No-ops (removing any existing index file) when there are zero chunks
     /// in this space, so queries correctly fall back to the brute-force
     /// path rather than querying an empty/stale index.
-    pub fn rebuild_index(&mut self, space: Space) -> Result<()> {
+    pub fn rebuild_index(&mut self, space: Space, quantization: ScalarKind) -> Result<()> {
         let mut stmt = self
             .conn
             .prepare("SELECT id, vector FROM chunks WHERE space = ?1 AND vector IS NOT NULL")?;
@@ -290,7 +290,7 @@ impl SqliteStore {
         let options = IndexOptions {
             dimensions,
             metric: MetricKind::IP,
-            quantization: ScalarKind::F32,
+            quantization,
             ..Default::default()
         };
         let index = Index::new(&options)?;
@@ -309,6 +309,17 @@ impl SqliteStore {
         index.save(path_str)?;
         Ok(())
     }
+}
+
+/// Map a config quantization name to a `usearch` scalar kind.
+pub fn resolve_quantization(name: &str) -> Result<ScalarKind> {
+    let kind = match name {
+        "f32" => ScalarKind::F32,
+        "f16" => ScalarKind::F16,
+        "i8" => ScalarKind::I8,
+        other => bail!("unknown ann quantization '{other}' (try: f32, f16, i8)"),
+    };
+    Ok(kind)
 }
 
 /// Shared row → `Candidate` mapper for the two candidate-fetching queries,
@@ -773,13 +784,47 @@ mod tests {
             Some(1),
             Some(1),
         );
-        store.rebuild_index(Space::Image).unwrap();
-        store.rebuild_index(Space::Text).unwrap(); // no text chunks — must no-op, not error
+        store.rebuild_index(Space::Image, ScalarKind::F32).unwrap();
+        store.rebuild_index(Space::Text, ScalarKind::F32).unwrap(); // no text chunks — must no-op, not error
 
         let hits = store
             .search_space(Space::Image, &[1.0, 0.0], 10, &TextQuery::default())
             .unwrap();
         assert_eq!(hits.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// A `rebuild_index` call at a lossy quantization must still round-trip
+    /// through `Index::save`/`Index::restore` and preserve ranking — the
+    /// exact score can shift slightly from rounding, but the nearer vector
+    /// must still come out on top.
+    #[test]
+    fn rebuild_index_supports_i8_quantization() {
+        let (mut store, path) = temp_store();
+        write_full_doc(
+            &mut store,
+            "/vault/near.png",
+            "image",
+            &[chunk("image", "image", None, vec![1.0, 0.0])],
+            Some(1),
+            Some(1),
+        );
+        write_full_doc(
+            &mut store,
+            "/vault/far.png",
+            "image",
+            &[chunk("image", "image", None, vec![0.0, 1.0])],
+            Some(1),
+            Some(1),
+        );
+        store.rebuild_index(Space::Image, ScalarKind::I8).unwrap();
+
+        let hits = store
+            .search_space(Space::Image, &[1.0, 0.0], 10, &TextQuery::default())
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].path, "/vault/near.png");
 
         let _ = std::fs::remove_dir_all(&path);
     }
