@@ -53,6 +53,7 @@ pub fn execute(ws: &Workspace, args: RebuildArgs) -> Result<()> {
         &ws.config.chunk,
         true,
         args.fail_fast,
+        ws.config.embed.image.batch_size,
     )?;
     println!("Done: {} indexed, {} chunks.", report.indexed, report.chunks);
     crate::commands::print_index_errors(&report.errors);

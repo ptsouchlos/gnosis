@@ -47,6 +47,7 @@ pub fn execute(mut ws: Workspace, args: IndexArgs) -> Result<()> {
         &ws.config.chunk,
         false,
         args.fail_fast,
+        ws.config.embed.image.batch_size,
     )?;
     println!(
         "Done: {} scanned, {} (re)indexed, {} unchanged, {} removed, {} chunks.",
