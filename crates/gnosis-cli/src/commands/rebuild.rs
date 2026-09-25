@@ -53,13 +53,15 @@ pub fn execute(ws: &Workspace, args: RebuildArgs) -> Result<()> {
         &ws.config.chunk,
         true,
         args.fail_fast,
+        ws.config.embed.image.batch_size,
     )?;
     println!("Done: {} indexed, {} chunks.", report.indexed, report.chunks);
     crate::commands::print_index_errors(&report.errors);
 
-    store.rebuild_index(Space::Text)?;
+    let quantization = crate::store::resolve_quantization(&ws.config.ann.quantization)?;
+    store.rebuild_index(Space::Text, quantization)?;
     if image_enabled {
-        store.rebuild_index(Space::Image)?;
+        store.rebuild_index(Space::Image, quantization)?;
     }
     println!("Updated search index.");
     Ok(())

@@ -35,9 +35,10 @@ pub fn execute(mut ws: Workspace, args: ForgetArgs) -> Result<()> {
         let mut store = SqliteStore::open(&ws.db_path)?;
         removed_docs = store.delete_by_root(&canon_str)?;
         if removed_docs > 0 {
-            store.rebuild_index(Space::Text)?;
+            let quantization = crate::store::resolve_quantization(&ws.config.ann.quantization)?;
+            store.rebuild_index(Space::Text, quantization)?;
             if ws.config.embed.image.enabled {
-                store.rebuild_index(Space::Image)?;
+                store.rebuild_index(Space::Image, quantization)?;
             }
         }
     }

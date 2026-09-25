@@ -73,6 +73,13 @@ mod tests {
         a.iter().zip(b).map(|(x, y)| x * y).sum()
     }
 
+    #[test]
+    fn resolve_text_model_recognizes_quantized_bge_small() {
+        let (model, dim) = resolve_text_model("bge-small-en-v1.5-q").expect("known model name");
+        assert_eq!(model, EmbeddingModel::BGESmallENV15Q);
+        assert_eq!(dim, 384);
+    }
+
     /// Loads the real model (downloads on first run), so it's network-gated and
     /// excluded from the default `cargo test` run. Run with:
     ///   cargo test --release -- --ignored --nocapture
@@ -162,12 +169,13 @@ mod tests {
 fn resolve_text_model(name: &str) -> Result<(EmbeddingModel, usize)> {
     let m = match name {
         "bge-small-en-v1.5" => (EmbeddingModel::BGESmallENV15, 384),
+        "bge-small-en-v1.5-q" => (EmbeddingModel::BGESmallENV15Q, 384),
         "bge-base-en-v1.5" => (EmbeddingModel::BGEBaseENV15, 768),
         "all-MiniLM-L6-v2" => (EmbeddingModel::AllMiniLML6V2, 384),
         "nomic-embed-text-v1.5" => (EmbeddingModel::NomicEmbedTextV15, 768),
         other => bail!(
-            "unknown text model '{other}' (try: bge-small-en-v1.5, bge-base-en-v1.5, \
-             all-MiniLM-L6-v2, nomic-embed-text-v1.5)"
+            "unknown text model '{other}' (try: bge-small-en-v1.5, bge-small-en-v1.5-q, \
+             bge-base-en-v1.5, all-MiniLM-L6-v2, nomic-embed-text-v1.5)"
         ),
     };
     Ok(m)

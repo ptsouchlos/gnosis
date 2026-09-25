@@ -47,6 +47,7 @@ pub fn execute(mut ws: Workspace, args: IndexArgs) -> Result<()> {
         &ws.config.chunk,
         false,
         args.fail_fast,
+        ws.config.embed.image.batch_size,
     )?;
     println!(
         "Done: {} scanned, {} (re)indexed, {} unchanged, {} removed, {} chunks.",
@@ -54,9 +55,10 @@ pub fn execute(mut ws: Workspace, args: IndexArgs) -> Result<()> {
     );
     crate::commands::print_index_errors(&report.errors);
 
-    store.rebuild_index(Space::Text)?;
+    let quantization = crate::store::resolve_quantization(&ws.config.ann.quantization)?;
+    store.rebuild_index(Space::Text, quantization)?;
     if image_enabled {
-        store.rebuild_index(Space::Image)?;
+        store.rebuild_index(Space::Image, quantization)?;
     }
     println!("Updated search index.");
     Ok(())

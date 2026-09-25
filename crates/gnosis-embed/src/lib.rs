@@ -35,6 +35,9 @@ pub struct TextEmbedConfig {
 pub struct ImageEmbedConfig {
     pub enabled: bool,
     pub model: String,
+    /// How many pending image/title embeds to accumulate before issuing one
+    /// batched `Embedder::embed` call, instead of one call per file.
+    pub batch_size: usize,
 }
 
 impl Default for EmbedConfig {
@@ -59,6 +62,7 @@ impl Default for ImageEmbedConfig {
         Self {
             enabled: false,
             model: "clip-vit-b-32".to_string(),
+            batch_size: 32,
         }
     }
 }
@@ -73,5 +77,11 @@ mod tests {
         assert_eq!(cfg.text.model, "bge-small-en-v1.5");
         assert!(!cfg.image.enabled);
         assert_eq!(cfg.image.model, "clip-vit-b-32");
+    }
+
+    #[test]
+    fn image_embed_config_default_batch_size_is_32() {
+        let cfg = EmbedConfig::default();
+        assert_eq!(cfg.image.batch_size, 32);
     }
 }

@@ -32,3 +32,8 @@ test config="debug":
 test-all config="debug":
     cargo test --workspace --all-targets {{ if config == "release" { "--release" } else { "" } }} -- --include-ignored
     cargo test --workspace --doc
+
+[doc('Benchmark indexing throughput on a synthetic vault (file-count, image-count)')]
+[group('dev')]
+bench file_count="2000" image_count="200":
+    infra/bench/run.sh {{ file_count }} {{ image_count }}
