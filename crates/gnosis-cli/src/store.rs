@@ -19,17 +19,17 @@ use usearch::{Index, IndexOptions, Key, MetricKind, ScalarKind};
 pub const SCHEMA_VERSION: i64 = 1;
 
 /// Name of the directory (sibling to the database file) holding one on-disk
-/// ANN index file per space.
+/// ANN index file per `(space, modality)` pair.
 const INDEX_DIR_NAME: &str = "index";
 
 /// SQLite-backed [`Store`]; gnosis's durable source of truth.
 pub struct SqliteStore {
     conn: Connection,
-    /// Directory holding one on-disk ANN index per space
-    /// (`<db_dir>/index/<space>.usearch`), sibling to the database file.
-    /// Always reconstructable from SQLite via `rebuild_index` — a missing
-    /// or stale file just means queries fall back to the brute-force path,
-    /// never data loss.
+    /// Directory holding one on-disk ANN index per `(space, modality)` pair
+    /// (`<db_dir>/index/<space>.<modality>.usearch`), sibling to the database
+    /// file. Always reconstructable from SQLite via `rebuild_index` — a
+    /// missing or stale file just means queries fall back to the brute-force
+    /// path, never data loss.
     index_dir: PathBuf,
 }
 
@@ -56,9 +56,51 @@ impl SqliteStore {
         Ok(store)
     }
 
-    /// Path to one space's on-disk ANN index file.
-    fn index_path(&self, space: Space) -> PathBuf {
-        self.index_dir.join(format!("{space}.usearch"))
+    /// Path to one `(space, modality)` pair's on-disk ANN index file.
+    ///
+    /// Granularity is the pair, not the space, because an ANN index is only
+    /// meaningful over vectors that are mutually rankable. The `image` space
+    /// holds CLIP vision vectors *and* CLIP text title proxies, and CLIP's
+    /// modality gap puts those in disjoint similarity ranges (measured on a
+    /// real vault: text->image peaks around 0.36, text->text_title averages
+    /// 0.76). Indexing them together meant every nearest neighbour of a text
+    /// query was a title proxy, so image search returned nothing once a vault
+    /// had more than a handful of notes.
+    fn index_path(&self, space: Space, modality: &str) -> PathBuf {
+        self.index_dir.join(format!("{space}.{modality}.usearch"))
+    }
+
+    /// Every modality present in `space` with at least one vector, sorted for
+    /// deterministic rebuild order.
+    fn modalities_in_space(&self, space: Space) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT modality FROM chunks
+             WHERE space = ?1 AND vector IS NOT NULL
+             ORDER BY modality",
+        )?;
+        let modalities = stmt
+            .query_map([space.as_str()], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(modalities)
+    }
+
+    /// Delete every ANN index file belonging to `space`, including the
+    /// pre-split `{space}.usearch` layout, so a rebuild can never leave a
+    /// stale file behind for a modality that no longer has rows.
+    fn remove_space_indexes(&self, space: Space) -> Result<()> {
+        let prefix = format!("{space}.");
+        let entries = match std::fs::read_dir(&self.index_dir) {
+            Ok(entries) => entries,
+            Err(_) => return Ok(()), // no index dir yet: nothing to clean
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&prefix) && name.ends_with(".usearch") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        Ok(())
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -161,13 +203,24 @@ impl SqliteStore {
     /// exactly how the pre-existing root/tag filtering already worked here,
     /// just with `space` folded into the same list instead of being a fixed
     /// SQL literal.
-    fn space_candidates(&self, space: Space, filter: &TextQuery) -> Result<Vec<Candidate>> {
+    /// `modality` restricts to a single modality within the space (what
+    /// `search_space` wants); `None` spans every modality (what
+    /// `related_space` wants, since it traverses title proxies too).
+    fn space_candidates(
+        &self,
+        space: Space,
+        modality: Option<&str>,
+        filter: &TextQuery,
+    ) -> Result<Vec<Candidate>> {
         let mut sql = String::from(
             "SELECT d.path, d.title, d.source_root, c.heading_path, c.text, c.vector,
                     d.width, d.height, c.modality
              FROM chunks c JOIN documents d ON d.id = c.doc_id
              WHERE c.space = ? AND c.vector IS NOT NULL",
         );
+        if modality.is_some() {
+            sql.push_str(" AND c.modality = ?");
+        }
         let roots = filter.from.filter(|f| !f.is_empty());
         if let Some(roots) = roots {
             sql.push_str(&format!(
@@ -186,6 +239,7 @@ impl SqliteStore {
         let mut stmt = self.conn.prepare(&sql)?;
         let map_row = space_candidate_row_mapper();
         let mut params: Vec<String> = vec![space.as_str().to_string()];
+        params.extend(modality.map(str::to_string));
         params.extend(roots.into_iter().flatten().cloned());
         params.extend(tags.into_iter().flatten().cloned());
         let candidates: Vec<Candidate> = stmt
@@ -226,22 +280,25 @@ impl SqliteStore {
         Ok(candidates)
     }
 
-    /// Prefilter candidates via one space's on-disk ANN index for one or
-    /// more query vectors (unioned across queries). `None` when no index
-    /// exists yet, or an existing one fails to load (treated as "not built"
-    /// rather than a hard error — reconstructable via `rebuild_index`, so a
-    /// stale/corrupt file should degrade to the brute-force path, not break
-    /// search). `k` is how many neighbors to request per query; callers
-    /// pick the over-fetch factor since ANN can't filter by vault root,
-    /// tag, or modality itself.
-    fn ann_candidates(
+    /// Chunk ids from one `(space, modality)` ANN index for one or more query
+    /// vectors (unioned across queries). `None` when no index exists yet, or
+    /// an existing one fails to load (treated as "not built" rather than a
+    /// hard error — reconstructable via `rebuild_index`, so a stale/corrupt
+    /// file should degrade to the brute-force path, not break search). `k` is
+    /// how many neighbors to request per query; callers pick the over-fetch
+    /// factor since ANN can't filter by vault root or tag.
+    ///
+    /// Modality is no longer something callers over-fetch to compensate for:
+    /// the index itself is per-modality, so what comes back needs no
+    /// modality post-filter.
+    fn ann_ids(
         &self,
         space: Space,
+        modality: &str,
         queries: &[Vec<f32>],
         k: usize,
-        filter: &TextQuery,
-    ) -> Result<Option<Vec<Candidate>>> {
-        let index_path = self.index_path(space);
+    ) -> Result<Option<HashSet<u64>>> {
+        let index_path = self.index_path(space, modality);
         if !index_path.exists() {
             return Ok(None);
         }
@@ -258,29 +315,48 @@ impl SqliteStore {
             let matches = index.search(q, k)?;
             ids.extend(matches.keys);
         }
-        let ids: Vec<u64> = ids.into_iter().collect();
-
-        Ok(Some(self.candidates_by_ids(&ids, filter)?))
+        Ok(Some(ids))
     }
 
-    /// Rebuild the on-disk ANN index for `space` from the current SQLite
-    /// contents. Always safe to call — the index is fully derived from
-    /// SQLite, so a stale or missing index is a (re)build, never data loss.
-    /// No-ops (removing any existing index file) when there are zero chunks
-    /// in this space, so queries correctly fall back to the brute-force
-    /// path rather than querying an empty/stale index.
+    /// Rebuild every on-disk ANN index belonging to `space` from the current
+    /// SQLite contents — one per modality present. Always safe to call: the
+    /// indexes are fully derived from SQLite, so a stale or missing index is a
+    /// (re)build, never data loss.
+    ///
+    /// Every existing index file for the space is removed first, so a modality
+    /// that no longer has rows leaves nothing stale behind, and the pre-split
+    /// `{space}.usearch` layout is cleaned up on first rebuild after upgrade.
     pub fn rebuild_index(&mut self, space: Space, quantization: ScalarKind) -> Result<()> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, vector FROM chunks WHERE space = ?1 AND vector IS NOT NULL")?;
+        self.remove_space_indexes(space)?;
+        for modality in self.modalities_in_space(space)? {
+            self.rebuild_modality_index(space, &modality, quantization)?;
+        }
+        Ok(())
+    }
+
+    /// Build one `(space, modality)` ANN index. No-ops when the pair has no
+    /// vectors, so queries fall back to the brute-force path rather than
+    /// reading an empty index.
+    fn rebuild_modality_index(
+        &self,
+        space: Space,
+        modality: &str,
+        quantization: ScalarKind,
+    ) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, vector FROM chunks
+             WHERE space = ?1 AND modality = ?2 AND vector IS NOT NULL",
+        )?;
         let rows: Vec<(i64, Vec<f32>)> = stmt
-            .query_map([space.as_str()], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))?
+            .query_map([space.as_str(), modality], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()
             .map(|(id, blob)| (id, search::blob_to_vec(&blob)))
             .collect();
 
-        let index_path = self.index_path(space);
+        let index_path = self.index_path(space, modality);
         if rows.is_empty() {
             let _ = std::fs::remove_file(&index_path);
             return Ok(());
@@ -308,6 +384,20 @@ impl SqliteStore {
             .context("index path is not valid UTF-8")?;
         index.save(path_str)?;
         Ok(())
+    }
+}
+
+/// The one modality `search` retrieves from within a space.
+///
+/// A space can hold several modalities, but only one of them is what a user
+/// means by searching it. The `image` space additionally stores CLIP-text
+/// title proxies, which exist so `related` can traverse from an image to a
+/// note and back; they are not themselves search results. `related` therefore
+/// spans every modality while `search` targets exactly this one.
+fn search_modality(space: Space) -> &'static str {
+    match space {
+        Space::Text => "text",
+        Space::Image => "image",
     }
 }
 
@@ -514,23 +604,23 @@ impl Store for SqliteStore {
     }
 
     fn search_space(&self, space: Space, query: &[f32], limit: usize, filter: &TextQuery) -> Result<Vec<Hit>> {
-        // Over-fetch when filtering by root/tag (ANN can't apply either),
-        // or when searching the image space (the modality post-filter below
-        // can drop a meaningful fraction of the ANN-returned candidates).
-        let k = if filter.from.is_some() || filter.tags.is_some() || space == Space::Image {
+        // Over-fetch only when filtering by root/tag, which ANN can't apply.
+        // Modality needs no over-fetch: the index is per-modality, so nothing
+        // is discarded after retrieval.
+        let k = if filter.from.is_some() || filter.tags.is_some() {
             limit * 5
         } else {
             limit
         };
+        let modality = search_modality(space);
         let queries = [query.to_vec()];
-        let mut candidates = if let Some(candidates) = self.ann_candidates(space, &queries, k, filter)? {
-            candidates
-        } else {
-            self.space_candidates(space, filter)?
+        let candidates = match self.ann_ids(space, modality, &queries, k)? {
+            Some(ids) => {
+                let ids: Vec<u64> = ids.into_iter().collect();
+                self.candidates_by_ids(&ids, filter)?
+            }
+            None => self.space_candidates(space, Some(modality), filter)?,
         };
-        if space == Space::Image {
-            candidates.retain(|c| c.modality == "image");
-        }
         Ok(search::rank(query, candidates, limit))
     }
 
@@ -580,15 +670,31 @@ impl Store for SqliteStore {
         // matches for their own queries, so a tight k would leave too few
         // results after exclusion.
         let k = limit * 5;
-        if let Some(candidates) = self.ann_candidates(space, query_vectors, k, filter)? {
-            return Ok(search::rank_multi(
-                query_vectors,
-                candidates,
-                exclude_paths,
-                limit,
-            ));
+
+        // `related` is cross-modal by design (an image's title proxy is how it
+        // reaches related notes), so it queries every modality index in the
+        // space and unions the hits. If any one of them is missing, fall back
+        // to brute force over the whole space rather than silently returning a
+        // partial candidate set.
+        let modalities = self.modalities_in_space(space)?;
+        let mut ids: HashSet<u64> = HashSet::new();
+        let mut fully_indexed = !modalities.is_empty();
+        for modality in &modalities {
+            match self.ann_ids(space, modality, query_vectors, k)? {
+                Some(found) => ids.extend(found),
+                None => {
+                    fully_indexed = false;
+                    break;
+                }
+            }
         }
-        let candidates = self.space_candidates(space, filter)?;
+
+        let candidates = if fully_indexed {
+            let ids: Vec<u64> = ids.into_iter().collect();
+            self.candidates_by_ids(&ids, filter)?
+        } else {
+            self.space_candidates(space, None, filter)?
+        };
         Ok(search::rank_multi(
             query_vectors,
             candidates,
@@ -858,5 +964,173 @@ mod tests {
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
+    }
+
+    /// Regression test for the P0 bug: image search returned nothing on any
+    /// real-sized vault.
+    ///
+    /// The `image` space holds two modalities — CLIP vision vectors
+    /// (`modality = "image"`) and CLIP text title proxies
+    /// (`modality = "text_title"`) — and CLIP's modality gap means a text
+    /// query scores far closer to other text than to any image. So when both
+    /// live in one ANN index, every one of the `limit * 5` nearest neighbours
+    /// is a title proxy and the modality filter drops the entire candidate
+    /// set.
+    ///
+    /// The fixture must therefore exceed the over-fetch window: with fewer
+    /// than `limit * 5` title proxies the ANN returns the whole index and the
+    /// bug cannot appear, which is exactly why the original unit test (1
+    /// image + 1 note) and the documented manual walkthrough both missed it.
+    #[test]
+    fn image_search_is_not_starved_by_title_proxy_rows() {
+        let (mut store, path) = temp_store();
+
+        // 60 title proxies (> limit * 5 == 50), each a perfect match for the
+        // query, standing in for a vault's markdown notes.
+        for i in 0..60 {
+            write_full_doc(
+                &mut store,
+                &format!("/vault/note{i}.md"),
+                "markdown",
+                &[chunk("image", "text_title", Some("note"), vec![1.0, 0.0])],
+                None,
+                None,
+            );
+        }
+        // 3 images, genuinely less similar to the query than any title proxy —
+        // mirroring the real measured gap (text->image peaks ~0.36 while
+        // text->text_title averages ~0.76).
+        for i in 0..3 {
+            write_full_doc(
+                &mut store,
+                &format!("/vault/photo{i}.png"),
+                "image",
+                &[chunk("image", "image", None, vec![0.6, 0.8])],
+                Some(800),
+                Some(600),
+            );
+        }
+
+        store.rebuild_index(Space::Image, ScalarKind::F32).unwrap();
+
+        let hits = store
+            .search_space(Space::Image, &[1.0, 0.0], 10, &TextQuery::default())
+            .unwrap();
+
+        assert!(
+            !hits.is_empty(),
+            "image search returned nothing despite 3 indexed images; \
+             title proxies starved the ANN candidate set"
+        );
+        assert!(
+            hits.iter().all(|h| h.path.ends_with(".png")),
+            "image-space search must return only real images, got {:?}",
+            hits.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+        assert_eq!(hits.len(), 3, "all three images should be found");
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// The ANN path and the brute-force path must agree. `ann_candidates`
+    /// falls back to brute force only when the index file is missing, so a
+    /// divergence between the two is invisible until someone happens to have
+    /// an index on disk — which is how the P0 bug shipped.
+    #[test]
+    fn ann_and_brute_force_agree_on_image_search() {
+        let (mut store, path) = temp_store();
+
+        for i in 0..60 {
+            write_full_doc(
+                &mut store,
+                &format!("/vault/note{i}.md"),
+                "markdown",
+                &[chunk("image", "text_title", Some("note"), vec![1.0, 0.0])],
+                None,
+                None,
+            );
+        }
+        for (i, v) in [vec![0.6, 0.8], vec![0.8, 0.6], vec![0.0, 1.0]].iter().enumerate() {
+            write_full_doc(
+                &mut store,
+                &format!("/vault/photo{i}.png"),
+                "image",
+                &[chunk("image", "image", None, v.clone())],
+                Some(1),
+                Some(1),
+            );
+        }
+
+        // Brute force: no index files on disk yet.
+        let brute: Vec<String> = store
+            .search_space(Space::Image, &[1.0, 0.0], 5, &TextQuery::default())
+            .unwrap()
+            .into_iter()
+            .map(|h| h.path)
+            .collect();
+
+        store.rebuild_index(Space::Image, ScalarKind::F32).unwrap();
+
+        let ann: Vec<String> = store
+            .search_space(Space::Image, &[1.0, 0.0], 5, &TextQuery::default())
+            .unwrap()
+            .into_iter()
+            .map(|h| h.path)
+            .collect();
+
+        assert_eq!(brute, ann, "ANN and brute-force rankings diverged");
+        assert!(!brute.is_empty(), "brute force found nothing to compare");
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// One ANN index file per `(space, modality)` pair, not per space — the
+    /// structural fix for the starvation above. A pair with no rows writes no
+    /// file, so queries for it fall back to brute force rather than reading a
+    /// stale one.
+    #[test]
+    fn rebuild_index_writes_one_file_per_space_and_modality() {
+        let (mut store, path) = temp_store();
+        write_full_doc(
+            &mut store,
+            "/vault/note.md",
+            "markdown",
+            &[
+                chunk("text", "text", Some("body"), vec![1.0, 0.0]),
+                chunk("image", "text_title", Some("note"), vec![1.0, 0.0]),
+            ],
+            None,
+            None,
+        );
+        write_full_doc(
+            &mut store,
+            "/vault/photo.png",
+            "image",
+            &[chunk("image", "image", None, vec![0.0, 1.0])],
+            Some(1),
+            Some(1),
+        );
+
+        store.rebuild_index(Space::Text, ScalarKind::F32).unwrap();
+        store.rebuild_index(Space::Image, ScalarKind::F32).unwrap();
+
+        let index_dir = path.join("index");
+        let mut files: Vec<String> = std::fs::read_dir(&index_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        files.sort();
+
+        assert_eq!(
+            files,
+            vec![
+                "image.image.usearch".to_string(),
+                "image.text_title.usearch".to_string(),
+                "text.text.usearch".to_string(),
+            ],
+            "expected one index file per (space, modality) pair"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
     }
 }
