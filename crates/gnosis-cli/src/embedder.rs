@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use fastembed::{EmbeddingModel, ImageEmbedding, ImageEmbeddingModel, ImageInitOptions, InitOptions, TextEmbedding};
 
 pub use embed::Embedder;
@@ -163,6 +163,35 @@ mod tests {
         println!("matching={matching_score:.4} unrelated={unrelated_score:.4}");
         assert!(matching_score > unrelated_score);
     }
+
+    /// A WebP or JPEG saved under a `.png` name is still a supported image, so
+    /// it must embed. fastembed's path-taking `embed` picks its decoder from
+    /// the file extension and fails on these; `embed_bytes` sniffs the content
+    /// instead. Network-gated like the tests above. Run with:
+    ///   cargo test --release -- --ignored --nocapture misnamed
+    #[test]
+    #[ignore = "downloads models and runs inference"]
+    fn embeds_images_whose_extension_lies_about_the_format() {
+        // 3x2 lossless WebP, deliberately written under a .png name.
+        let webp: &[u8] = &[
+            0x52, 0x49, 0x46, 0x46, 0x1E, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38,
+            0x4C, 0x11, 0x00, 0x00, 0x00, 0x2F, 0x02, 0x40, 0x00, 0x00, 0x07, 0x50, 0x8F, 0x22, 0x17,
+            0xA5, 0xFF, 0x81, 0x88, 0xE8, 0x7F, 0x00, 0x00
+        ];
+        let mut embedder = ImageEmbedder::new("clip-vit-b-32").expect("load image model");
+
+        let path = std::env::temp_dir()
+            .join(format!("gnosis-embedder-misnamed-{}.png", std::process::id()));
+        std::fs::write(&path, webp).unwrap();
+
+        let result = embedder.embed(&[path.to_string_lossy().to_string()]);
+        std::fs::remove_file(&path).ok();
+
+        let vectors = result.expect("a WebP named .png must embed: format comes from the bytes");
+        assert_eq!(vectors.len(), 1);
+        assert_eq!(vectors[0].len(), 512);
+    }
+
 }
 
 /// Map a config model name to a fastembed model enum and its dimensionality.
@@ -221,11 +250,22 @@ impl Embedder for ImageEmbedder {
         &self.model_id
     }
 
+    /// Each input is a file path. The bytes are read here and handed to
+    /// `embed_bytes` rather than letting fastembed open the paths itself:
+    /// its path-taking `embed` picks a decoder from the file extension, which
+    /// fails on the misnamed images vaults accumulate (a WebP or JPEG saved
+    /// under a `.png` name). `embed_bytes` guesses the format from the content,
+    /// so a supported image is read regardless of what it is called.
     fn embed(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
-        let vectors = self.model.embed(inputs.to_vec(), None)?;
+        let bytes: Vec<Vec<u8>> = inputs
+            .iter()
+            .map(|path| std::fs::read(path).with_context(|| format!("reading image {path}")))
+            .collect::<Result<_>>()?;
+        let slices: Vec<&[u8]> = bytes.iter().map(Vec::as_slice).collect();
+        let vectors = self.model.embed_bytes(&slices, None)?;
         Ok(vectors)
     }
 }
