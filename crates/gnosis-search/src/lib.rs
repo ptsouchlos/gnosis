@@ -165,9 +165,14 @@ pub fn vec_to_blob(v: &[f32]) -> Vec<u8> {
 
 /// Decode a little-endian f32 BLOB back into a vector.
 pub fn blob_to_vec(bytes: &[u8]) -> Vec<f32> {
+    // `as_chunks` yields `&[u8; 4]` directly, so no per-byte indexing is
+    // needed to build the array `from_le_bytes` wants. Any trailing bytes that
+    // don't form a whole f32 are ignored, same as `chunks_exact`.
     bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 

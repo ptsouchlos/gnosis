@@ -60,8 +60,147 @@ impl Embedder for TextEmbedder {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
-        let vectors = self.model.embed(inputs.to_vec(), None)?;
+        let vectors = self.model.embed(inputs, None)?;
         Ok(vectors)
+    }
+}
+
+/// Map a config model name to a fastembed model enum and its dimensionality.
+fn resolve_text_model(name: &str) -> Result<(EmbeddingModel, usize)> {
+    let m = match name {
+        "bge-small-en-v1.5" => (EmbeddingModel::BGESmallENV15, 384),
+        "bge-small-en-v1.5-q" => (EmbeddingModel::BGESmallENV15Q, 384),
+        "bge-base-en-v1.5" => (EmbeddingModel::BGEBaseENV15, 768),
+        "all-MiniLM-L6-v2" => (EmbeddingModel::AllMiniLML6V2, 384),
+        "nomic-embed-text-v1.5" => (EmbeddingModel::NomicEmbedTextV15, 768),
+        other => bail!(
+            "unknown text model '{other}' (try: bge-small-en-v1.5, bge-small-en-v1.5-q, \
+             bge-base-en-v1.5, all-MiniLM-L6-v2, nomic-embed-text-v1.5)"
+        ),
+    };
+    Ok(m)
+}
+
+/// Image embedder backed by a local fastembed (ONNX) CLIP vision model.
+/// `embed()`'s inputs are file paths, not text — matches `TextEmbedder`'s
+/// convention of treating each input string as "the thing to embed" for its
+/// modality.
+pub struct ImageEmbedder {
+    model: ImageEmbedding,
+    model_id: String,
+    dim: usize,
+}
+
+impl ImageEmbedder {
+    pub fn new(model_name: &str) -> Result<Self> {
+        let (model, dim) = resolve_image_model(model_name)?;
+        let opts = ImageInitOptions::new(model);
+        let embedding = ImageEmbedding::try_new(opts)?;
+        Ok(Self {
+            model: embedding,
+            model_id: model_name.to_string(),
+            dim,
+        })
+    }
+}
+
+pub fn build_image_embedder(model_name: &str) -> Result<Box<dyn Embedder>> {
+    Ok(Box::new(ImageEmbedder::new(model_name)?))
+}
+
+impl Embedder for ImageEmbedder {
+    fn space(&self) -> &str {
+        "image"
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    /// Each input is a file path. The bytes are read here and handed to
+    /// `embed_bytes` rather than letting fastembed open the paths itself:
+    /// its path-taking `embed` picks a decoder from the file extension, which
+    /// fails on the misnamed images vaults accumulate (a WebP or JPEG saved
+    /// under a `.png` name). `embed_bytes` guesses the format from the content,
+    /// so a supported image is read regardless of what it is called.
+    fn embed(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bytes: Vec<Vec<u8>> = inputs
+            .iter()
+            .map(|path| std::fs::read(path).with_context(|| format!("reading image {path}")))
+            .collect::<Result<_>>()?;
+        let slices: Vec<&[u8]> = bytes.iter().map(Vec::as_slice).collect();
+        let vectors = self.model.embed_bytes(&slices, None)?;
+        Ok(vectors)
+    }
+}
+
+fn resolve_image_model(name: &str) -> Result<(ImageEmbeddingModel, usize)> {
+    match name {
+        "clip-vit-b-32" => Ok((ImageEmbeddingModel::ClipVitB32, 512)),
+        other => bail!("unknown image model '{other}' (try: clip-vit-b-32)"),
+    }
+}
+
+/// Text embedder backed by the CLIP *text* encoder — produces vectors in
+/// the same space as `ImageEmbedder`'s CLIP *vision* encoder, so a text
+/// query (or a document title, for the title-proxy mechanism) can be
+/// compared against real image embeddings.
+pub struct ClipTextEmbedder {
+    model: TextEmbedding,
+    model_id: String,
+    dim: usize,
+}
+
+impl ClipTextEmbedder {
+    pub fn new(model_name: &str) -> Result<Self> {
+        let (model, dim) = resolve_clip_text_model(model_name)?;
+        let opts = InitOptions::new(model);
+        let embedding = TextEmbedding::try_new(opts)?;
+        Ok(Self {
+            model: embedding,
+            model_id: model_name.to_string(),
+            dim,
+        })
+    }
+}
+
+pub fn build_clip_text_embedder(model_name: &str) -> Result<Box<dyn Embedder>> {
+    Ok(Box::new(ClipTextEmbedder::new(model_name)?))
+}
+
+impl Embedder for ClipTextEmbedder {
+    fn space(&self) -> &str {
+        "image"
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    fn embed(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let vectors = self.model.embed(inputs, None)?;
+        Ok(vectors)
+    }
+}
+
+fn resolve_clip_text_model(name: &str) -> Result<(EmbeddingModel, usize)> {
+    match name {
+        "clip-vit-b-32" => Ok((EmbeddingModel::ClipVitB32, 512)),
+        other => bail!("unknown image model '{other}' (try: clip-vit-b-32)"),
     }
 }
 
@@ -192,143 +331,4 @@ mod tests {
         assert_eq!(vectors[0].len(), 512);
     }
 
-}
-
-/// Map a config model name to a fastembed model enum and its dimensionality.
-fn resolve_text_model(name: &str) -> Result<(EmbeddingModel, usize)> {
-    let m = match name {
-        "bge-small-en-v1.5" => (EmbeddingModel::BGESmallENV15, 384),
-        "bge-small-en-v1.5-q" => (EmbeddingModel::BGESmallENV15Q, 384),
-        "bge-base-en-v1.5" => (EmbeddingModel::BGEBaseENV15, 768),
-        "all-MiniLM-L6-v2" => (EmbeddingModel::AllMiniLML6V2, 384),
-        "nomic-embed-text-v1.5" => (EmbeddingModel::NomicEmbedTextV15, 768),
-        other => bail!(
-            "unknown text model '{other}' (try: bge-small-en-v1.5, bge-small-en-v1.5-q, \
-             bge-base-en-v1.5, all-MiniLM-L6-v2, nomic-embed-text-v1.5)"
-        ),
-    };
-    Ok(m)
-}
-
-/// Image embedder backed by a local fastembed (ONNX) CLIP vision model.
-/// `embed()`'s inputs are file paths, not text — matches `TextEmbedder`'s
-/// convention of treating each input string as "the thing to embed" for its
-/// modality.
-pub struct ImageEmbedder {
-    model: ImageEmbedding,
-    model_id: String,
-    dim: usize,
-}
-
-impl ImageEmbedder {
-    pub fn new(model_name: &str) -> Result<Self> {
-        let (model, dim) = resolve_image_model(model_name)?;
-        let opts = ImageInitOptions::new(model);
-        let embedding = ImageEmbedding::try_new(opts)?;
-        Ok(Self {
-            model: embedding,
-            model_id: model_name.to_string(),
-            dim,
-        })
-    }
-}
-
-pub fn build_image_embedder(model_name: &str) -> Result<Box<dyn Embedder>> {
-    Ok(Box::new(ImageEmbedder::new(model_name)?))
-}
-
-impl Embedder for ImageEmbedder {
-    fn space(&self) -> &str {
-        "image"
-    }
-
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    fn model_id(&self) -> &str {
-        &self.model_id
-    }
-
-    /// Each input is a file path. The bytes are read here and handed to
-    /// `embed_bytes` rather than letting fastembed open the paths itself:
-    /// its path-taking `embed` picks a decoder from the file extension, which
-    /// fails on the misnamed images vaults accumulate (a WebP or JPEG saved
-    /// under a `.png` name). `embed_bytes` guesses the format from the content,
-    /// so a supported image is read regardless of what it is called.
-    fn embed(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
-        if inputs.is_empty() {
-            return Ok(Vec::new());
-        }
-        let bytes: Vec<Vec<u8>> = inputs
-            .iter()
-            .map(|path| std::fs::read(path).with_context(|| format!("reading image {path}")))
-            .collect::<Result<_>>()?;
-        let slices: Vec<&[u8]> = bytes.iter().map(Vec::as_slice).collect();
-        let vectors = self.model.embed_bytes(&slices, None)?;
-        Ok(vectors)
-    }
-}
-
-fn resolve_image_model(name: &str) -> Result<(ImageEmbeddingModel, usize)> {
-    match name {
-        "clip-vit-b-32" => Ok((ImageEmbeddingModel::ClipVitB32, 512)),
-        other => bail!("unknown image model '{other}' (try: clip-vit-b-32)"),
-    }
-}
-
-/// Text embedder backed by the CLIP *text* encoder — produces vectors in
-/// the same space as `ImageEmbedder`'s CLIP *vision* encoder, so a text
-/// query (or a document title, for the title-proxy mechanism) can be
-/// compared against real image embeddings.
-pub struct ClipTextEmbedder {
-    model: TextEmbedding,
-    model_id: String,
-    dim: usize,
-}
-
-impl ClipTextEmbedder {
-    pub fn new(model_name: &str) -> Result<Self> {
-        let (model, dim) = resolve_clip_text_model(model_name)?;
-        let opts = InitOptions::new(model);
-        let embedding = TextEmbedding::try_new(opts)?;
-        Ok(Self {
-            model: embedding,
-            model_id: model_name.to_string(),
-            dim,
-        })
-    }
-}
-
-pub fn build_clip_text_embedder(model_name: &str) -> Result<Box<dyn Embedder>> {
-    Ok(Box::new(ClipTextEmbedder::new(model_name)?))
-}
-
-impl Embedder for ClipTextEmbedder {
-    fn space(&self) -> &str {
-        "image"
-    }
-
-    fn dim(&self) -> usize {
-        self.dim
-    }
-
-    fn model_id(&self) -> &str {
-        &self.model_id
-    }
-
-    fn embed(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
-        if inputs.is_empty() {
-            return Ok(Vec::new());
-        }
-        let vectors = self.model.embed(inputs.to_vec(), None)?;
-        Ok(vectors)
-    }
-}
-
-fn resolve_clip_text_model(name: &str) -> Result<(EmbeddingModel, usize)> {
-    match name {
-        "clip-vit-b-32" => Ok((EmbeddingModel::ClipVitB32, 512)),
-        other => bail!("unknown image model '{other}' (try: clip-vit-b-32)"),
-    }
 }
