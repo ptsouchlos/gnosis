@@ -88,3 +88,53 @@ fn indexed_image_content_is_found_by_semantic_search() {
 
     let _ = std::fs::remove_dir_all(&vault);
 }
+
+/// End-to-end guard for the P0 bug: image search returned nothing on any vault
+/// with more than a handful of notes.
+///
+/// Every markdown document also gets a CLIP-text "title proxy" chunk in the
+/// `image` space, and CLIP's modality gap puts text far closer to other text
+/// than to any image. While one ANN index held both modalities, the whole
+/// `limit * 5` candidate window filled with title proxies and the modality
+/// filter emptied it.
+///
+/// The fixture therefore needs **more than `limit * 5`** notes. The
+/// pre-existing test above uses one note and one image, which is inside the
+/// over-fetch window — it passed throughout the period the feature was broken,
+/// which is exactly why this second test exists rather than an assertion being
+/// added to that one.
+#[test]
+#[ignore = "downloads CLIP models and runs inference"]
+fn image_search_survives_a_vault_with_many_notes() {
+    let vault =
+        std::env::temp_dir().join(format!("gnosis-image-scale-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&vault);
+    std::fs::create_dir_all(&vault).unwrap();
+
+    std::fs::write(vault.join("gnosis.toml"), "[embed.image]\nenabled = true\n").unwrap();
+    std::fs::write(vault.join("photo.png"), RED_BLUE_PNG).unwrap();
+
+    // 60 notes > the default limit(10) * 5 over-fetch window.
+    for i in 0..60 {
+        std::fs::write(
+            vault.join(format!("note{i}.md")),
+            format!("# Note {i}\n\nSome unrelated prose about topic number {i}.\n"),
+        )
+        .unwrap();
+    }
+
+    run(&vault, &["index", "."]);
+
+    let hits = search_image_space(&vault, "a small red and blue image");
+    assert!(
+        !hits.is_empty(),
+        "image search returned nothing on a 60-note vault; title proxies starved the candidate set"
+    );
+    assert!(
+        hits.iter()
+            .all(|h| h["path"].as_str().unwrap().ends_with(".png")),
+        "image-space search must return only images, got {hits:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&vault);
+}
