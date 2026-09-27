@@ -29,8 +29,20 @@ impl FileReader for StdFs {
             .unwrap_or(0)
     }
 
+    /// Identifies the format from the file's **contents**, not its extension.
+    ///
+    /// `image::image_dimensions` would guess from the path, which silently
+    /// fails on the misnamed files vaults accumulate — a WebP or JPEG saved
+    /// as `.png` by a browser or screenshot tool. Those are formats gnosis
+    /// supports; only the name is wrong, so the bytes are what to trust.
+    /// Still a header-only probe: no pixel data is decoded.
     fn image_dimensions(&self, path: &Path) -> Option<(u32, u32)> {
-        image::image_dimensions(path).ok()
+        image::ImageReader::open(path)
+            .ok()?
+            .with_guessed_format()
+            .ok()?
+            .into_dimensions()
+            .ok()
     }
 }
 
@@ -62,5 +74,73 @@ mod tests {
     fn image_dimensions_none_for_missing_file() {
         let path = std::env::temp_dir().join("gnosis-fs-test-does-not-exist.png");
         assert_eq!(StdFs.image_dimensions(&path), None);
+    }
+
+    /// A 3x2 lossless WebP. Vaults accumulate these under a `.png` name —
+    /// browsers and screenshot tools save WebP bytes with whatever extension
+    /// the source URL had. WebP is a format gnosis supports, so the only thing
+    /// wrong with such a file is its name.
+    const WEBP_3X2: &[u8] = &[
+        0x52, 0x49, 0x46, 0x46, 0x1E, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38,
+        0x4C, 0x11, 0x00, 0x00, 0x00, 0x2F, 0x02, 0x40, 0x00, 0x00, 0x07, 0x50, 0x8F, 0x22, 0x17,
+        0xA5, 0xFF, 0x81, 0x88, 0xE8, 0x7F, 0x00, 0x00
+    ];
+
+    /// Encode a 3x2 JPEG at test time rather than embedding ~630 bytes of
+    /// baseline JPEG (fixed Huffman/quantization tables make a hand-embedded
+    /// one an order of magnitude larger than the WebP above).
+    fn jpeg_3x2() -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(3, 2, image::Rgb([200, 30, 40]));
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut std::io::Cursor::new(&mut bytes))
+            .encode_image(&image::DynamicImage::ImageRgb8(img))
+            .unwrap();
+        bytes
+    }
+
+    fn write_temp(name: &str, bytes: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "gnosis-fs-fmt-{}-{}",
+            std::process::id(),
+            name
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn image_dimensions_reads_webp_misnamed_as_png() {
+        let path = write_temp("webp-as.png", WEBP_3X2);
+        let dims = StdFs.image_dimensions(&path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            dims,
+            Some((3, 2)),
+            "a WebP named .png must still be read: format comes from the bytes, not the name"
+        );
+    }
+
+    #[test]
+    fn image_dimensions_reads_jpeg_misnamed_as_png() {
+        let path = write_temp("jpeg-as.png", &jpeg_3x2());
+        let dims = StdFs.image_dimensions(&path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(dims, Some((3, 2)), "a JPEG named .png must still be read");
+    }
+
+    #[test]
+    fn image_dimensions_none_for_empty_file() {
+        let path = write_temp("empty.png", b"");
+        let dims = StdFs.image_dimensions(&path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(dims, None, "a 0-byte file has nothing to sniff");
+    }
+
+    #[test]
+    fn image_dimensions_none_for_garbage() {
+        let path = write_temp("garbage.png", b"this is not an image at all");
+        let dims = StdFs.image_dimensions(&path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(dims, None, "unrecognizable bytes must not be guessed at");
     }
 }
