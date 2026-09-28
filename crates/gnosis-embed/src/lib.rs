@@ -17,7 +17,9 @@ pub trait Embedder {
 
 /// Text/image embedding configuration, shared by every `Embedder` implementor
 /// (native fastembed today, a JS-backed embedder in a future WASM plugin).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `Default` is derived: both fields carry their own non-trivial `Default`
+/// impls below, and a derive delegates to those.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EmbedConfig {
     pub text: TextEmbedConfig,
@@ -38,15 +40,6 @@ pub struct ImageEmbedConfig {
     /// How many pending image/title embeds to accumulate before issuing one
     /// batched `Embedder::embed` call, instead of one call per file.
     pub batch_size: usize,
-}
-
-impl Default for EmbedConfig {
-    fn default() -> Self {
-        Self {
-            text: TextEmbedConfig::default(),
-            image: ImageEmbedConfig::default(),
-        }
-    }
 }
 
 impl Default for TextEmbedConfig {

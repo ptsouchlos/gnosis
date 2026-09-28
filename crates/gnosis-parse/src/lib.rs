@@ -125,29 +125,30 @@ fn extract_wikilinks(body: &str) -> (Vec<String>, Vec<String>) {
     let bytes = body.as_bytes();
     let mut i = 0;
     while i + 1 < bytes.len() {
-        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
-            if let Some(end) = body[i + 2..].find("]]") {
-                let inner = &body[i + 2..i + 2 + end];
-                let target = inner
-                    .split('|')
-                    .next()
-                    .unwrap_or(inner)
-                    .split('#')
-                    .next()
-                    .unwrap_or(inner)
-                    .trim();
-                let is_embed = i > 0 && bytes[i - 1] == b'!';
-                if !target.is_empty() {
-                    if !links.iter().any(|l| l == target) {
-                        links.push(target.to_string());
-                    }
-                    if is_embed && !embeds.iter().any(|l| l == target) {
-                        embeds.push(target.to_string());
-                    }
+        if bytes[i] == b'['
+            && bytes[i + 1] == b'['
+            && let Some(end) = body[i + 2..].find("]]")
+        {
+            let inner = &body[i + 2..i + 2 + end];
+            let target = inner
+                .split('|')
+                .next()
+                .unwrap_or(inner)
+                .split('#')
+                .next()
+                .unwrap_or(inner)
+                .trim();
+            let is_embed = i > 0 && bytes[i - 1] == b'!';
+            if !target.is_empty() {
+                if !links.iter().any(|l| l == target) {
+                    links.push(target.to_string());
                 }
-                i = i + 2 + end + 2;
-                continue;
+                if is_embed && !embeds.iter().any(|l| l == target) {
+                    embeds.push(target.to_string());
+                }
             }
+            i = i + 2 + end + 2;
+            continue;
         }
         i += 1;
     }

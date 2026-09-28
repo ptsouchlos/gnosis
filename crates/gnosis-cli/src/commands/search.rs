@@ -83,7 +83,7 @@ pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
             Space::Text => {
                 let mut embedder = build_text_embedder(&ws.config.embed.text.model)?;
                 embedder
-                    .embed(&[args.query.clone()])?
+                    .embed(std::slice::from_ref(&args.query))?
                     .into_iter()
                     .next()
                     .context("embedding produced no vector")?
@@ -91,7 +91,7 @@ pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
             Space::Image => {
                 let mut embedder = build_clip_text_embedder(&ws.config.embed.image.model)?;
                 embedder
-                    .embed(&[args.query.clone()])?
+                    .embed(std::slice::from_ref(&args.query))?
                     .into_iter()
                     .next()
                     .context("embedding produced no vector")?

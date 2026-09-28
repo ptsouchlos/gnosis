@@ -100,10 +100,10 @@ fn split_sections(body: &str) -> Vec<Section> {
             }
             Event::End(TagEnd::Paragraph)
             | Event::End(TagEnd::Item)
-            | Event::End(TagEnd::CodeBlock) => {
-                if heading_buf.is_none() {
-                    current.push('\n');
-                }
+            | Event::End(TagEnd::CodeBlock)
+                if heading_buf.is_none() =>
+            {
+                current.push('\n');
             }
             _ => {}
         }
