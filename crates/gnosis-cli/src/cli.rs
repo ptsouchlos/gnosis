@@ -37,6 +37,8 @@ pub enum Command {
     Related(commands::related::RelatedArgs),
     /// Remove a vault from the index and delete its documents.
     Forget(commands::forget::ForgetArgs),
+    /// Score retrieval quality against a qrels file.
+    Eval(commands::eval::EvalArgs),
     /// Show index statistics.
     Status(commands::status::StatusArgs),
     /// Force a full re-embed and rebuild of the index.

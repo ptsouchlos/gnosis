@@ -3,6 +3,7 @@ members = [
     "crates/gnosis-cli",
     "crates/gnosis-chunker",
     "crates/gnosis-embed",
+    "crates/gnosis-eval",
     "crates/gnosis-fs",
     "crates/gnosis-index",
     "crates/gnosis-parse",
@@ -17,6 +18,7 @@ resolver = "3"
 # Workspace member crates
 chunker = { path = "crates/gnosis-chunker" }
 embed = { path = "crates/gnosis-embed" }
+eval = { path = "crates/gnosis-eval" }
 fs = { path = "crates/gnosis-fs" }
 index = { path = "crates/gnosis-index" }
 parse = { path = "crates/gnosis-parse" }

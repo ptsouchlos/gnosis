@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 chunker = { workspace = true }
 embed = { workspace = true }
+eval = { workspace = true }
 fs = { workspace = true }
 index = { workspace = true }
 parse = { workspace = true }

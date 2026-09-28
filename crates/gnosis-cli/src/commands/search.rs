@@ -52,6 +52,74 @@ pub(crate) fn resolve_spaces(ws: &Workspace, requested: &[String]) -> Result<Vec
     requested.iter().map(|s| s.parse()).collect()
 }
 
+/// Query-side embedders, built on first use and reused afterwards.
+///
+/// `search` runs a single query so this is immaterial there, but `eval` runs
+/// a whole qrels file through the same path, and constructing a fastembed
+/// model per query would dominate its runtime.
+pub(crate) struct QueryEmbedders<'a> {
+    ws: &'a Workspace,
+    text: Option<Box<dyn embed::Embedder>>,
+    clip_text: Option<Box<dyn embed::Embedder>>,
+}
+
+impl<'a> QueryEmbedders<'a> {
+    pub(crate) fn new(ws: &'a Workspace) -> Self {
+        Self {
+            ws,
+            text: None,
+            clip_text: None,
+        }
+    }
+
+    /// Embed `query` into `space`'s vector space, loading that space's model
+    /// on first use.
+    pub(crate) fn embed(&mut self, space: Space, query: &str) -> Result<Vec<f32>> {
+        let embedder = match space {
+            Space::Text => {
+                if self.text.is_none() {
+                    self.text = Some(build_text_embedder(&self.ws.config.embed.text.model)?);
+                }
+                self.text.as_mut().expect("just built")
+            }
+            Space::Image => {
+                if self.clip_text.is_none() {
+                    self.clip_text =
+                        Some(build_clip_text_embedder(&self.ws.config.embed.image.model)?);
+                }
+                self.clip_text.as_mut().expect("just built")
+            }
+        };
+        embedder
+            .embed(std::slice::from_ref(&query.to_string()))?
+            .into_iter()
+            .next()
+            .context("embedding produced no vector")
+    }
+}
+
+/// Run one query across `spaces` and merge the per-space results.
+///
+/// The single retrieval path shared by `search` and `eval`. Keeping it in one
+/// place is the point: an evaluation harness that reimplemented retrieval
+/// could not catch a retrieval bug, which is exactly how the image-search
+/// defect survived its own tests.
+pub(crate) fn run_query(
+    store: &SqliteStore,
+    embedders: &mut QueryEmbedders,
+    query: &str,
+    spaces: &[Space],
+    limit: usize,
+    filter: &TextQuery,
+) -> Result<Vec<search::Hit>> {
+    let mut per_space: Vec<Vec<search::Hit>> = Vec::with_capacity(spaces.len());
+    for space in spaces.iter().copied() {
+        let query_vec = embedders.embed(space, query)?;
+        per_space.push(store.search_space(space, &query_vec, limit, filter)?);
+    }
+    Ok(search::merge_normalized(per_space, limit))
+}
+
 pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
     if !ws.db_path.exists() {
         bail!(
@@ -77,29 +145,15 @@ pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
         tags: tags_ref,
     };
 
-    let mut per_space: Vec<Vec<search::Hit>> = Vec::with_capacity(spaces.len());
-    for space in spaces.iter().copied() {
-        let query_vec = match space {
-            Space::Text => {
-                let mut embedder = build_text_embedder(&ws.config.embed.text.model)?;
-                embedder
-                    .embed(std::slice::from_ref(&args.query))?
-                    .into_iter()
-                    .next()
-                    .context("embedding produced no vector")?
-            }
-            Space::Image => {
-                let mut embedder = build_clip_text_embedder(&ws.config.embed.image.model)?;
-                embedder
-                    .embed(std::slice::from_ref(&args.query))?
-                    .into_iter()
-                    .next()
-                    .context("embedding produced no vector")?
-            }
-        };
-        per_space.push(store.search_space(space, &query_vec, args.limit, &filter)?);
-    }
-    let hits = search::merge_normalized(per_space, args.limit);
+    let mut embedders = QueryEmbedders::new(ws);
+    let hits = run_query(
+        &store,
+        &mut embedders,
+        &args.query,
+        &spaces,
+        args.limit,
+        &filter,
+    )?;
 
     if args.json {
         // Full data regardless of --full: JSON output is for programmatic

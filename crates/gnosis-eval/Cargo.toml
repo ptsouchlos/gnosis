@@ -1,0 +1,7 @@
+[package]
+name = "eval"
+version = "0.1.0"
+edition = "2024"
+description = "Relevance metrics (nDCG, recall, MRR) for scoring gnosis retrieval quality"
+
+[dependencies]
