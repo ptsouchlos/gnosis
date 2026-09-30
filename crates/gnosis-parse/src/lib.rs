@@ -1,3 +1,6 @@
+pub mod pdf;
+pub use pdf::{ParsedPdf, parse_pdf};
+
 use std::path::Path;
 
 /// The result of parsing a markdown document.
@@ -310,5 +313,71 @@ mod obsidian_tests {
         let (links, embeds) = extract_wikilinks("See [[Note A]] and ![[Note B]].");
         assert_eq!(links, vec!["Note A", "Note B"]);
         assert_eq!(embeds, vec!["Note B"]);
+    }
+
+    // ---- parse_pdf -------------------------------------------------------
+
+    /// A 1.1 KB two-page PDF using base-14 Helvetica (no embedded fonts), with
+    /// "Gnosis Sample Document" as its metadata Title. Compiled in rather than
+    /// read at runtime so the test needs no fixture path.
+    const SAMPLE_PDF: &[u8] = include_bytes!("../../../tests/fixtures/sample.pdf");
+
+    #[test]
+    fn parse_pdf_extracts_each_page_separately() {
+        let parsed = parse_pdf(SAMPLE_PDF).expect("a valid PDF must parse");
+        assert_eq!(parsed.pages.len(), 2, "expected one entry per page");
+        assert_eq!(parsed.pages[0].0, 1, "pages are numbered from 1");
+        assert_eq!(parsed.pages[1].0, 2);
+        assert!(
+            parsed.pages[0].1.contains("Chunking strategies"),
+            "page 1 text missing, got {:?}",
+            parsed.pages[0].1
+        );
+        assert!(
+            parsed.pages[1].1.contains("approximate nearest"),
+            "page 2 text missing, got {:?}",
+            parsed.pages[1].1
+        );
+    }
+
+    #[test]
+    fn parse_pdf_does_not_leak_text_between_pages() {
+        let parsed = parse_pdf(SAMPLE_PDF).unwrap();
+        assert!(
+            !parsed.pages[0].1.contains("nearest"),
+            "page 1 must not contain page 2's text"
+        );
+        assert!(
+            !parsed.pages[1].1.contains("Chunking"),
+            "page 2 must not contain page 1's text"
+        );
+    }
+
+    #[test]
+    fn parse_pdf_prefers_the_metadata_title() {
+        let parsed = parse_pdf(SAMPLE_PDF).unwrap();
+        assert_eq!(parsed.title, "Gnosis Sample Document");
+    }
+
+    #[test]
+    fn parse_pdf_rejects_bytes_that_are_not_a_pdf() {
+        assert!(
+            parse_pdf(b"this is not a pdf at all").is_err(),
+            "garbage input must fail, not yield an empty document"
+        );
+    }
+
+    #[test]
+    fn parse_pdf_rejects_an_empty_input() {
+        assert!(parse_pdf(b"").is_err());
+    }
+
+    #[test]
+    fn parse_pdf_rejects_a_pdf_with_no_extractable_text() {
+        // Header and trailer only: structurally PDF-ish, no text layer. A
+        // scanned page behaves this way, and it must fail rather than index
+        // as an empty document.
+        let empty = b"%PDF-1.4\ntrailer\n<< /Size 1 >>\n%%EOF\n";
+        assert!(parse_pdf(empty).is_err());
     }
 }

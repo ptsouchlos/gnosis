@@ -5,4 +5,6 @@ edition = "2024"
 description = "Markdown frontmatter/title/wikilink parsing shared across gnosis front-ends"
 
 [dependencies]
+anyhow = { workspace = true }
+pdf-extract = { workspace = true }
 serde_norway = "0.9.42"

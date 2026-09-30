@@ -158,6 +158,43 @@ pub fn run(
                         Err(e) => return Err(e),
                     }
                 }
+                // Structured like the markdown arms (immediate vs. staged for the
+                // title batch) but soft-failing like the image arm: extraction
+                // can fail where markdown's cannot.
+                DocKind::Pdf if batching_titles => {
+                    match stage_pdf_file(args, &path_str, &root_str, chunk_cfg, force) {
+                        Ok(Some(pending)) => {
+                            pending_titles.push(pending);
+                            if pending_titles.len() >= image_batch_size {
+                                flush_title_batch(args, &mut pending_titles, &mut report, fail_fast)?;
+                            }
+                        }
+                        Ok(None) => report.skipped += 1,
+                        Err(e) if !fail_fast => {
+                            report.errors.push(IndexError {
+                                path: path_str.clone(),
+                                message: e.to_string(),
+                            });
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                DocKind::Pdf => {
+                    match process_pdf_file(args, &path_str, &root_str, chunk_cfg, force) {
+                        Ok(Some(n)) => {
+                            report.indexed += 1;
+                            report.chunks += n;
+                        }
+                        Ok(None) => report.skipped += 1,
+                        Err(e) if !fail_fast => {
+                            report.errors.push(IndexError {
+                                path: path_str.clone(),
+                                message: e.to_string(),
+                            });
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
                 DocKind::Image => match stage_image_file(args, &path_str, &root_str, force) {
                     Ok(Some(pending)) => {
                         pending_images.push(pending);
@@ -246,8 +283,9 @@ fn index_markdown_file(
     let (parsed, chunk_writes) = embed_markdown_chunks(args, path_str, bytes, chunk_cfg)?;
     let hash = blake3::hash(bytes);
     let mtime = args.fs_reader.mtime(Path::new(path_str));
-    write_markdown_doc(
+    write_text_doc(
         args,
+        DocKind::Markdown,
         path_str,
         source_root,
         hash.as_bytes(),
@@ -302,12 +340,14 @@ fn embed_markdown_chunks(
     Ok((parsed, chunk_writes))
 }
 
-/// Persist a markdown document from its already-embedded chunks. Updates
+/// Persist a text-bearing document (markdown or PDF) from its
+/// already-embedded chunks. Updates
 /// `report` counters are the caller's responsibility (the two call sites —
 /// immediate and title-batch-flush — account differently).
 #[allow(clippy::too_many_arguments)]
-fn write_markdown_doc(
+fn write_text_doc(
     args: &mut IndexerArgs,
+    kind: DocKind,
     path_str: &str,
     source_root: &str,
     content_hash: &[u8],
@@ -321,7 +361,7 @@ fn write_markdown_doc(
     let indexed_at = now_unix();
     args.store.replace_document(&DocWrite {
         path: path_str,
-        kind: DocKind::Markdown.as_str(),
+        kind: kind.as_str(),
         source_root,
         content_hash,
         mtime,
@@ -335,6 +375,133 @@ fn write_markdown_doc(
         height: None,
     })?;
     Ok(chunk_writes.len())
+}
+
+/// Parse, chunk, embed, and persist a single PDF. Used when no title-proxy
+/// chunk is needed; otherwise `stage_pdf_file` defers the write so the title
+/// embeds in a batch. Mirrors `process_markdown_file`, but a PDF can fail to
+/// extract where markdown cannot, so the caller treats an error as a per-file
+/// soft failure.
+fn process_pdf_file(
+    args: &mut IndexerArgs,
+    path_str: &str,
+    source_root: &str,
+    chunk_cfg: &chunker::ChunkConfig,
+    force: bool,
+) -> Result<Option<usize>> {
+    let bytes = args.fs_reader.read(Path::new(path_str))?;
+    let hash = blake3::hash(&bytes);
+
+    if !force
+        && let Some(existing) = args.store.document_hash(path_str)?
+        && existing.as_slice() == hash.as_bytes()
+    {
+        return Ok(None);
+    }
+
+    let (title, chunk_writes) = embed_pdf_chunks(args, path_str, &bytes, chunk_cfg)?;
+    let mtime = args.fs_reader.mtime(Path::new(path_str));
+    let n = write_text_doc(
+        args,
+        DocKind::Pdf,
+        path_str,
+        source_root,
+        hash.as_bytes(),
+        mtime,
+        &title,
+        None,
+        &[],
+        &[],
+        chunk_writes,
+    )?;
+    Ok(Some(n))
+}
+
+/// Read/hash/skip-check a PDF and embed its chunks, deferring the write until
+/// its title-proxy vector arrives. The PDF counterpart of
+/// `stage_markdown_file`.
+fn stage_pdf_file(
+    args: &mut IndexerArgs,
+    path_str: &str,
+    source_root: &str,
+    chunk_cfg: &chunker::ChunkConfig,
+    force: bool,
+) -> Result<Option<PendingTitleDoc>> {
+    let bytes = args.fs_reader.read(Path::new(path_str))?;
+    let hash = blake3::hash(&bytes);
+
+    if !force
+        && let Some(existing) = args.store.document_hash(path_str)?
+        && existing.as_slice() == hash.as_bytes()
+    {
+        return Ok(None);
+    }
+
+    let (title, chunk_writes) = embed_pdf_chunks(args, path_str, &bytes, chunk_cfg)?;
+    let mtime = args.fs_reader.mtime(Path::new(path_str));
+
+    Ok(Some(PendingTitleDoc::Text {
+        kind: DocKind::Pdf,
+        path: path_str.to_string(),
+        source_root: source_root.to_string(),
+        content_hash: hash.as_bytes().to_vec(),
+        mtime,
+        title,
+        // A PDF carries no frontmatter, wikilinks or tags.
+        frontmatter: None,
+        links: Vec::new(),
+        tags: Vec::new(),
+        chunk_writes,
+    }))
+}
+
+/// Extract per-page text, chunk it, and text-embed the chunks. Returns the
+/// resolved title alongside them.
+///
+/// Chunks land in the `text` space with `modality = "text"`, exactly like
+/// markdown's: nothing downstream needs to tell a PDF-sourced chunk from a
+/// markdown-sourced one, and the same embedder handles both.
+fn embed_pdf_chunks(
+    args: &mut IndexerArgs,
+    path_str: &str,
+    bytes: &[u8],
+    chunk_cfg: &chunker::ChunkConfig,
+) -> Result<(String, Vec<ChunkWrite>)> {
+    let parsed = parse::parse_pdf(bytes)?;
+    let chunks = chunker::chunk_pages(&parsed.pages, chunk_cfg.max_tokens, chunk_cfg.overlap);
+
+    // Prefix the page label, mirroring how markdown prefixes its heading
+    // trail, so a chunk's embedding carries its own locator.
+    let texts: Vec<String> = chunks
+        .iter()
+        .map(|c| format!("{}\n{}", c.heading_path, c.text))
+        .collect();
+    let vectors = args.embedders.text.embed(&texts)?;
+
+    let chunk_writes: Vec<ChunkWrite> = chunks
+        .iter()
+        .zip(vectors)
+        .map(|(c, vector)| ChunkWrite {
+            ord: c.ord,
+            space: "text".to_string(),
+            modality: "text".to_string(),
+            text: Some(c.text.clone()),
+            heading_path: c.heading_path.clone(),
+            vector,
+        })
+        .collect();
+
+    // PDF metadata often has no Title; the file stem is the only other signal.
+    let title = if parsed.title.is_empty() {
+        Path::new(path_str)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| path_str.to_string())
+    } else {
+        parsed.title
+    };
+
+    Ok((title, chunk_writes))
 }
 
 /// One image file that has been read/hashed/skip-checked and is waiting for
@@ -419,7 +586,8 @@ fn stage_markdown_file(
     let (parsed, chunk_writes) = embed_markdown_chunks(args, path_str, &bytes, chunk_cfg)?;
     let mtime = args.fs_reader.mtime(Path::new(path_str));
 
-    Ok(Some(PendingTitleDoc::Markdown {
+    Ok(Some(PendingTitleDoc::Text {
+        kind: DocKind::Markdown,
         path: path_str.to_string(),
         source_root: source_root.to_string(),
         content_hash: hash.as_bytes().to_vec(),
@@ -571,7 +739,11 @@ fn write_image_doc(
 /// image to a text document (and vice versa) without ever comparing
 /// incompatible vector spaces directly. See `docs/gnosis/image-support.md`.
 enum PendingTitleDoc {
-    Markdown {
+    /// A text-bearing document (markdown or PDF). One variant rather than two
+    /// because the fields are identical; `kind` is what differs, and it is
+    /// also what decides whether a title-embed failure may be skipped.
+    Text {
+        kind: DocKind,
         path: String,
         source_root: String,
         content_hash: Vec<u8>,
@@ -591,14 +763,14 @@ enum PendingTitleDoc {
 impl PendingTitleDoc {
     fn title(&self) -> &str {
         match self {
-            PendingTitleDoc::Markdown { title, .. } => title,
+            PendingTitleDoc::Text { title, .. } => title,
             PendingTitleDoc::Image { item, .. } => &item.title,
         }
     }
 
     fn path(&self) -> &str {
         match self {
-            PendingTitleDoc::Markdown { path, .. } => path,
+            PendingTitleDoc::Text { path, .. } => path,
             PendingTitleDoc::Image { item, .. } => &item.path,
         }
     }
@@ -608,7 +780,13 @@ impl PendingTitleDoc {
     /// per-kind error-isolation contract (markdown always propagates,
     /// image soft-fails).
     fn must_propagate(&self) -> bool {
-        matches!(self, PendingTitleDoc::Markdown { .. })
+        matches!(
+            self,
+            PendingTitleDoc::Text {
+                kind: DocKind::Markdown,
+                ..
+            }
+        )
     }
 }
 
@@ -679,7 +857,8 @@ fn write_title_doc(
     report: &mut IndexReport,
 ) -> Result<()> {
     match item {
-        PendingTitleDoc::Markdown {
+        PendingTitleDoc::Text {
+            kind,
             path,
             source_root,
             content_hash,
@@ -699,8 +878,9 @@ fn write_title_doc(
                 heading_path: String::new(),
                 vector,
             });
-            let n = write_markdown_doc(
+            let n = write_text_doc(
                 args,
+                kind,
                 &path,
                 &source_root,
                 &content_hash,
@@ -777,6 +957,10 @@ mod tests {
     #[derive(Default)]
     struct FakeStore {
         written: Vec<String>,
+        /// (path, kind) per persisted document.
+        kinds: Vec<(String, String)>,
+        /// (path, heading_path) per persisted chunk.
+        chunk_headings: Vec<(String, String)>,
     }
 
     impl Store for FakeStore {
@@ -803,6 +987,11 @@ mod tests {
         }
         fn replace_document(&mut self, doc: &DocWrite<'_>) -> Result<()> {
             self.written.push(doc.path.to_string());
+            self.kinds.push((doc.path.to_string(), doc.kind.to_string()));
+            for chunk in doc.chunks {
+                self.chunk_headings
+                    .push((doc.path.to_string(), chunk.heading_path.clone()));
+            }
             Ok(())
         }
         fn delete_document(&self, _path: &str) -> Result<()> {
@@ -852,7 +1041,15 @@ mod tests {
         fn canonicalize(&self, path: &Path) -> Result<PathBuf> {
             Ok(path.to_path_buf())
         }
-        fn read(&self, _path: &Path) -> Result<Vec<u8>> {
+        fn read(&self, path: &Path) -> Result<Vec<u8>> {
+            let name = path.to_string_lossy();
+            if name.ends_with("bad.pdf") {
+                // Structurally not a PDF: extraction must fail.
+                return Ok(b"not a pdf".to_vec());
+            }
+            if name.ends_with(".pdf") {
+                return Ok(SAMPLE_PDF.to_vec());
+            }
             Ok(b"# Heading\n\nbody text".to_vec())
         }
         fn mtime(&self, _path: &Path) -> i64 {
@@ -1209,5 +1406,129 @@ mod tests {
             "titles from both markdown files and the image must embed in a single batched call"
         );
         assert_eq!(calls[0].len(), 3);
+    }
+
+    /// The same two-page fixture `gnosis-parse` uses; shared so both crates
+    /// exercise real PDF bytes rather than a mock.
+    const SAMPLE_PDF: &[u8] = include_bytes!("../../../tests/fixtures/sample.pdf");
+
+    fn mixed_kind_walker() -> FakeWalker {
+        FakeWalker {
+            files: vec![
+                (PathBuf::from("/vault/a.md"), DocKind::Markdown),
+                (PathBuf::from("/vault/paper.pdf"), DocKind::Pdf),
+                (PathBuf::from("/vault/b.md"), DocKind::Markdown),
+            ],
+        }
+    }
+
+    fn run_with(walker: &FakeWalker, store: &mut FakeStore, fail_fast: bool) -> Result<IndexReport> {
+        let fs_reader = FakeFileReader;
+        let mut text_embedder = FakeTextEmbedder;
+        let progress = progress::NoopProgress;
+        let mut args = IndexerArgs {
+            store,
+            walker,
+            fs_reader: &fs_reader,
+            embedders: EmbedderSet {
+                text: &mut text_embedder,
+                image: None,
+                image_text: None,
+            },
+            progress: &progress,
+        };
+        run(
+            &mut args,
+            &[PathBuf::from("/vault")],
+            &[],
+            &chunker::ChunkConfig::default(),
+            false,
+            fail_fast,
+            8,
+        )
+    }
+
+    #[test]
+    fn run_indexes_a_pdf_alongside_markdown() {
+        let mut store = FakeStore::default();
+        let walker = mixed_kind_walker();
+        let report = run_with(&walker, &mut store, false).expect("a valid PDF must index");
+
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.indexed, 3, "both markdown files and the PDF index");
+        assert!(report.errors.is_empty(), "got {:?}", report.errors);
+        assert!(
+            store.written.iter().any(|p| p.ends_with("paper.pdf")),
+            "the PDF must be persisted, got {:?}",
+            store.written
+        );
+    }
+
+    #[test]
+    fn run_records_a_pdf_as_kind_pdf() {
+        let mut store = FakeStore::default();
+        let walker = mixed_kind_walker();
+        run_with(&walker, &mut store, false).unwrap();
+        let kind = store
+            .kinds
+            .iter()
+            .find(|(path, _)| path.ends_with("paper.pdf"))
+            .map(|(_, kind)| kind.as_str());
+        assert_eq!(kind, Some("pdf"));
+    }
+
+    #[test]
+    fn run_chunks_a_pdf_by_page() {
+        let mut store = FakeStore::default();
+        let walker = mixed_kind_walker();
+        run_with(&walker, &mut store, false).unwrap();
+        let headings: Vec<&String> = store
+            .chunk_headings
+            .iter()
+            .filter(|(path, _)| path.ends_with("paper.pdf"))
+            .map(|(_, heading)| heading)
+            .collect();
+        assert!(
+            headings.iter().any(|h| h.as_str() == "Page 1"),
+            "expected a Page 1 chunk, got {headings:?}"
+        );
+        assert!(
+            headings.iter().any(|h| h.as_str() == "Page 2"),
+            "expected a Page 2 chunk, got {headings:?}"
+        );
+    }
+
+    /// A PDF that fails extraction must cost only itself, matching how a
+    /// corrupt image behaves — markdown has no such failure mode, so PDF
+    /// follows the image contract here, not markdown's.
+    #[test]
+    fn run_skips_an_unreadable_pdf_and_reports_it() {
+        let mut store = FakeStore::default();
+        let walker = FakeWalker {
+            files: vec![
+                (PathBuf::from("/vault/a.md"), DocKind::Markdown),
+                (PathBuf::from("/vault/bad.pdf"), DocKind::Pdf),
+                (PathBuf::from("/vault/b.md"), DocKind::Markdown),
+            ],
+        };
+        let report = run_with(&walker, &mut store, false)
+            .expect("an unreadable PDF must not abort the run by default");
+
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.indexed, 2, "both markdown files still index");
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].path.ends_with("bad.pdf"));
+    }
+
+    #[test]
+    fn run_fail_fast_propagates_an_unreadable_pdf() {
+        let mut store = FakeStore::default();
+        let walker = FakeWalker {
+            files: vec![(PathBuf::from("/vault/bad.pdf"), DocKind::Pdf)],
+        };
+        assert!(
+            run_with(&walker, &mut store, true).is_err(),
+            "fail_fast must propagate the PDF error instead of collecting it"
+        );
     }
 }
