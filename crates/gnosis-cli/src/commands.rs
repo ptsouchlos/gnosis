@@ -6,6 +6,7 @@ use embed::{EmbedConfig, Embedder};
 
 use crate::embedder::{build_clip_text_embedder, build_image_embedder, build_text_embedder};
 
+pub mod eval;
 pub mod forget;
 pub mod index;
 pub mod init;

@@ -4,6 +4,7 @@ mod config;
 mod embedder;
 mod fs;
 mod progress;
+mod qrels;
 mod store;
 mod walk;
 mod workspace;
@@ -33,6 +34,7 @@ fn main() -> Result<()> {
         Command::Init(_) => unreachable!("handled above"),
         Command::Index(args) => commands::index::execute(ws, args),
         Command::Search(args) => commands::search::execute(&ws, args),
+        Command::Eval(args) => commands::eval::execute(&ws, args),
         Command::Related(args) => commands::related::execute(&ws, args),
         Command::Forget(args) => commands::forget::execute(ws, args),
         Command::Status(args) => commands::status::execute(&ws, args),

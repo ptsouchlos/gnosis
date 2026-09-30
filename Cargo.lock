@@ -817,6 +817,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 
 [[package]]
+name = "eval"
+version = "0.1.0"
+
+[[package]]
 name = "exr"
 version = "1.74.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1077,6 +1081,7 @@ dependencies = [
  "clap",
  "dirs",
  "embed",
+ "eval",
  "fastembed",
  "fs",
  "ignore",
