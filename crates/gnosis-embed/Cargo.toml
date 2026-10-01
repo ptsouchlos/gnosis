@@ -7,3 +7,6 @@ description = "Embedder trait and embedding config shared across gnosis front-en
 [dependencies]
 anyhow = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+toml = "0.8"

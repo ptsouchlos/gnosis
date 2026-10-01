@@ -41,7 +41,7 @@ pub(crate) struct Embedders {
 /// Shared by `index`/`rebuild`, which both assemble the same trio into an
 /// `index::EmbedderSet` before running.
 pub(crate) fn build_embedders(config: &EmbedConfig) -> Result<Embedders> {
-    let text = build_text_embedder(&config.text.model)?;
+    let text = build_text_embedder(&config.text.model, config.text.batch_size)?;
     let (image, image_text) = if config.image.enabled {
         (
             Some(build_image_embedder(&config.image.model)?),

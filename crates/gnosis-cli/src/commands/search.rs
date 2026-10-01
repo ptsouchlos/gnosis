@@ -78,7 +78,7 @@ impl<'a> QueryEmbedders<'a> {
         let embedder = match space {
             Space::Text => {
                 if self.text.is_none() {
-                    self.text = Some(build_text_embedder(&self.ws.config.embed.text.model)?);
+                    self.text = Some(build_text_embedder(&self.ws.config.embed.text.model, self.ws.config.embed.text.batch_size)?);
                 }
                 self.text.as_mut().expect("just built")
             }
