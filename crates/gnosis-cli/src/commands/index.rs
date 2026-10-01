@@ -31,7 +31,7 @@ pub fn execute(mut ws: Workspace, args: IndexArgs) -> Result<()> {
     let progress = IndicatifProgress::new();
     let mut indexer_args = index::IndexerArgs {
         store: &mut store,
-        walker: &FsWalker,
+        walker: &FsWalker::new(ws.config.pdf.enabled),
         fs_reader: &StdFs,
         embedders: index::EmbedderSet {
             text: embedders.text.as_mut(),

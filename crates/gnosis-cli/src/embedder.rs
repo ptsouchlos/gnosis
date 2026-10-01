@@ -10,11 +10,14 @@ pub struct TextEmbedder {
     model: TextEmbedding,
     model_id: String,
     dim: usize,
+    /// Chunks per model call. Bounds ONNX activation memory, which scales with
+    /// batch size × sequence length; see `TextEmbedConfig::batch_size`.
+    batch_size: usize,
 }
 
 impl TextEmbedder {
     /// Construct from a config model name. Downloads/caches the model on first use.
-    pub fn new(model_name: &str) -> Result<Self> {
+    pub fn new(model_name: &str, batch_size: usize) -> Result<Self> {
         let (model, dim) = resolve_text_model(model_name)?;
         let mut opts = InitOptions::new(model);
         if let Some(dir) = model_cache_dir() {
@@ -26,14 +29,15 @@ impl TextEmbedder {
             model: embedding,
             model_id: model_name.to_string(),
             dim,
+            batch_size: batch_size.max(1),
         })
     }
 }
 
 /// Build the configured text embedder as a trait object, so callers (e.g. the
 /// `index` crate) stay agnostic to which concrete backend is in use.
-pub fn build_text_embedder(model_name: &str) -> Result<Box<dyn Embedder>> {
-    Ok(Box::new(TextEmbedder::new(model_name)?))
+pub fn build_text_embedder(model_name: &str, batch_size: usize) -> Result<Box<dyn Embedder>> {
+    Ok(Box::new(TextEmbedder::new(model_name, batch_size)?))
 }
 
 /// Stable per-user cache directory for downloaded models, so fastembed doesn't
@@ -60,7 +64,7 @@ impl Embedder for TextEmbedder {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
-        let vectors = self.model.embed(inputs, None)?;
+        let vectors = self.model.embed(inputs, Some(self.batch_size))?;
         Ok(vectors)
     }
 }
@@ -171,6 +175,10 @@ impl ClipTextEmbedder {
     }
 }
 
+/// Titles are short, so a larger batch is safe here than for body chunks —
+/// but still bounded, for the same reason.
+const CLIP_TEXT_BATCH_SIZE: usize = 32;
+
 pub fn build_clip_text_embedder(model_name: &str) -> Result<Box<dyn Embedder>> {
     Ok(Box::new(ClipTextEmbedder::new(model_name)?))
 }
@@ -192,7 +200,7 @@ impl Embedder for ClipTextEmbedder {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
-        let vectors = self.model.embed(inputs, None)?;
+        let vectors = self.model.embed(inputs, Some(CLIP_TEXT_BATCH_SIZE))?;
         Ok(vectors)
     }
 }
@@ -225,7 +233,7 @@ mod tests {
     #[test]
     #[ignore = "downloads model and runs inference"]
     fn embeds_text_sanely() {
-        let mut embedder = TextEmbedder::new("bge-small-en-v1.5").expect("load model");
+        let mut embedder = TextEmbedder::new("bge-small-en-v1.5", 16).expect("load model");
         assert_eq!(embedder.dim(), 384);
 
         let inputs = vec![

@@ -11,6 +11,7 @@ use anyhow::Result;
 pub enum DocKind {
     Markdown,
     Image,
+    Pdf,
 }
 
 impl DocKind {
@@ -18,6 +19,7 @@ impl DocKind {
         match self {
             DocKind::Markdown => "markdown",
             DocKind::Image => "image",
+            DocKind::Pdf => "pdf",
         }
     }
 
@@ -33,6 +35,10 @@ impl DocKind {
             {
                 Some(DocKind::Image)
             }
+            // Recognized unconditionally, like images: the `[pdf] enabled`
+            // flag is enforced a layer up in the CLI, not baked into path
+            // classification.
+            Some(ext) if ext.eq_ignore_ascii_case("pdf") => Some(DocKind::Pdf),
             _ => None,
         }
     }
@@ -56,6 +62,18 @@ pub trait Walker {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn classifies_pdf_extensions() {
+        assert_eq!(DocKind::from_path(Path::new("paper.pdf")), Some(DocKind::Pdf));
+        assert_eq!(DocKind::from_path(Path::new("PAPER.PDF")), Some(DocKind::Pdf));
+        assert_eq!(DocKind::from_path(Path::new("report.v2.pdf")), Some(DocKind::Pdf));
+    }
+
+    #[test]
+    fn pdf_kind_has_a_stable_name() {
+        assert_eq!(DocKind::Pdf.as_str(), "pdf");
+    }
 
     #[test]
     fn classifies_markdown_and_image_extensions() {
