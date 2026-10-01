@@ -25,8 +25,7 @@ pub struct ParsedPdf {
 /// with no searchable content. The indexing pipeline treats this as a
 /// per-file soft failure, so one such PDF costs only itself.
 pub fn parse_pdf(bytes: &[u8]) -> Result<ParsedPdf> {
-    let pages: Vec<String> = pdf_extract::extract_text_from_mem_by_pages(bytes)
-        .map_err(|e| anyhow::anyhow!("pdf text extraction failed: {e}"))?;
+    let pages: Vec<String> = extract_pages_without_panicking(bytes)?;
 
     let pages: Vec<(u32, String)> = pages
         .into_iter()
@@ -42,6 +41,61 @@ pub fn parse_pdf(bytes: &[u8]) -> Result<ParsedPdf> {
         title: metadata_title(bytes).unwrap_or_default(),
         pages,
     })
+}
+
+/// Run `pdf_extract`'s page extraction, turning a panic into an error.
+///
+/// `pdf_extract` indexes content-stream operands without checking their length
+/// in around fifty places, so a malformed operator — a `lineto` with no
+/// coordinates, say — panics instead of returning `Err`. Left uncaught that
+/// unwinds straight through the indexing pipeline's per-file error handling and
+/// aborts the whole run, so a single bad PDF anywhere in a vault would cost
+/// every other file. Containing it here keeps the "one bad file costs only
+/// itself" contract that the rest of the pipeline is built around.
+///
+/// Only panics raised inside `pdf_extract` are silenced; anything else still
+/// reaches the previous hook, so a genuine bug in gnosis is never hidden.
+fn extract_pages_without_panicking(bytes: &[u8]) -> Result<Vec<String>> {
+    install_quiet_pdf_panic_hook();
+
+    // `&[u8]` holds no interior mutability, so there is no broken invariant to
+    // observe after an unwind; the closure borrows it and returns owned data.
+    let extracted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pdf_extract::extract_text_from_mem_by_pages(bytes)
+    }));
+
+    match extracted {
+        Ok(Ok(pages)) => Ok(pages),
+        Ok(Err(e)) => bail!("pdf text extraction failed: {e}"),
+        Err(_) => bail!(
+            "pdf text extraction panicked (malformed content stream); \
+             the file was skipped"
+        ),
+    }
+}
+
+/// Install, once, a panic hook that stays quiet for panics originating inside
+/// `pdf_extract` and delegates everything else to the hook that was already in
+/// place.
+///
+/// Without this, every malformed PDF prints a `panicked at ...` backtrace
+/// notice to stderr mid-index, which reads like a crash even though the file is
+/// being skipped cleanly. Installed once rather than swapped around each call,
+/// so there is no window in which another thread's panic message is lost.
+fn install_quiet_pdf_panic_hook() {
+    use std::sync::Once;
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let from_pdf_extract = info
+                .location()
+                .is_some_and(|l| l.file().contains("pdf-extract"));
+            if !from_pdf_extract {
+                previous(info);
+            }
+        }));
+    });
 }
 
 /// The document's `Info` dictionary `Title`, if it has a non-empty one.

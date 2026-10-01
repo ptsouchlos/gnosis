@@ -359,6 +359,22 @@ mod obsidian_tests {
         assert_eq!(parsed.title, "Gnosis Sample Document");
     }
 
+    /// `pdf-extract` indexes content-stream operands without checking their
+    /// length in ~50 places, so a malformed operator *panics* rather than
+    /// returning an error. A panic would unwind past the indexing pipeline's
+    /// per-file error handling and abort the entire run, so one bad PDF in a
+    /// vault would cost every other file. The fixture is a structurally valid
+    /// PDF whose content stream holds a bare `l` (lineto) with no operands;
+    /// poppler reports a syntax error and recovers.
+    #[test]
+    fn parse_pdf_survives_a_malformed_content_stream() {
+        const MALFORMED: &[u8] = include_bytes!("../../../tests/fixtures/malformed-ops.pdf");
+        assert!(
+            parse_pdf(MALFORMED).is_err(),
+            "a malformed content stream must return Err, never panic"
+        );
+    }
+
     #[test]
     fn parse_pdf_rejects_bytes_that_are_not_a_pdf() {
         assert!(

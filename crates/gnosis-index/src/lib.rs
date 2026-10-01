@@ -1043,6 +1043,11 @@ mod tests {
         }
         fn read(&self, path: &Path) -> Result<Vec<u8>> {
             let name = path.to_string_lossy();
+            if name.ends_with("panic.pdf") {
+                // Structurally valid, but its content stream panics
+                // pdf-extract rather than returning an error.
+                return Ok(MALFORMED_PDF.to_vec());
+            }
             if name.ends_with("bad.pdf") {
                 // Structurally not a PDF: extraction must fail.
                 return Ok(b"not a pdf".to_vec());
@@ -1412,6 +1417,10 @@ mod tests {
     /// exercise real PDF bytes rather than a mock.
     const SAMPLE_PDF: &[u8] = include_bytes!("../../../tests/fixtures/sample.pdf");
 
+    /// A PDF whose malformed content stream panics `pdf-extract` instead of
+    /// returning an error.
+    const MALFORMED_PDF: &[u8] = include_bytes!("../../../tests/fixtures/malformed-ops.pdf");
+
     fn mixed_kind_walker() -> FakeWalker {
         FakeWalker {
             files: vec![
@@ -1530,5 +1539,42 @@ mod tests {
             run_with(&walker, &mut store, true).is_err(),
             "fail_fast must propagate the PDF error instead of collecting it"
         );
+    }
+
+    /// A PDF that *panics* the extractor must behave exactly like one that
+    /// returns an error: skipped, reported, run continues. An uncaught panic
+    /// would unwind through this loop and abort the whole index, so a single
+    /// bad file in a vault would cost every other file.
+    #[test]
+    fn run_survives_a_pdf_that_panics_the_extractor() {
+        let mut store = FakeStore::default();
+        let walker = FakeWalker {
+            files: vec![
+                (PathBuf::from("/vault/a.md"), DocKind::Markdown),
+                (PathBuf::from("/vault/panic.pdf"), DocKind::Pdf),
+                (PathBuf::from("/vault/b.md"), DocKind::Markdown),
+            ],
+        };
+        let report = run_with(&walker, &mut store, false)
+            .expect("a panicking PDF must not abort the run");
+
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.indexed, 2, "both markdown files still index");
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].path.ends_with("panic.pdf"));
+        assert!(
+            report.errors[0].message.contains("panicked"),
+            "the report should say the extractor panicked, got {:?}",
+            report.errors[0].message
+        );
+    }
+
+    #[test]
+    fn run_fail_fast_propagates_a_panicking_pdf() {
+        let mut store = FakeStore::default();
+        let walker = FakeWalker {
+            files: vec![(PathBuf::from("/vault/panic.pdf"), DocKind::Pdf)],
+        };
+        assert!(run_with(&walker, &mut store, true).is_err());
     }
 }
