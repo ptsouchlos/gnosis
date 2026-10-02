@@ -130,7 +130,8 @@ fn rank_by(
 pub fn fuse_hits(
     dense: Vec<Hit>,
     lexical: Vec<Hit>,
-    dense_weight: f32,
+    query_terms: &[String],
+    cfg: &bm25::SearchConfig,
     limit: usize,
 ) -> Vec<Hit> {
     let mut by_path: HashMap<String, (Hit, f32, f32)> = HashMap::new();
@@ -152,24 +153,48 @@ pub fn fuse_hits(
         }
     }
 
-    let mut fused: Vec<Hit> = by_path
+    let fused: Vec<Hit> = by_path
         .into_values()
         .map(|(mut hit, dense_score, lexical_score)| {
-            hit.score = bm25::fuse(dense_score, lexical_score, dense_weight);
+            hit.score = bm25::fuse(dense_score, lexical_score, cfg.dense_weight);
             hit
         })
         .collect();
 
+    boost_and_rank(fused, query_terms, cfg.title_boost, limit)
+}
+
+/// Apply the title bonus, order, and truncate.
+///
+/// Shared by the fused and the dense-only paths so the bonus behaves the same
+/// either way — it is independent of whether a lexical channel is running, and
+/// quietly doing nothing when lexical retrieval is off would be a trap.
+///
+/// The bonus is additive and applied *before* truncation, so a titled document
+/// can climb into the result set rather than only move within it. Applying it
+/// after `limit` would make it useless for exactly the navigational case it
+/// exists to serve.
+pub fn boost_and_rank(
+    mut hits: Vec<Hit>,
+    query_terms: &[String],
+    title_boost: f32,
+    limit: usize,
+) -> Vec<Hit> {
+    if title_boost != 0.0 {
+        for hit in &mut hits {
+            hit.score += title_boost * bm25::title_match(query_terms, &hit.title);
+        }
+    }
     // Ties broken by path so a given index always ranks the same way; an
     // arbitrary order would make evaluation runs irreproducible.
-    fused.sort_by(|a, b| {
+    hits.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.path.cmp(&b.path))
     });
-    fused.truncate(limit);
-    fused
+    hits.truncate(limit);
+    hits
 }
 
 pub fn merge_normalized(per_space: Vec<Vec<Hit>>, limit: usize) -> Vec<Hit> {
@@ -382,6 +407,16 @@ mod tests {
 
     // ---- fuse_hits -------------------------------------------------------
 
+    /// Fusion config with only the dense weight set — the title boost is
+    /// exercised by its own tests below.
+    fn fcfg(dense_weight: f32) -> bm25::SearchConfig {
+        bm25::SearchConfig {
+            dense_weight,
+            title_boost: 0.0,
+            ..bm25::SearchConfig::default()
+        }
+    }
+
     fn h(path: &str, score: f32) -> Hit {
         Hit {
             path: path.to_string(),
@@ -397,7 +432,7 @@ mod tests {
 
     #[test]
     fn fuse_hits_combines_both_channels_for_a_shared_document() {
-        let got = fuse_hits(vec![h("a.md", 1.0)], vec![h("a.md", 0.0)], 0.5, 10);
+        let got = fuse_hits(vec![h("a.md", 1.0)], vec![h("a.md", 0.0)], &[], &fcfg(0.5), 10);
         assert_eq!(got.len(), 1);
         assert!((got[0].score - 0.5).abs() < 1e-6, "got {}", got[0].score);
     }
@@ -406,14 +441,14 @@ mod tests {
     /// whole reason for a lexical channel.
     #[test]
     fn fuse_hits_keeps_a_document_only_the_lexical_channel_found() {
-        let got = fuse_hits(vec![h("dense.md", 0.9)], vec![h("lexonly.md", 1.0)], 0.5, 10);
+        let got = fuse_hits(vec![h("dense.md", 0.9)], vec![h("lexonly.md", 1.0)], &[], &fcfg(0.5), 10);
         let paths: Vec<&str> = got.iter().map(|x| x.path.as_str()).collect();
         assert!(paths.contains(&"lexonly.md"), "got {paths:?}");
     }
 
     #[test]
     fn fuse_hits_keeps_a_document_only_the_dense_channel_found() {
-        let got = fuse_hits(vec![h("denseonly.md", 1.0)], vec![], 0.5, 10);
+        let got = fuse_hits(vec![h("denseonly.md", 1.0)], vec![], &[], &fcfg(0.5), 10);
         assert_eq!(got.len(), 1);
         assert!((got[0].score - 0.5).abs() < 1e-6, "missing channel scores 0");
     }
@@ -422,7 +457,7 @@ mod tests {
     fn fuse_hits_at_weight_one_ranks_exactly_like_dense_alone() {
         let dense = vec![h("a.md", 0.9), h("b.md", 0.4)];
         let lexical = vec![h("b.md", 1.0), h("c.md", 1.0)];
-        let got = fuse_hits(dense, lexical, 1.0, 10);
+        let got = fuse_hits(dense, lexical, &[], &fcfg(1.0), 10);
         assert_eq!(got[0].path, "a.md");
         assert_eq!(got[0].score, 0.9);
         assert_eq!(got[1].path, "b.md");
@@ -432,7 +467,7 @@ mod tests {
 
     #[test]
     fn fuse_hits_at_weight_zero_ranks_by_lexical_alone() {
-        let got = fuse_hits(vec![h("a.md", 1.0)], vec![h("b.md", 0.8)], 0.0, 10);
+        let got = fuse_hits(vec![h("a.md", 1.0)], vec![h("b.md", 0.8)], &[], &fcfg(0.0), 10);
         assert_eq!(got[0].path, "b.md");
     }
 
@@ -442,7 +477,7 @@ mod tests {
         dense_hit.heading_path = "Design > Storage".to_string();
         let mut lexical_hit = h("a.md", 0.5);
         lexical_hit.heading_path = "somewhere else".to_string();
-        let got = fuse_hits(vec![dense_hit], vec![lexical_hit], 0.5, 10);
+        let got = fuse_hits(vec![dense_hit], vec![lexical_hit], &[], &fcfg(0.5), 10);
         assert_eq!(got[0].heading_path, "Design > Storage");
     }
 
@@ -451,7 +486,7 @@ mod tests {
         // Two chunks of one document in each channel.
         let dense = vec![h("a.md", 0.2), h("a.md", 0.9)];
         let lexical = vec![h("a.md", 0.1), h("a.md", 0.7)];
-        let got = fuse_hits(dense, lexical, 0.5, 10);
+        let got = fuse_hits(dense, lexical, &[], &fcfg(0.5), 10);
         assert_eq!(got.len(), 1, "a document must appear once");
         assert!((got[0].score - 0.8).abs() < 1e-6, "got {}", got[0].score);
     }
@@ -459,14 +494,14 @@ mod tests {
     #[test]
     fn fuse_hits_respects_the_limit() {
         let dense: Vec<Hit> = (0..10).map(|i| h(&format!("{i}.md"), 0.5)).collect();
-        assert_eq!(fuse_hits(dense, vec![], 0.5, 3).len(), 3);
+        assert_eq!(fuse_hits(dense, vec![], &[], &fcfg(0.5), 3).len(), 3);
     }
 
     #[test]
     fn fuse_hits_is_deterministic_for_tied_scores() {
         let dense = vec![h("b.md", 0.5), h("a.md", 0.5), h("c.md", 0.5)];
-        let first = fuse_hits(dense.clone(), vec![], 1.0, 10);
-        let second = fuse_hits(dense, vec![], 1.0, 10);
+        let first = fuse_hits(dense.clone(), vec![], &[], &fcfg(1.0), 10);
+        let second = fuse_hits(dense, vec![], &[], &fcfg(1.0), 10);
         let paths: Vec<&str> = first.iter().map(|x| x.path.as_str()).collect();
         assert_eq!(paths, vec!["a.md", "b.md", "c.md"], "ties break by path");
         assert_eq!(
@@ -478,6 +513,96 @@ mod tests {
 
     #[test]
     fn fusing_nothing_yields_nothing() {
-        assert!(fuse_hits(vec![], vec![], 0.5, 10).is_empty());
+        assert!(fuse_hits(vec![], vec![], &[], &fcfg(0.5), 10).is_empty());
+    }
+
+    // ---- title boost -----------------------------------------------------
+
+    fn tcfg(dense_weight: f32, title_boost: f32) -> bm25::SearchConfig {
+        bm25::SearchConfig {
+            dense_weight,
+            title_boost,
+            ..bm25::SearchConfig::default()
+        }
+    }
+
+    fn titled(path: &str, title: &str, score: f32) -> Hit {
+        let mut hit = h(path, score);
+        hit.title = title.to_string();
+        hit
+    }
+
+    #[test]
+    fn a_title_boost_of_zero_changes_nothing() {
+        let hits = vec![titled("a.md", "HNSW", 0.5), titled("b.md", "Cake", 0.6)];
+        let got = fuse_hits(hits, vec![], &bm25::tokenize("hnsw"), &tcfg(1.0, 0.0), 10);
+        assert_eq!(got[0].path, "b.md", "without a boost the stronger score wins");
+    }
+
+    #[test]
+    fn a_title_match_can_overtake_a_slightly_better_body_match() {
+        let hits = vec![titled("a.md", "HNSW", 0.5), titled("b.md", "Cake", 0.6)];
+        let got = fuse_hits(hits, vec![], &bm25::tokenize("hnsw"), &tcfg(1.0, 0.2), 10);
+        assert_eq!(got[0].path, "a.md", "the titled note should now lead");
+    }
+
+    /// Bounded, so a title match nudges near-ties rather than overriding a
+    /// substantially better match.
+    #[test]
+    fn a_title_match_cannot_overtake_a_far_better_body_match() {
+        let hits = vec![titled("a.md", "HNSW", 0.2), titled("b.md", "Cake", 0.95)];
+        let got = fuse_hits(hits, vec![], &bm25::tokenize("hnsw"), &tcfg(1.0, 0.2), 10);
+        assert_eq!(got[0].path, "b.md", "a 0.2 bonus must not close a 0.75 gap");
+    }
+
+    #[test]
+    fn a_partial_title_match_gets_a_proportional_share_of_the_boost() {
+        let full = fuse_hits(
+            vec![titled("a.md", "hnsw graph", 0.5)],
+            vec![],
+            &bm25::tokenize("hnsw graph"),
+            &tcfg(1.0, 0.4),
+            10,
+        );
+        let half = fuse_hits(
+            vec![titled("a.md", "hnsw cake", 0.5)],
+            vec![],
+            &bm25::tokenize("hnsw graph"),
+            &tcfg(1.0, 0.4),
+            10,
+        );
+        assert!((full[0].score - 0.9).abs() < 1e-6, "got {}", full[0].score);
+        assert!((half[0].score - 0.7).abs() < 1e-6, "got {}", half[0].score);
+    }
+
+    /// The boost is applied before truncation, so a titled document can enter
+    /// the result set rather than only move within it. Applying it after
+    /// `limit` would silently make the boost useless for exactly the
+    /// navigational case it exists to serve.
+    #[test]
+    fn a_title_boost_can_lift_a_document_into_the_result_set() {
+        let mut hits: Vec<Hit> = (0..5).map(|i| titled(&format!("{i}.md"), "unrelated", 0.6)).collect();
+        hits.push(titled("target.md", "HNSW", 0.45));
+        let got = fuse_hits(hits, vec![], &bm25::tokenize("hnsw"), &tcfg(1.0, 0.3), 2);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].path, "target.md", "a boosted document must be able to enter the top-k");
+    }
+
+    #[test]
+    fn a_title_boost_applies_to_a_lexical_only_hit_too() {
+        let got = fuse_hits(
+            vec![],
+            vec![titled("a.md", "HNSW", 0.5)],
+            &bm25::tokenize("hnsw"),
+            &tcfg(0.0, 0.2),
+            10,
+        );
+        assert!((got[0].score - 0.7).abs() < 1e-6, "got {}", got[0].score);
+    }
+
+    #[test]
+    fn an_empty_query_gets_no_title_boost() {
+        let got = fuse_hits(vec![titled("a.md", "HNSW", 0.5)], vec![], &[], &tcfg(1.0, 0.5), 10);
+        assert!((got[0].score - 0.5).abs() < 1e-6);
     }
 }

@@ -126,8 +126,17 @@ pub(crate) fn run_query(
 
         // Lexical matching applies to the text space only: image chunks carry
         // no text, and title proxies exist for `related` to traverse.
-        if cfg.lexical && space == Space::Text {
-            per_space.push(fuse_text_space(store, query, dense, limit, filter, cfg)?);
+        if space == Space::Text {
+            // The title bonus is independent of the lexical channel, so it is
+            // applied either way — `fuse_text_space` does it as part of fusing,
+            // and the dense-only path does it here.
+            let ranked = if cfg.lexical {
+                fuse_text_space(store, query, dense, limit, filter, cfg)?
+            } else {
+                let terms = search::bm25::tokenize(query);
+                search::boost_and_rank(dense, &terms, cfg.title_boost, limit)
+            };
+            per_space.push(ranked);
         } else {
             per_space.push(dense);
         }
@@ -187,7 +196,7 @@ fn fuse_text_space(
         })
         .collect();
 
-    Ok(search::fuse_hits(dense, lexical, cfg.dense_weight, limit))
+    Ok(search::fuse_hits(dense, lexical, &terms, cfg, limit))
 }
 
 pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {

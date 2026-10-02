@@ -58,6 +58,12 @@ pub struct SearchConfig {
     /// 0.0 lexical-only.
     pub dense_weight: f32,
     pub bm25: Bm25Params,
+    /// Bounded additive bonus for a document whose *title* carries the query's
+    /// terms, scaled by how much of the query the title covers.
+    ///
+    /// A note titled for a topic is usually what someone looking for that topic
+    /// wants, rather than one of many notes mentioning it in passing.
+    pub title_boost: f32,
 }
 
 impl Default for SearchConfig {
@@ -72,6 +78,8 @@ impl Default for SearchConfig {
             // that never regresses. See docs/gnosis/hybrid-lexical-fusion.md.
             dense_weight: 0.9,
             bm25: Bm25Params::default(),
+            // Set from measurement; see docs/gnosis/ranking-signals.md.
+            title_boost: 0.0,
         }
     }
 }
@@ -133,6 +141,30 @@ pub fn term_freqs(text: &str, terms: &[String]) -> Vec<u32> {
         }
     }
     counts
+}
+
+/// Share of the query's terms that appear in `title`, in `0.0..=1.0`.
+///
+/// A document whose *title* carries the query's words usually is the thing
+/// being looked for, rather than a document that merely mentions them — the
+/// note named "HNSW" versus twenty notes discussing it in passing.
+///
+/// Proportional rather than an all-or-nothing test for the title containing
+/// the whole query. Full containment still scores 1.0 and so still gets the
+/// largest boost, but a partial match is not discarded, which matters because
+/// exact title matches are rare outside genuinely navigational queries. Terms
+/// are compared after `tokenize`, so the match is case- and
+/// punctuation-insensitive.
+pub fn title_match(query_terms: &[String], title: &str) -> f32 {
+    if query_terms.is_empty() {
+        return 0.0;
+    }
+    let title_terms: std::collections::HashSet<String> = tokenize(title).into_iter().collect();
+    let matched = query_terms
+        .iter()
+        .filter(|t| title_terms.contains(*t))
+        .count();
+    matched as f32 / query_terms.len() as f32
 }
 
 /// Inverse document frequency, in the form Lv & Zhai use for BM25+.
@@ -532,5 +564,60 @@ mod tests {
         let text = "Vector search, vector indexes; VECTOR!";
         let terms = tokenize("vector");
         assert_eq!(term_freqs(text, &terms), vec![3]);
+    }
+
+    // ---- title_match -----------------------------------------------------
+
+    fn terms_of(q: &str) -> Vec<String> {
+        tokenize(q)
+    }
+
+    #[test]
+    fn a_title_containing_the_whole_query_scores_one() {
+        assert_eq!(title_match(&terms_of("hnsw graph"), "HNSW graph construction"), 1.0);
+    }
+
+    #[test]
+    fn a_title_containing_none_of_the_query_scores_zero() {
+        assert_eq!(title_match(&terms_of("hnsw graph"), "Chocolate cake recipe"), 0.0);
+    }
+
+    #[test]
+    fn a_partial_title_match_scores_proportionally() {
+        // One of two terms present.
+        assert!((title_match(&terms_of("hnsw cake"), "HNSW graph") - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn title_match_is_case_and_punctuation_insensitive() {
+        assert_eq!(title_match(&terms_of("hnsw"), "HNSW!"), 1.0);
+        assert_eq!(title_match(&terms_of("graph construction"), "Graph-Construction"), 1.0);
+    }
+
+    #[test]
+    fn title_match_counts_each_query_term_once() {
+        // A title repeating a term must not score above 1.0.
+        assert_eq!(title_match(&terms_of("graph"), "graph graph graph"), 1.0);
+    }
+
+    #[test]
+    fn title_match_of_an_empty_query_is_zero() {
+        assert_eq!(title_match(&[], "anything"), 0.0);
+    }
+
+    #[test]
+    fn title_match_of_an_empty_title_is_zero() {
+        assert_eq!(title_match(&terms_of("hnsw"), ""), 0.0);
+    }
+
+    /// The failure mode worth watching: a short common query matching many
+    /// titles boosts them all equally, which flattens rather than orders. The
+    /// scoring cannot prevent that on its own — it is why the boost is bounded
+    /// and additive rather than dominant.
+    #[test]
+    fn a_common_single_term_query_boosts_every_matching_title_equally() {
+        let q = terms_of("notes");
+        assert_eq!(title_match(&q, "Meeting notes"), 1.0);
+        assert_eq!(title_match(&q, "Reading notes"), 1.0);
     }
 }
