@@ -18,6 +18,12 @@ use usearch::{Index, IndexOptions, Key, MetricKind, ScalarKind};
 /// Bumped whenever the schema changes in a backward-incompatible way.
 pub const SCHEMA_VERSION: i64 = 1;
 
+/// Bumped whenever the lexical index's contents would differ — a changed
+/// tokenizer, or a change to which chunks are indexed — to force a rebuild on
+/// next open.
+const LEXICAL_INDEX_VERSION: i64 = 1;
+const LEXICAL_INDEX_VERSION_KEY: &str = "lexical_index_version";
+
 /// Name of the directory (sibling to the database file) holding one on-disk
 /// ANN index file per `(space, modality)` pair.
 const INDEX_DIR_NAME: &str = "index";
@@ -181,7 +187,7 @@ impl SqliteStore {
             "#,
         )?;
 
-        self.backfill_lexical_index()?;
+        self.ensure_lexical_index()?;
 
         self.ensure_column("documents", "width", "width INTEGER")?;
         self.ensure_column("documents", "height", "height INTEGER")?;
@@ -225,38 +231,36 @@ impl SqliteStore {
         Ok(paths)
     }
 
-    /// Populate the full-text index for a database indexed before it existed.
+    /// Build the full-text index when it is missing or was built by an older
+    /// scheme.
     ///
-    /// The sync triggers only fire on new writes, so an index built by an
-    /// earlier version would otherwise have an empty lexical channel — and
-    /// silently, since a query would simply match nothing. Backfilling here
-    /// means the channel starts working on the next search rather than
-    /// requiring a full reindex.
+    /// The sync triggers only fire on new writes, so a database indexed before
+    /// this index existed would otherwise have a silently dead lexical channel:
+    /// every query simply matches nothing, with no error to notice.
     ///
-    /// Deliberately an explicit filtered `INSERT ... SELECT` rather than FTS5's
-    /// own `'rebuild'` command: `rebuild` reads every row of the content table,
-    /// which would pull in image chunks and title proxies that the triggers
-    /// exclude, and a title proxy in the lexical index would make filenames
-    /// match as prose.
-    fn backfill_lexical_index(&self) -> Result<()> {
-        let indexed: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))?;
-        if indexed > 0 {
-            return Ok(());
-        }
-        let pending: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM chunks WHERE space = 'text' AND text IS NOT NULL",
-            [],
-            |r| r.get(0),
-        )?;
-        if pending == 0 {
+    /// Gated on a `meta` marker rather than on whether the index looks empty.
+    /// There is no cheap, honest emptiness test for an external-content FTS5
+    /// table — `COUNT(*) FROM chunks_fts` reports rows in the *content* table,
+    /// so it is non-zero even when the index holds nothing, which is exactly
+    /// the trap an earlier version of this function fell into. A version marker
+    /// also means a future change to the tokenizer or the filter below can force
+    /// a rebuild by bumping the constant.
+    ///
+    /// The repopulation is a filtered `INSERT ... SELECT`, not FTS5's own
+    /// `'rebuild'`: `rebuild` reads every row of the content table, which would
+    /// pull in the image chunks and title proxies the triggers exclude, and a
+    /// title proxy in the lexical index would make filenames match as prose.
+    fn ensure_lexical_index(&self) -> Result<()> {
+        let current = LEXICAL_INDEX_VERSION.to_string();
+        if self.get_meta(LEXICAL_INDEX_VERSION_KEY)?.as_deref() == Some(current.as_str()) {
             return Ok(());
         }
         self.conn.execute_batch(
-            "INSERT INTO chunks_fts(rowid, text)
-             SELECT id, text FROM chunks WHERE space = 'text' AND text IS NOT NULL",
+            "INSERT INTO chunks_fts(chunks_fts) VALUES('delete-all');
+             INSERT INTO chunks_fts(rowid, text)
+             SELECT id, text FROM chunks WHERE space = 'text' AND text IS NOT NULL;",
         )?;
+        self.set_meta(LEXICAL_INDEX_VERSION_KEY, &current)?;
         Ok(())
     }
 
@@ -1479,6 +1483,43 @@ mod tests {
 
         store.delete_document("/vault/a.md").unwrap();
         assert!(lex(&store, "deletabletext").candidates.is_empty());
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// A database indexed before the full-text index existed must get one built
+    /// on open. The sync triggers only fire on new writes, so without this the
+    /// lexical channel is silently dead — every query simply matches nothing.
+    ///
+    /// Asserted through search results, never through `COUNT(*) FROM
+    /// chunks_fts`: this is an external-content table, so that count reports
+    /// rows in `chunks` rather than index entries and is non-zero even when the
+    /// index is completely empty.
+    #[test]
+    fn opening_a_store_builds_a_missing_lexical_index() {
+        let (mut store, path) = temp_store();
+        write_text_doc_with(&mut store, "/vault/a.md", &["cholesterol and statins"]);
+        assert_eq!(lex(&store, "cholesterol").candidates.len(), 1);
+
+        // Simulate a pre-FTS database: wipe the index and the marker that says
+        // it was built, leaving the chunks in place.
+        store
+            .conn
+            .execute_batch("INSERT INTO chunks_fts(chunks_fts) VALUES('delete-all');")
+            .unwrap();
+        store.set_meta("lexical_index_version", "0").unwrap();
+        assert!(
+            lex(&store, "cholesterol").candidates.is_empty(),
+            "precondition: the index should now be empty"
+        );
+        drop(store);
+
+        let reopened = SqliteStore::open(&path.join("gnosis.db")).unwrap();
+        assert_eq!(
+            lex(&reopened, "cholesterol").candidates.len(),
+            1,
+            "reopening must rebuild the missing lexical index"
+        );
 
         let _ = std::fs::remove_dir_all(&path);
     }
