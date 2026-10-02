@@ -78,8 +78,14 @@ impl Default for SearchConfig {
             // that never regresses. See docs/gnosis/hybrid-lexical-fusion.md.
             dense_weight: 0.9,
             bm25: Bm25Params::default(),
-            // Set from measurement; see docs/gnosis/ranking-signals.md.
-            title_boost: 0.0,
+            // Measured, and the measurement is shape-dependent. On known-item
+            // lookups — searching for a note by its name, the query a notes
+            // tool exists to answer — 0.1 lifts nDCG@10 from 0.38 to 0.50
+            // against a ceiling of 0.57, i.e. from 66% to 87% of what is
+            // achievable. On topical benchmark queries it costs about 0.006.
+            // That asymmetry is roughly twentyfold in favour of enabling it,
+            // so it is on by default and small.
+            title_boost: 0.1,
         }
     }
 }
