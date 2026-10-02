@@ -21,7 +21,7 @@ pub const SCHEMA_VERSION: i64 = 1;
 /// Bumped whenever the lexical index's contents would differ — a changed
 /// tokenizer, or a change to which chunks are indexed — to force a rebuild on
 /// next open.
-const LEXICAL_INDEX_VERSION: i64 = 1;
+const LEXICAL_INDEX_VERSION: i64 = 2;
 const LEXICAL_INDEX_VERSION_KEY: &str = "lexical_index_version";
 
 /// Name of the directory (sibling to the database file) holding one on-disk
@@ -146,6 +146,7 @@ impl SqliteStore {
             -- `chunks`, so the text is not duplicated. Sync is therefore the
             -- triggers' job, not FTS5's.
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                heading_path,
                 text,
                 content='chunks',
                 content_rowid='id',
@@ -157,13 +158,14 @@ impl SqliteStore {
             -- than to be matched lexically.
             CREATE TRIGGER IF NOT EXISTS chunks_fts_insert AFTER INSERT ON chunks
             WHEN new.space = 'text' AND new.text IS NOT NULL BEGIN
-                INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text);
+                INSERT INTO chunks_fts(rowid, heading_path, text)
+                VALUES (new.id, new.heading_path, new.text);
             END;
 
             CREATE TRIGGER IF NOT EXISTS chunks_fts_delete AFTER DELETE ON chunks
             WHEN old.space = 'text' AND old.text IS NOT NULL BEGIN
-                INSERT INTO chunks_fts(chunks_fts, rowid, text)
-                VALUES ('delete', old.id, old.text);
+                INSERT INTO chunks_fts(chunks_fts, rowid, heading_path, text)
+                VALUES ('delete', old.id, old.heading_path, old.text);
             END;
 
 
@@ -257,14 +259,18 @@ impl SqliteStore {
         }
         self.conn.execute_batch(
             "INSERT INTO chunks_fts(chunks_fts) VALUES('delete-all');
-             INSERT INTO chunks_fts(rowid, text)
-             SELECT id, text FROM chunks WHERE space = 'text' AND text IS NOT NULL;",
+             INSERT INTO chunks_fts(rowid, heading_path, text)
+             SELECT id, heading_path, text FROM chunks
+             WHERE space = 'text' AND text IS NOT NULL;",
         )?;
         self.set_meta(LEXICAL_INDEX_VERSION_KEY, &current)?;
         Ok(())
     }
 
     /// Corpus statistics for the lexical channel.
+    ///
+    /// Length covers the heading plus the text, matching what is indexed and
+    /// what term frequencies are counted over.
     ///
     /// Length is measured in **characters**, not tokens, for both the per-chunk
     /// length and the average. BM25's length normalization uses the ratio
@@ -273,8 +279,8 @@ impl SqliteStore {
     /// whole corpus at query time or storing a second length column.
     fn lexical_corpus_stats(&self) -> Result<search::bm25::CorpusStats> {
         let (count, avg): (i64, Option<f64>) = self.conn.query_row(
-            "SELECT COUNT(*), AVG(LENGTH(text)) FROM chunks
-             WHERE space = 'text' AND text IS NOT NULL",
+            "SELECT COUNT(*), AVG(LENGTH(COALESCE(heading_path, '') || ' ' || text))
+             FROM chunks WHERE space = 'text' AND text IS NOT NULL",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
@@ -1386,9 +1392,12 @@ mod tests {
 
         let got = lex(&store, "aaaa");
         assert_eq!(got.stats.total_chunks, 2, "only the two text chunks count");
+        // Length covers heading plus a separator plus text, matching what is
+        // indexed and what term frequencies are counted over. These chunks have
+        // empty headings, so each is 0 + 1 + len(text): 5 and 3, averaging 4.
         assert!(
-            (got.stats.avg_chunk_len - 3.0).abs() < 1e-6,
-            "avg of 4 and 2 characters should be 3, got {}",
+            (got.stats.avg_chunk_len - 4.0).abs() < 1e-6,
+            "expected 4, got {}",
             got.stats.avg_chunk_len
         );
 
@@ -1520,6 +1529,51 @@ mod tests {
             1,
             "reopening must rebuild the missing lexical index"
         );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// A term that appears only in a chunk's heading must still be findable.
+    ///
+    /// The dense channel already sees headings — they are prefixed to the text
+    /// before embedding — so a lexical channel that ignores them is
+    /// inconsistent, and badly so for the queries a lexical channel exists to
+    /// serve: looking up a note by the words in its own title.
+    #[test]
+    fn a_term_only_in_the_heading_is_lexically_findable() {
+        let (mut store, path) = temp_store();
+        store
+            .replace_document(&DocWrite {
+                path: "/vault/a.md",
+                kind: "markdown",
+                source_root: "/vault",
+                content_hash: b"h",
+                mtime: 0,
+                title: "Recalcitrant hypertension",
+                frontmatter: None,
+                indexed_at: 0,
+                chunks: &[ChunkWrite {
+                    ord: 0,
+                    space: "text".to_string(),
+                    modality: "text".to_string(),
+                    text: Some("Body prose that never repeats the heading's words.".to_string()),
+                    heading_path: "Recalcitrant hypertension".to_string(),
+                    vector: vec![1.0, 0.0],
+                }],
+                links: &[],
+                tags: &[],
+                width: None,
+                height: None,
+            })
+            .unwrap();
+
+        let got = lex(&store, "recalcitrant");
+        assert_eq!(
+            got.candidates.len(),
+            1,
+            "a heading-only term must match its own chunk"
+        );
+        assert_eq!(got.doc_freqs, vec![1], "and must count toward document frequency");
 
         let _ = std::fs::remove_dir_all(&path);
     }

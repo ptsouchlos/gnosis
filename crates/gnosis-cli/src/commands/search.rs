@@ -177,10 +177,15 @@ fn fuse_text_space(
         .candidates
         .into_iter()
         .map(|c| {
+            // Score over heading plus body, matching what the index contains
+            // and how the corpus average length is measured. A term appearing
+            // only in a chunk's heading is exactly the lookup-by-note-name
+            // case a lexical channel exists for.
+            let scored_text = format!("{} {}", c.heading_path, c.text);
             let m = search::bm25::LexicalMatch {
                 // Characters, matching how the corpus average is measured.
-                chunk_len: c.text.chars().count() as u32,
-                term_freqs: search::bm25::term_freqs(&c.text, &terms),
+                chunk_len: scored_text.chars().count() as u32,
+                term_freqs: search::bm25::term_freqs(&scored_text, &terms),
             };
             let raw = search::bm25::score(&m, &query_terms, matches.stats, cfg.bm25);
             search::Hit {
