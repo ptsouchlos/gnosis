@@ -997,6 +997,22 @@ mod tests {
         fn delete_document(&self, _path: &str) -> Result<()> {
             Ok(())
         }
+        fn lexical_candidates(
+            &self,
+            terms: &[String],
+            _: usize,
+            _: &TextQuery,
+        ) -> Result<store::LexicalMatches> {
+            // Indexing never queries; a shape-correct empty result is enough.
+            Ok(store::LexicalMatches {
+                stats: search::bm25::CorpusStats {
+                    total_chunks: 0,
+                    avg_chunk_len: 0.0,
+                },
+                doc_freqs: vec![0; terms.len()],
+                candidates: Vec::new(),
+            })
+        }
         fn search_space(&self, _: Space, _: &[f32], _: usize, _: &TextQuery) -> Result<Vec<search::Hit>> {
             Ok(Vec::new())
         }

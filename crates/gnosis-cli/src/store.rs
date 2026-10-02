@@ -134,6 +134,33 @@ impl SqliteStore {
             CREATE INDEX IF NOT EXISTS idx_chunks_doc   ON chunks(doc_id);
             CREATE INDEX IF NOT EXISTS idx_chunks_space ON chunks(space);
 
+            -- Full-text index over text-space chunks, for the lexical channel.
+            -- `content='chunks'` makes this an external-content index: FTS5
+            -- stores only the inverted index and reads the text back from
+            -- `chunks`, so the text is not duplicated. Sync is therefore the
+            -- triggers' job, not FTS5's.
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                text,
+                content='chunks',
+                content_rowid='id',
+                tokenize='unicode61'
+            );
+
+            -- Only text-space chunks with text are indexed: image chunks carry
+            -- no text, and title proxies exist for `related` to traverse rather
+            -- than to be matched lexically.
+            CREATE TRIGGER IF NOT EXISTS chunks_fts_insert AFTER INSERT ON chunks
+            WHEN new.space = 'text' AND new.text IS NOT NULL BEGIN
+                INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS chunks_fts_delete AFTER DELETE ON chunks
+            WHEN old.space = 'text' AND old.text IS NOT NULL BEGIN
+                INSERT INTO chunks_fts(chunks_fts, rowid, text)
+                VALUES ('delete', old.id, old.text);
+            END;
+
+
             CREATE TABLE IF NOT EXISTS links (
                 src_doc  INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
                 dst_path TEXT NOT NULL
@@ -194,6 +221,38 @@ impl SqliteStore {
             .query_map(rusqlite::params_from_iter(tags), |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<HashSet<_>>>()?;
         Ok(paths)
+    }
+
+    /// Corpus statistics for the lexical channel.
+    ///
+    /// Length is measured in **characters**, not tokens, for both the per-chunk
+    /// length and the average. BM25's length normalization uses the ratio
+    /// `dl / avgdl`, so any consistent unit works, and characters come straight
+    /// from SQL (`LENGTH` over TEXT counts characters) without tokenizing the
+    /// whole corpus at query time or storing a second length column.
+    fn lexical_corpus_stats(&self) -> Result<search::bm25::CorpusStats> {
+        let (count, avg): (i64, Option<f64>) = self.conn.query_row(
+            "SELECT COUNT(*), AVG(LENGTH(text)) FROM chunks
+             WHERE space = 'text' AND text IS NOT NULL",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(search::bm25::CorpusStats {
+            total_chunks: count.max(0) as u64,
+            avg_chunk_len: avg.unwrap_or(0.0) as f32,
+        })
+    }
+
+    /// How many text chunks contain `term`.
+    fn term_doc_freq(&self, term: &str) -> Result<u64> {
+        // Quoted so FTS5 reads it as a bare term rather than as syntax.
+        let expr = format!("\"{}\"", term.replace('"', ""));
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH ?1",
+            [expr],
+            |r| r.get(0),
+        )?;
+        Ok(count.max(0) as u64)
     }
 
     /// Every chunk in `space` as a scoring candidate, scoped per `filter`.
@@ -601,6 +660,79 @@ impl Store for SqliteStore {
         self.conn
             .execute("DELETE FROM documents WHERE path = ?1", [path])?;
         Ok(())
+    }
+
+    fn lexical_candidates(
+        &self,
+        terms: &[String],
+        limit: usize,
+        filter: &TextQuery,
+    ) -> Result<store::LexicalMatches> {
+        let stats = self.lexical_corpus_stats()?;
+        if terms.is_empty() || stats.total_chunks == 0 {
+            return Ok(store::LexicalMatches {
+                stats,
+                doc_freqs: vec![0; terms.len()],
+                candidates: Vec::new(),
+            });
+        }
+
+        let doc_freqs = terms
+            .iter()
+            .map(|t| self.term_doc_freq(t))
+            .collect::<Result<Vec<u64>>>()?;
+
+        // Any term matching is enough to be a candidate; how many and how
+        // often is what BM25+ then weighs.
+        let match_expr = terms
+            .iter()
+            .map(|t| format!("\"{}\"", t.replace('"', "")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+
+        let mut sql = String::from(
+            "SELECT d.path, d.title, d.source_root, c.heading_path, c.text, c.vector,
+                    d.width, d.height, c.modality
+             FROM chunks_fts f
+             JOIN chunks c ON c.id = f.rowid
+             JOIN documents d ON d.id = c.doc_id
+             WHERE chunks_fts MATCH ?",
+        );
+        let roots = filter.from.filter(|f| !f.is_empty());
+        if let Some(roots) = roots {
+            sql.push_str(&format!(
+                " AND d.source_root IN ({})",
+                in_placeholders(roots.len())
+            ));
+        }
+        let tags = filter.tags.filter(|t| !t.is_empty());
+        if let Some(tags) = tags {
+            sql.push_str(&format!(
+                " AND d.id IN (SELECT doc_id FROM tags WHERE tag IN ({}))",
+                in_placeholders(tags.len())
+            ));
+        }
+        // FTS5's own bm25() only orders the candidate set here; BM25+ does the
+        // real scoring. Ordering by it means a truncated set keeps the most
+        // promising rows rather than an arbitrary slice.
+        sql.push_str(" ORDER BY bm25(chunks_fts) LIMIT ?");
+
+        let mut params: Vec<String> = vec![match_expr];
+        params.extend(roots.into_iter().flatten().cloned());
+        params.extend(tags.into_iter().flatten().cloned());
+        params.push(limit.to_string());
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let map_row = space_candidate_row_mapper();
+        let candidates: Vec<Candidate> = stmt
+            .query_map(rusqlite::params_from_iter(params), map_row)?
+            .collect::<rusqlite::Result<_>>()?;
+
+        Ok(store::LexicalMatches {
+            stats,
+            doc_freqs,
+            candidates,
+        })
     }
 
     fn search_space(&self, space: Space, query: &[f32], limit: usize, filter: &TextQuery) -> Result<Vec<Hit>> {
@@ -1131,6 +1263,247 @@ mod tests {
             "expected one index file per (space, modality) pair"
         );
 
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    // ---- lexical channel -------------------------------------------------
+
+    fn write_text_doc_with(store: &mut SqliteStore, path: &str, texts: &[&str]) {
+        let chunks: Vec<ChunkWrite> = texts
+            .iter()
+            .map(|t| chunk("text", "text", Some(t), vec![1.0, 0.0]))
+            .collect();
+        write_full_doc(store, path, "markdown", &chunks, None, None);
+    }
+
+    fn lex(store: &SqliteStore, query: &str) -> store::LexicalMatches {
+        let terms = search::bm25::tokenize(query);
+        store
+            .lexical_candidates(&terms, 50, &TextQuery::default())
+            .unwrap()
+    }
+
+    #[test]
+    fn lexical_candidates_finds_a_matching_chunk() {
+        let (mut store, path) = temp_store();
+        write_text_doc_with(&mut store, "/vault/a.md", &["hnsw graph construction"]);
+        write_text_doc_with(&mut store, "/vault/b.md", &["a recipe for chocolate cake"]);
+
+        let got = lex(&store, "hnsw");
+        assert_eq!(got.candidates.len(), 1);
+        assert_eq!(got.candidates[0].path, "/vault/a.md");
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn lexical_candidates_matches_any_term_not_all() {
+        let (mut store, path) = temp_store();
+        write_text_doc_with(&mut store, "/vault/a.md", &["hnsw graph"]);
+        write_text_doc_with(&mut store, "/vault/b.md", &["chocolate cake"]);
+
+        let got = lex(&store, "hnsw chocolate");
+        let mut paths: Vec<&str> = got.candidates.iter().map(|c| c.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["/vault/a.md", "/vault/b.md"]);
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn lexical_candidates_reports_document_frequency_per_term() {
+        let (mut store, path) = temp_store();
+        write_text_doc_with(&mut store, "/vault/a.md", &["vector search"]);
+        write_text_doc_with(&mut store, "/vault/b.md", &["vector indexes"]);
+        write_text_doc_with(&mut store, "/vault/c.md", &["unrelated prose"]);
+
+        let terms = search::bm25::tokenize("vector missingterm");
+        let got = store
+            .lexical_candidates(&terms, 50, &TextQuery::default())
+            .unwrap();
+        assert_eq!(got.doc_freqs, vec![2, 0], "df must align with the terms given");
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn lexical_corpus_stats_count_only_text_chunks() {
+        let (mut store, path) = temp_store();
+        write_text_doc_with(&mut store, "/vault/a.md", &["aaaa", "bb"]);
+        // An image chunk (no text) and a title proxy must not be counted.
+        write_full_doc(
+            &mut store,
+            "/vault/photo.png",
+            "image",
+            &[
+                chunk("image", "image", None, vec![1.0, 0.0]),
+                chunk("image", "text_title", Some("photo"), vec![1.0, 0.0]),
+            ],
+            Some(1),
+            Some(1),
+        );
+
+        let got = lex(&store, "aaaa");
+        assert_eq!(got.stats.total_chunks, 2, "only the two text chunks count");
+        assert!(
+            (got.stats.avg_chunk_len - 3.0).abs() < 1e-6,
+            "avg of 4 and 2 characters should be 3, got {}",
+            got.stats.avg_chunk_len
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn image_and_title_chunks_are_not_lexically_searchable() {
+        let (mut store, path) = temp_store();
+        write_full_doc(
+            &mut store,
+            "/vault/photo.png",
+            "image",
+            &[chunk("image", "text_title", Some("sunset"), vec![1.0, 0.0])],
+            Some(1),
+            Some(1),
+        );
+
+        let got = lex(&store, "sunset");
+        assert!(
+            got.candidates.is_empty(),
+            "a title proxy exists for `related`, not for lexical search, got {:?}",
+            got.candidates.iter().map(|c| &c.path).collect::<Vec<_>>()
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Document frequency is read from `chunks_fts` alone, with no join back to
+    /// `chunks`, so a stale FTS row inflates it even though the orphan would be
+    /// filtered out of the candidate list. This is what the delete trigger is
+    /// actually for: without it the candidates still look right while every
+    /// IDF silently drifts.
+    #[test]
+    fn deleting_a_document_lowers_the_document_frequency_of_its_terms() {
+        let (mut store, path) = temp_store();
+        write_text_doc_with(&mut store, "/vault/a.md", &["sharedterm alpha"]);
+        write_text_doc_with(&mut store, "/vault/b.md", &["sharedterm beta"]);
+        assert_eq!(lex(&store, "sharedterm").doc_freqs, vec![2]);
+
+        store.delete_document("/vault/a.md").unwrap();
+        assert_eq!(
+            lex(&store, "sharedterm").doc_freqs,
+            vec![1],
+            "a deleted chunk must stop counting toward document frequency"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Same hazard on the reindex path: replacing a document's chunks deletes
+    /// the old rows, and their terms must stop counting.
+    #[test]
+    fn replacing_a_document_lowers_the_document_frequency_of_dropped_terms() {
+        let (mut store, path) = temp_store();
+        write_text_doc_with(&mut store, "/vault/a.md", &["originalterm here"]);
+        assert_eq!(lex(&store, "originalterm").doc_freqs, vec![1]);
+
+        write_text_doc_with(&mut store, "/vault/a.md", &["replacementterm here"]);
+        assert_eq!(
+            lex(&store, "originalterm").doc_freqs,
+            vec![0],
+            "the replaced chunk's terms must leave the index"
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// The FTS index is kept in sync by triggers, so a reindex that replaces a
+    /// document's chunks must not leave the old text matchable.
+    #[test]
+    fn replacing_a_document_updates_the_lexical_index() {
+        let (mut store, path) = temp_store();
+        write_text_doc_with(&mut store, "/vault/a.md", &["originaltext here"]);
+        assert_eq!(lex(&store, "originaltext").candidates.len(), 1);
+
+        write_text_doc_with(&mut store, "/vault/a.md", &["replacementtext here"]);
+        assert!(
+            lex(&store, "originaltext").candidates.is_empty(),
+            "stale text must not remain matchable after a reindex"
+        );
+        assert_eq!(lex(&store, "replacementtext").candidates.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn deleting_a_document_removes_it_from_the_lexical_index() {
+        let (mut store, path) = temp_store();
+        write_text_doc_with(&mut store, "/vault/a.md", &["deletabletext here"]);
+        assert_eq!(lex(&store, "deletabletext").candidates.len(), 1);
+
+        store.delete_document("/vault/a.md").unwrap();
+        assert!(lex(&store, "deletabletext").candidates.is_empty());
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn lexical_candidates_respects_the_root_filter() {
+        let (mut store, path) = temp_store();
+        write_text_doc_with(&mut store, "/vault/a.md", &["sharedterm one"]);
+        store
+            .replace_document(&DocWrite {
+                path: "/other/b.md",
+                kind: "markdown",
+                source_root: "/other",
+                content_hash: b"h",
+                mtime: 0,
+                title: "b",
+                frontmatter: None,
+                indexed_at: 0,
+                chunks: &[chunk("text", "text", Some("sharedterm two"), vec![1.0, 0.0])],
+                links: &[],
+                tags: &[],
+                width: None,
+                height: None,
+            })
+            .unwrap();
+
+        let roots = vec!["/vault".to_string()];
+        let terms = search::bm25::tokenize("sharedterm");
+        let got = store
+            .lexical_candidates(
+                &terms,
+                50,
+                &TextQuery {
+                    from: Some(&roots),
+                    tags: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(got.candidates.len(), 1);
+        assert_eq!(got.candidates[0].path, "/vault/a.md");
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn an_empty_query_returns_nothing_without_erroring() {
+        let (mut store, path) = temp_store();
+        write_text_doc_with(&mut store, "/vault/a.md", &["some prose"]);
+        let got = store
+            .lexical_candidates(&[], 50, &TextQuery::default())
+            .unwrap();
+        assert!(got.candidates.is_empty());
+        assert!(got.doc_freqs.is_empty());
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn a_query_against_an_empty_corpus_returns_nothing() {
+        let (store, path) = temp_store();
+        let got = lex(&store, "anything");
+        assert_eq!(got.stats.total_chunks, 0);
+        assert!(got.candidates.is_empty());
         let _ = std::fs::remove_dir_all(&path);
     }
 }

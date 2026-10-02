@@ -72,6 +72,39 @@ pub struct LexicalMatch {
     pub term_freqs: Vec<u32>,
 }
 
+/// Split text into lexical terms.
+///
+/// Lowercases and splits on anything that is not alphanumeric, which
+/// approximates SQLite FTS5's `unicode61` tokenizer closely enough that term
+/// frequencies counted here line up with the candidates FTS5 matched. It is an
+/// approximation, not a reimplementation: `unicode61` also folds diacritics by
+/// default, which this does not, so an accented term can be matched by FTS5 and
+/// then counted as absent here. The consequence is a conservative score for
+/// that term rather than a wrong candidate set.
+///
+/// Scoring and tokenizing live together deliberately — a scorer whose notion of
+/// a term differs from whatever produced its statistics is silently wrong.
+pub fn tokenize(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_lowercase())
+        .collect()
+}
+
+/// Count each of `terms` in `text`, returning counts positionally aligned with
+/// `terms`. `terms` are expected to be already lowercased by `tokenize`.
+pub fn term_freqs(text: &str, terms: &[String]) -> Vec<u32> {
+    let mut counts = vec![0u32; terms.len()];
+    for token in tokenize(text) {
+        for (i, term) in terms.iter().enumerate() {
+            if &token == term {
+                counts[i] += 1;
+            }
+        }
+    }
+    counts
+}
+
 /// Inverse document frequency, in the form Lv & Zhai use for BM25+.
 ///
 /// `ln((N + 1) / df)` is always positive, unlike the classic
@@ -419,5 +452,55 @@ mod tests {
             let got = fuse(1.0, 1.0, alpha);
             assert!((got - 1.0).abs() < 1e-6, "alpha {alpha} gave {got}");
         }
+    }
+
+    // ---- tokenize / term_freqs -------------------------------------------
+
+    #[test]
+    fn tokenize_lowercases_and_splits_on_punctuation() {
+        assert_eq!(tokenize("HNSW graph-construction, fast!"), vec!["hnsw", "graph", "construction", "fast"]);
+    }
+
+    #[test]
+    fn tokenize_keeps_digits_and_alphanumeric_runs() {
+        assert_eq!(tokenize("bge-small-en-v1.5"), vec!["bge", "small", "en", "v1", "5"]);
+    }
+
+    #[test]
+    fn tokenize_discards_empty_runs() {
+        assert_eq!(tokenize("  ...  a   b  "), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn tokenize_of_nothing_is_empty() {
+        assert!(tokenize("").is_empty());
+        assert!(tokenize("---").is_empty());
+    }
+
+    #[test]
+    fn term_freqs_counts_each_term_positionally() {
+        let terms = vec!["graph".to_string(), "missing".to_string(), "hnsw".to_string()];
+        let got = term_freqs("HNSW graph: a graph of graphs", &terms);
+        assert_eq!(got, vec![2, 0, 1], "'graphs' must not count as 'graph'");
+    }
+
+    #[test]
+    fn term_freqs_is_case_insensitive() {
+        let terms = vec!["hnsw".to_string()];
+        assert_eq!(term_freqs("HNSW hnsw HnSw", &terms), vec![3]);
+    }
+
+    #[test]
+    fn term_freqs_of_an_empty_query_is_empty() {
+        assert!(term_freqs("anything at all", &[]).is_empty());
+    }
+
+    /// A term counted here must be scored the same way the corpus statistics
+    /// were gathered, so a round trip through tokenize is the contract.
+    #[test]
+    fn term_freqs_agrees_with_tokenize() {
+        let text = "Vector search, vector indexes; VECTOR!";
+        let terms = tokenize("vector");
+        assert_eq!(term_freqs(text, &terms), vec![3]);
     }
 }

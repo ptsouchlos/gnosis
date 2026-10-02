@@ -6,6 +6,7 @@ pub mod bm25;
 use std::collections::HashMap;
 
 /// One embedded chunk to score against a query, before dedup/ranking.
+#[derive(Debug, Clone)]
 pub struct Candidate {
     pub path: String,
     pub title: String,
