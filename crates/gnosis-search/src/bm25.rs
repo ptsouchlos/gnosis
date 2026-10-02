@@ -24,7 +24,8 @@
 //! query keeps "weak" looking weak.
 
 /// BM25+ tuning parameters.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Bm25Params {
     /// Term-frequency saturation. Higher means repeated terms keep adding.
     pub k1: f32,
@@ -42,6 +43,31 @@ impl Default for Bm25Params {
             k1: 1.2,
             b: 0.75,
             delta: 0.5,
+        }
+    }
+}
+
+/// Hybrid retrieval configuration.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SearchConfig {
+    /// Whether the lexical channel runs at all. With it off, ranking is
+    /// bit-identical to pure dense retrieval — the fused path is not entered.
+    pub lexical: bool,
+    /// The convex-combination weight on the dense channel. 1.0 is dense-only,
+    /// 0.0 lexical-only.
+    pub dense_weight: f32,
+    pub bm25: Bm25Params,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            lexical: true,
+            // Chosen by measurement on public BEIR datasets, not by taste; see
+            // docs/gnosis/hybrid-lexical-fusion.md for the sweep.
+            dense_weight: 0.7,
+            bm25: Bm25Params::default(),
         }
     }
 }

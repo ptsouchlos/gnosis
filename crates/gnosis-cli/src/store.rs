@@ -181,6 +181,8 @@ impl SqliteStore {
             "#,
         )?;
 
+        self.backfill_lexical_index()?;
+
         self.ensure_column("documents", "width", "width INTEGER")?;
         self.ensure_column("documents", "height", "height INTEGER")?;
 
@@ -221,6 +223,41 @@ impl SqliteStore {
             .query_map(rusqlite::params_from_iter(tags), |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<HashSet<_>>>()?;
         Ok(paths)
+    }
+
+    /// Populate the full-text index for a database indexed before it existed.
+    ///
+    /// The sync triggers only fire on new writes, so an index built by an
+    /// earlier version would otherwise have an empty lexical channel — and
+    /// silently, since a query would simply match nothing. Backfilling here
+    /// means the channel starts working on the next search rather than
+    /// requiring a full reindex.
+    ///
+    /// Deliberately an explicit filtered `INSERT ... SELECT` rather than FTS5's
+    /// own `'rebuild'` command: `rebuild` reads every row of the content table,
+    /// which would pull in image chunks and title proxies that the triggers
+    /// exclude, and a title proxy in the lexical index would make filenames
+    /// match as prose.
+    fn backfill_lexical_index(&self) -> Result<()> {
+        let indexed: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))?;
+        if indexed > 0 {
+            return Ok(());
+        }
+        let pending: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM chunks WHERE space = 'text' AND text IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        if pending == 0 {
+            return Ok(());
+        }
+        self.conn.execute_batch(
+            "INSERT INTO chunks_fts(rowid, text)
+             SELECT id, text FROM chunks WHERE space = 'text' AND text IS NOT NULL",
+        )?;
+        Ok(())
     }
 
     /// Corpus statistics for the lexical channel.

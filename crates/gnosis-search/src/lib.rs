@@ -22,7 +22,7 @@ pub struct Candidate {
 }
 
 /// One ranked search result (best chunk per document).
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Hit {
     pub path: String,
     pub title: String,
@@ -116,6 +116,62 @@ fn rank_by(
 /// can legitimately score it from both sides) is kept once, at its best
 /// score — a caller-visible duplicate listing would look like a bug, not a
 /// feature. Truncated to `limit` after dedup.
+/// Fuse a dense and a lexical ranking into one, by document path.
+///
+/// Both inputs carry **already-normalized** scores in `Hit::score`, each
+/// against its own channel's theoretical ceiling. A document present in only
+/// one channel scores 0 in the other rather than being dropped — that is the
+/// point of fusing: a literal match the embedder missed, or a semantic match
+/// containing none of the query's words, should still surface.
+///
+/// Metadata comes from the dense hit when a document appears in both, so a
+/// fused result looks exactly like a dense one to callers (same snippet, same
+/// heading path).
+pub fn fuse_hits(
+    dense: Vec<Hit>,
+    lexical: Vec<Hit>,
+    dense_weight: f32,
+    limit: usize,
+) -> Vec<Hit> {
+    let mut by_path: HashMap<String, (Hit, f32, f32)> = HashMap::new();
+
+    for hit in dense {
+        let dense_score = hit.score;
+        by_path
+            .entry(hit.path.clone())
+            .and_modify(|slot| slot.1 = slot.1.max(dense_score))
+            .or_insert((hit, dense_score, 0.0));
+    }
+    for hit in lexical {
+        let lexical_score = hit.score;
+        match by_path.get_mut(&hit.path) {
+            Some(slot) => slot.2 = slot.2.max(lexical_score),
+            None => {
+                by_path.insert(hit.path.clone(), (hit, 0.0, lexical_score));
+            }
+        }
+    }
+
+    let mut fused: Vec<Hit> = by_path
+        .into_values()
+        .map(|(mut hit, dense_score, lexical_score)| {
+            hit.score = bm25::fuse(dense_score, lexical_score, dense_weight);
+            hit
+        })
+        .collect();
+
+    // Ties broken by path so a given index always ranks the same way; an
+    // arbitrary order would make evaluation runs irreproducible.
+    fused.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    fused.truncate(limit);
+    fused
+}
+
 pub fn merge_normalized(per_space: Vec<Vec<Hit>>, limit: usize) -> Vec<Hit> {
     if per_space.len() <= 1 {
         let mut hits = per_space.into_iter().next().unwrap_or_default();
@@ -322,5 +378,106 @@ mod tests {
         assert_eq!(note_hits.len(), 1, "note.md must appear exactly once");
         assert_eq!(note_hits[0].score, 1.0, "kept at its best (text-space) normalized score");
         assert_eq!(merged.len(), 3);
+    }
+
+    // ---- fuse_hits -------------------------------------------------------
+
+    fn h(path: &str, score: f32) -> Hit {
+        Hit {
+            path: path.to_string(),
+            title: path.to_string(),
+            source_root: "/v".to_string(),
+            heading_path: String::new(),
+            text: format!("text of {path}"),
+            score,
+            width: None,
+            height: None,
+        }
+    }
+
+    #[test]
+    fn fuse_hits_combines_both_channels_for_a_shared_document() {
+        let got = fuse_hits(vec![h("a.md", 1.0)], vec![h("a.md", 0.0)], 0.5, 10);
+        assert_eq!(got.len(), 1);
+        assert!((got[0].score - 0.5).abs() < 1e-6, "got {}", got[0].score);
+    }
+
+    /// A literal match the embedder missed must still surface — that is the
+    /// whole reason for a lexical channel.
+    #[test]
+    fn fuse_hits_keeps_a_document_only_the_lexical_channel_found() {
+        let got = fuse_hits(vec![h("dense.md", 0.9)], vec![h("lexonly.md", 1.0)], 0.5, 10);
+        let paths: Vec<&str> = got.iter().map(|x| x.path.as_str()).collect();
+        assert!(paths.contains(&"lexonly.md"), "got {paths:?}");
+    }
+
+    #[test]
+    fn fuse_hits_keeps_a_document_only_the_dense_channel_found() {
+        let got = fuse_hits(vec![h("denseonly.md", 1.0)], vec![], 0.5, 10);
+        assert_eq!(got.len(), 1);
+        assert!((got[0].score - 0.5).abs() < 1e-6, "missing channel scores 0");
+    }
+
+    #[test]
+    fn fuse_hits_at_weight_one_ranks_exactly_like_dense_alone() {
+        let dense = vec![h("a.md", 0.9), h("b.md", 0.4)];
+        let lexical = vec![h("b.md", 1.0), h("c.md", 1.0)];
+        let got = fuse_hits(dense, lexical, 1.0, 10);
+        assert_eq!(got[0].path, "a.md");
+        assert_eq!(got[0].score, 0.9);
+        assert_eq!(got[1].path, "b.md");
+        assert_eq!(got[1].score, 0.4);
+        assert_eq!(got[2].score, 0.0, "a lexical-only hit contributes nothing at weight 1");
+    }
+
+    #[test]
+    fn fuse_hits_at_weight_zero_ranks_by_lexical_alone() {
+        let got = fuse_hits(vec![h("a.md", 1.0)], vec![h("b.md", 0.8)], 0.0, 10);
+        assert_eq!(got[0].path, "b.md");
+    }
+
+    #[test]
+    fn fuse_hits_prefers_dense_metadata_for_a_shared_document() {
+        let mut dense_hit = h("a.md", 0.5);
+        dense_hit.heading_path = "Design > Storage".to_string();
+        let mut lexical_hit = h("a.md", 0.5);
+        lexical_hit.heading_path = "somewhere else".to_string();
+        let got = fuse_hits(vec![dense_hit], vec![lexical_hit], 0.5, 10);
+        assert_eq!(got[0].heading_path, "Design > Storage");
+    }
+
+    #[test]
+    fn fuse_hits_keeps_the_best_score_per_channel_across_chunks() {
+        // Two chunks of one document in each channel.
+        let dense = vec![h("a.md", 0.2), h("a.md", 0.9)];
+        let lexical = vec![h("a.md", 0.1), h("a.md", 0.7)];
+        let got = fuse_hits(dense, lexical, 0.5, 10);
+        assert_eq!(got.len(), 1, "a document must appear once");
+        assert!((got[0].score - 0.8).abs() < 1e-6, "got {}", got[0].score);
+    }
+
+    #[test]
+    fn fuse_hits_respects_the_limit() {
+        let dense: Vec<Hit> = (0..10).map(|i| h(&format!("{i}.md"), 0.5)).collect();
+        assert_eq!(fuse_hits(dense, vec![], 0.5, 3).len(), 3);
+    }
+
+    #[test]
+    fn fuse_hits_is_deterministic_for_tied_scores() {
+        let dense = vec![h("b.md", 0.5), h("a.md", 0.5), h("c.md", 0.5)];
+        let first = fuse_hits(dense.clone(), vec![], 1.0, 10);
+        let second = fuse_hits(dense, vec![], 1.0, 10);
+        let paths: Vec<&str> = first.iter().map(|x| x.path.as_str()).collect();
+        assert_eq!(paths, vec!["a.md", "b.md", "c.md"], "ties break by path");
+        assert_eq!(
+            paths,
+            second.iter().map(|x| x.path.as_str()).collect::<Vec<_>>(),
+            "repeat runs must agree, or evaluation is irreproducible"
+        );
+    }
+
+    #[test]
+    fn fusing_nothing_yields_nothing() {
+        assert!(fuse_hits(vec![], vec![], 0.5, 10).is_empty());
     }
 }

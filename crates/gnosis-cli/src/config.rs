@@ -23,6 +23,8 @@ pub struct Config {
     pub pdf: PdfConfig,
     pub ignore: IgnoreConfig,
     pub ann: AnnConfig,
+    #[serde(default)]
+    pub search: search::bm25::SearchConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +60,7 @@ impl Default for Config {
             pdf: PdfConfig::default(),
             ignore: IgnoreConfig::default(),
             ann: AnnConfig::default(),
+            search: search::bm25::SearchConfig::default(),
         }
     }
 }
