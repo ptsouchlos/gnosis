@@ -64,9 +64,13 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             lexical: true,
-            // Chosen by measurement on public BEIR datasets, not by taste; see
-            // docs/gnosis/hybrid-lexical-fusion.md for the sweep.
-            dense_weight: 0.7,
+            // Measured, not chosen by taste. Sweeping alpha on two BEIR
+            // datasets, 0.9 is the only value that improves *both* (nfcorpus
+            // +0.008, scifact +0.014 nDCG@10). They disagree about the
+            // optimum — nfcorpus peaks near 0.3, scifact near 0.9 — so a
+            // single global weight is a compromise, and 0.9 is the compromise
+            // that never regresses. See docs/gnosis/hybrid-lexical-fusion.md.
+            dense_weight: 0.9,
             bm25: Bm25Params::default(),
         }
     }
