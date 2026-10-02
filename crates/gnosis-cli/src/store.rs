@@ -28,6 +28,35 @@ const LEXICAL_INDEX_VERSION_KEY: &str = "lexical_index_version";
 /// ANN index file per `(space, modality)` pair.
 const INDEX_DIR_NAME: &str = "index";
 
+/// Definition of the lexical index and the triggers that keep it in sync.
+///
+/// Shared by first-time creation and by the migration path, so the two cannot
+/// drift. `IF NOT EXISTS` makes it a no-op against an index that is already the
+/// right shape.
+const LEXICAL_INDEX_DDL: &str = r#"
+-- Full-text index over text-space chunks, for the lexical channel.
+-- `content='chunks'` makes this an external-content index: FTS5
+-- stores only the inverted index and reads the text back from
+-- `chunks`, so the text is not duplicated. Sync is therefore the
+-- triggers' job, not FTS5's.
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+    heading_path,
+    text,
+    content='chunks',
+    content_rowid='id',
+    tokenize='unicode61'
+);
+
+-- Only text-space chunks with text are indexed: image chunks carry
+-- no text, and title proxies exist for `related` to traverse rather
+-- than to be matched lexically.
+CREATE TRIGGER IF NOT EXISTS chunks_fts_insert AFTER INSERT ON chunks
+WHEN new.space = 'text' AND new.text IS NOT NULL BEGIN
+    INSERT INTO chunks_fts(rowid, heading_path, text)
+    VALUES (new.id, new.heading_path, new.text);
+END;
+"#;
+
 /// SQLite-backed [`Store`]; gnosis's durable source of truth.
 pub struct SqliteStore {
     conn: Connection,
@@ -140,27 +169,6 @@ impl SqliteStore {
             CREATE INDEX IF NOT EXISTS idx_chunks_doc   ON chunks(doc_id);
             CREATE INDEX IF NOT EXISTS idx_chunks_space ON chunks(space);
 
-            -- Full-text index over text-space chunks, for the lexical channel.
-            -- `content='chunks'` makes this an external-content index: FTS5
-            -- stores only the inverted index and reads the text back from
-            -- `chunks`, so the text is not duplicated. Sync is therefore the
-            -- triggers' job, not FTS5's.
-            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-                heading_path,
-                text,
-                content='chunks',
-                content_rowid='id',
-                tokenize='unicode61'
-            );
-
-            -- Only text-space chunks with text are indexed: image chunks carry
-            -- no text, and title proxies exist for `related` to traverse rather
-            -- than to be matched lexically.
-            CREATE TRIGGER IF NOT EXISTS chunks_fts_insert AFTER INSERT ON chunks
-            WHEN new.space = 'text' AND new.text IS NOT NULL BEGIN
-                INSERT INTO chunks_fts(rowid, heading_path, text)
-                VALUES (new.id, new.heading_path, new.text);
-            END;
 
             CREATE TRIGGER IF NOT EXISTS chunks_fts_delete AFTER DELETE ON chunks
             WHEN old.space = 'text' AND old.text IS NOT NULL BEGIN
@@ -189,6 +197,7 @@ impl SqliteStore {
             "#,
         )?;
 
+        self.conn.execute_batch(LEXICAL_INDEX_DDL)?;
         self.ensure_lexical_index()?;
 
         self.ensure_column("documents", "width", "width INTEGER")?;
@@ -257,9 +266,14 @@ impl SqliteStore {
         if self.get_meta(LEXICAL_INDEX_VERSION_KEY)?.as_deref() == Some(current.as_str()) {
             return Ok(());
         }
+        // Dropped and recreated rather than emptied: a bumped version may mean
+        // the index's *shape* changed, and `CREATE VIRTUAL TABLE IF NOT EXISTS`
+        // is a no-op against an existing table, so a column added here would
+        // otherwise never reach a database that already had an index.
+        self.conn.execute_batch("DROP TABLE IF EXISTS chunks_fts;")?;
+        self.conn.execute_batch(LEXICAL_INDEX_DDL)?;
         self.conn.execute_batch(
-            "INSERT INTO chunks_fts(chunks_fts) VALUES('delete-all');
-             INSERT INTO chunks_fts(rowid, heading_path, text)
+            "INSERT INTO chunks_fts(rowid, heading_path, text)
              SELECT id, heading_path, text FROM chunks
              WHERE space = 'text' AND text IS NOT NULL;",
         )?;
@@ -1529,6 +1543,39 @@ mod tests {
             1,
             "reopening must rebuild the missing lexical index"
         );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// A database whose `chunks_fts` was created with an older *shape* must be
+    /// migrated, not just repopulated.
+    ///
+    /// `CREATE VIRTUAL TABLE IF NOT EXISTS` is a no-op against an existing
+    /// table, so adding a column to the index is invisible to every database
+    /// that already has one — and the failure is a hard error on the next
+    /// search, not a quiet degradation.
+    #[test]
+    fn opening_a_store_migrates_an_older_lexical_index_shape() {
+        let (mut store, path) = temp_store();
+        write_text_doc_with(&mut store, "/vault/a.md", &["body prose"]);
+
+        // Recreate the pre-heading index: a single `text` column.
+        store
+            .conn
+            .execute_batch(
+                "DROP TABLE chunks_fts;
+                 CREATE VIRTUAL TABLE chunks_fts USING fts5(
+                     text, content='chunks', content_rowid='id', tokenize='unicode61');",
+            )
+            .unwrap();
+        store.set_meta("lexical_index_version", "1").unwrap();
+        drop(store);
+
+        let reopened = SqliteStore::open(&path.join("gnosis.db")).unwrap();
+        let got = reopened
+            .lexical_candidates(&search::bm25::tokenize("prose"), 10, &TextQuery::default())
+            .expect("a stale index shape must be migrated, not error");
+        assert_eq!(got.candidates.len(), 1);
 
         let _ = std::fs::remove_dir_all(&path);
     }
