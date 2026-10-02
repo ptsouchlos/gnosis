@@ -1,6 +1,8 @@
 //! Pure vector scoring/ranking, independent of how candidates are stored.
 //! Kept storage-agnostic so it can back both the CLI's SQLite-backed search
 //! and other front-ends (e.g. a WASM build indexing over IndexedDB).
+pub mod bm25;
+
 use std::collections::HashMap;
 
 /// One embedded chunk to score against a query, before dedup/ranking.
