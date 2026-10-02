@@ -108,6 +108,21 @@ pub struct TextQuery<'a> {
     pub tags: Option<&'a [String]>,
 }
 
+/// Everything the lexical channel needs to score one query.
+///
+/// The corpus statistics and per-term document frequencies come from the store
+/// because only it knows the whole corpus; term frequencies are counted from
+/// each candidate's `text` by the caller, using the same tokenizer the
+/// statistics were gathered with.
+#[derive(Debug, Clone)]
+pub struct LexicalMatches {
+    pub stats: search::bm25::CorpusStats,
+    /// Document frequency per query term, positionally aligned with the terms
+    /// that were asked for.
+    pub doc_freqs: Vec<u64>,
+    pub candidates: Vec<search::Candidate>,
+}
+
 /// Durable storage for gnosis's indexed documents, chunks, and links.
 pub trait Store {
     /// Insert or update a meta key/value pair.
@@ -147,6 +162,19 @@ pub trait Store {
     /// `modality = "image"` chunks are considered — title-proxy rows
     /// (`modality = "text_title"`) are for `related_space` to traverse, not
     /// for direct image search.
+    /// Chunks in the text space matching any of `terms`, with the corpus
+    /// statistics and document frequencies needed to score them.
+    ///
+    /// Lexical retrieval is text-space only: image chunks carry no text, and
+    /// title proxies exist for `related` to traverse rather than to be matched
+    /// as prose.
+    fn lexical_candidates(
+        &self,
+        terms: &[String],
+        limit: usize,
+        filter: &TextQuery,
+    ) -> Result<LexicalMatches>;
+
     fn search_space(&self, space: Space, query: &[f32], limit: usize, filter: &TextQuery) -> Result<Vec<Hit>>;
 
     /// A document's own chunk vectors within one space — the query set for

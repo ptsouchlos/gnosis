@@ -6,6 +6,11 @@ use crate::embedder::{build_clip_text_embedder, build_text_embedder};
 use crate::store::{Space, SqliteStore, Store, TextQuery};
 use crate::workspace::{Workspace, expand_tilde};
 
+/// How far past `limit` to reach for lexical candidates. A document worth
+/// surfacing after fusion can sit well down the lexical ranking, so the
+/// candidate set has to be wider than the result set.
+const LEXICAL_OVERFETCH: usize = 5;
+
 /// Left margin used for every indented detail line under a hit (heading
 /// path, image dimensions, text snippet) — shared so the columns line up
 /// regardless of which branch prints.
@@ -112,12 +117,91 @@ pub(crate) fn run_query(
     limit: usize,
     filter: &TextQuery,
 ) -> Result<Vec<search::Hit>> {
+    let cfg = &embedders.ws.config.search;
+
     let mut per_space: Vec<Vec<search::Hit>> = Vec::with_capacity(spaces.len());
     for space in spaces.iter().copied() {
         let query_vec = embedders.embed(space, query)?;
-        per_space.push(store.search_space(space, &query_vec, limit, filter)?);
+        let dense = store.search_space(space, &query_vec, limit, filter)?;
+
+        // Lexical matching applies to the text space only: image chunks carry
+        // no text, and title proxies exist for `related` to traverse.
+        if space == Space::Text {
+            // The title bonus is independent of the lexical channel, so it is
+            // applied either way — `fuse_text_space` does it as part of fusing,
+            // and the dense-only path does it here.
+            let ranked = if cfg.lexical {
+                fuse_text_space(store, query, dense, limit, filter, cfg)?
+            } else {
+                let terms = search::bm25::tokenize(query);
+                search::boost_and_rank(dense, &terms, cfg.title_boost, limit)
+            };
+            per_space.push(ranked);
+        } else {
+            per_space.push(dense);
+        }
     }
     Ok(search::merge_normalized(per_space, limit))
+}
+
+/// Score the lexical channel for `query` and fuse it with the dense ranking.
+///
+/// Both channels are normalized against their own theoretical ceiling before
+/// fusing — dense against 1.0, since chunk vectors are unit-norm so cosine
+/// cannot exceed it, and lexical against BM25+'s per-query maximum. Neither is
+/// min-max normalized, so a weak result set stays weak.
+fn fuse_text_space(
+    store: &SqliteStore,
+    query: &str,
+    dense: Vec<search::Hit>,
+    limit: usize,
+    filter: &TextQuery,
+    cfg: &search::bm25::SearchConfig,
+) -> Result<Vec<search::Hit>> {
+    let terms = search::bm25::tokenize(query);
+    if terms.is_empty() {
+        return Ok(dense);
+    }
+
+    // Over-fetch the lexical side: a document fusion should surface may rank
+    // well below `limit` on lexical score alone.
+    let matches = store.lexical_candidates(&terms, limit * LEXICAL_OVERFETCH, filter)?;
+    let query_terms: Vec<search::bm25::QueryTerm> = matches
+        .doc_freqs
+        .iter()
+        .map(|&doc_freq| search::bm25::QueryTerm { doc_freq })
+        .collect();
+    let ceiling = search::bm25::max_score(&query_terms, matches.stats, cfg.bm25);
+
+    let lexical: Vec<search::Hit> = matches
+        .candidates
+        .into_iter()
+        .map(|c| {
+            // Score over heading plus body, matching what the index contains
+            // and how the corpus average length is measured. A term appearing
+            // only in a chunk's heading is exactly the lookup-by-note-name
+            // case a lexical channel exists for.
+            let scored_text = format!("{} {}", c.heading_path, c.text);
+            let m = search::bm25::LexicalMatch {
+                // Characters, matching how the corpus average is measured.
+                chunk_len: scored_text.chars().count() as u32,
+                term_freqs: search::bm25::term_freqs(&scored_text, &terms),
+            };
+            let raw = search::bm25::score(&m, &query_terms, matches.stats, cfg.bm25);
+            search::Hit {
+                path: c.path,
+                title: c.title,
+                source_root: c.source_root,
+                heading_path: c.heading_path,
+                text: c.text,
+                score: search::bm25::normalize(raw, ceiling),
+                width: c.width,
+                height: c.height,
+            }
+        })
+        .collect();
+
+    Ok(search::fuse_hits(dense, lexical, &terms, cfg, limit))
 }
 
 pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
