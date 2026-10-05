@@ -13,6 +13,24 @@ pub trait Embedder {
     fn model_id(&self) -> &str;
     /// Embed a batch of inputs, preserving order.
     fn embed(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>>;
+
+    /// Embed a *search query*, as opposed to indexed content.
+    ///
+    /// Asymmetric retrieval models are trained with an instruction on the query
+    /// side only — `bge-small-en-v1.5` wants
+    /// `"Represent this sentence for searching relevant passages: "` — so a
+    /// query embedded exactly like a document is embedded in a way the model
+    /// was not trained for. Only the query side differs; stored chunk vectors
+    /// are unaffected, which is why `related` (document-to-document) keeps
+    /// using `embed`.
+    ///
+    /// Defaults to `embed`, so a symmetric model implements nothing.
+    fn embed_query(&mut self, query: &str) -> Result<Vec<f32>> {
+        self.embed(std::slice::from_ref(&query.to_string()))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("embedding produced no vector"))
+    }
 }
 
 /// Text/image embedding configuration, shared by every `Embedder` implementor
@@ -30,6 +48,12 @@ pub struct EmbedConfig {
 #[serde(default)]
 pub struct TextEmbedConfig {
     pub model: String,
+    /// Prepend the model's own query instruction when embedding a search query.
+    ///
+    /// On by default, because a model that wants one was trained that way. Set
+    /// `false` to reproduce pre-instruction measurements, or for a model whose
+    /// instruction gnosis guesses wrong.
+    pub query_instruction: bool,
     /// How many chunks to embed per model call.
     ///
     /// Bounds peak memory: ONNX activation memory scales with
@@ -55,6 +79,7 @@ impl Default for TextEmbedConfig {
     fn default() -> Self {
         Self {
             model: "bge-small-en-v1.5".to_string(),
+            query_instruction: true,
             batch_size: 16,
         }
     }
@@ -109,5 +134,42 @@ mod tests {
     fn omitting_text_batch_size_keeps_the_default() {
         let cfg: TextEmbedConfig = toml::from_str("model = \"all-MiniLM-L6-v2\"\n").unwrap();
         assert_eq!(cfg.batch_size, TextEmbedConfig::default().batch_size);
+    }
+
+    #[test]
+    fn query_instruction_defaults_on_and_round_trips_through_toml() {
+        assert!(TextEmbedConfig::default().query_instruction);
+        let cfg: TextEmbedConfig = toml::from_str("query_instruction = false\n").unwrap();
+        assert!(!cfg.query_instruction);
+    }
+
+    /// A symmetric embedder implements nothing, so the default must pass the
+    /// query through untouched — otherwise turning the instruction on for one
+    /// model would quietly alter every other backend's queries too.
+    #[test]
+    fn default_embed_query_passes_the_query_through_unchanged() {
+        struct Spy {
+            seen: Vec<String>,
+        }
+        impl Embedder for Spy {
+            fn space(&self) -> &str {
+                "text"
+            }
+            fn dim(&self) -> usize {
+                1
+            }
+            fn model_id(&self) -> &str {
+                "spy"
+            }
+            fn embed(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+                self.seen.extend_from_slice(inputs);
+                Ok(inputs.iter().map(|_| vec![1.0]).collect())
+            }
+        }
+
+        let mut spy = Spy { seen: Vec::new() };
+        let v = spy.embed_query("tent repair").expect("embed query");
+        assert_eq!(v, vec![1.0]);
+        assert_eq!(spy.seen, vec!["tent repair".to_string()]);
     }
 }

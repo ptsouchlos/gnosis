@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
 use crate::embedder::{build_clip_text_embedder, build_text_embedder};
 use crate::store::{Space, SqliteStore, Store, TextQuery};
@@ -83,7 +83,7 @@ impl<'a> QueryEmbedders<'a> {
         let embedder = match space {
             Space::Text => {
                 if self.text.is_none() {
-                    self.text = Some(build_text_embedder(&self.ws.config.embed.text.model, self.ws.config.embed.text.batch_size)?);
+                    self.text = Some(build_text_embedder(&self.ws.config.embed.text)?);
                 }
                 self.text.as_mut().expect("just built")
             }
@@ -95,11 +95,7 @@ impl<'a> QueryEmbedders<'a> {
                 self.clip_text.as_mut().expect("just built")
             }
         };
-        embedder
-            .embed(std::slice::from_ref(&query.to_string()))?
-            .into_iter()
-            .next()
-            .context("embedding produced no vector")
+        embedder.embed_query(query)
     }
 }
 

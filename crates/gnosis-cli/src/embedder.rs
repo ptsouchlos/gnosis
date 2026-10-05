@@ -10,6 +10,9 @@ pub struct TextEmbedder {
     model: TextEmbedding,
     model_id: String,
     dim: usize,
+    /// Instruction prepended to a search query, empty when the model wants
+    /// none or the user turned it off. See `Embedder::embed_query`.
+    query_prefix: &'static str,
     /// Chunks per model call. Bounds ONNX activation memory, which scales with
     /// batch size × sequence length; see `TextEmbedConfig::batch_size`.
     batch_size: usize,
@@ -17,8 +20,9 @@ pub struct TextEmbedder {
 
 impl TextEmbedder {
     /// Construct from a config model name. Downloads/caches the model on first use.
-    pub fn new(model_name: &str, batch_size: usize) -> Result<Self> {
-        let (model, dim) = resolve_text_model(model_name)?;
+    pub fn new(model_name: &str, batch_size: usize, query_instruction: bool) -> Result<Self> {
+        let (model, dim, _) = resolve_text_model(model_name)?;
+        let prefix = resolve_query_prefix(model_name, query_instruction)?;
         let mut opts = InitOptions::new(model);
         if let Some(dir) = model_cache_dir() {
             std::fs::create_dir_all(&dir).ok();
@@ -29,6 +33,7 @@ impl TextEmbedder {
             model: embedding,
             model_id: model_name.to_string(),
             dim,
+            query_prefix: prefix,
             batch_size: batch_size.max(1),
         })
     }
@@ -36,8 +41,12 @@ impl TextEmbedder {
 
 /// Build the configured text embedder as a trait object, so callers (e.g. the
 /// `index` crate) stay agnostic to which concrete backend is in use.
-pub fn build_text_embedder(model_name: &str, batch_size: usize) -> Result<Box<dyn Embedder>> {
-    Ok(Box::new(TextEmbedder::new(model_name, batch_size)?))
+pub fn build_text_embedder(cfg: &embed::TextEmbedConfig) -> Result<Box<dyn Embedder>> {
+    Ok(Box::new(TextEmbedder::new(
+        &cfg.model,
+        cfg.batch_size,
+        cfg.query_instruction,
+    )?))
 }
 
 /// Stable per-user cache directory for downloaded models, so fastembed doesn't
@@ -67,22 +76,54 @@ impl Embedder for TextEmbedder {
         let vectors = self.model.embed(inputs, Some(self.batch_size))?;
         Ok(vectors)
     }
+
+    fn embed_query(&mut self, query: &str) -> Result<Vec<f32>> {
+        let prefixed = format!("{}{query}", self.query_prefix);
+        self.embed(std::slice::from_ref(&prefixed))?
+            .into_iter()
+            .next()
+            .context("embedding produced no vector")
+    }
 }
 
-/// Map a config model name to a fastembed model enum and its dimensionality.
-fn resolve_text_model(name: &str) -> Result<(EmbeddingModel, usize)> {
+/// The query-side instruction each model was trained with, or `""` for a
+/// symmetric model. fastembed applies none of these itself — it embeds queries
+/// and documents identically — so gnosis has to carry them.
+///
+/// BAAI's for the bge English v1.5 family; nomic's `search_query:`/
+/// `search_document:` pair, where the document side is *also* required, so it
+/// stays empty until indexing can prefix documents too. `all-MiniLM-L6-v2` is
+/// symmetric and wants nothing.
+const BGE_EN_QUERY_INSTRUCTION: &str = "Represent this sentence for searching relevant passages: ";
+
+/// Map a config model name to a fastembed model enum, its dimensionality, and
+/// its query instruction.
+fn resolve_text_model(name: &str) -> Result<(EmbeddingModel, usize, &'static str)> {
     let m = match name {
-        "bge-small-en-v1.5" => (EmbeddingModel::BGESmallENV15, 384),
-        "bge-small-en-v1.5-q" => (EmbeddingModel::BGESmallENV15Q, 384),
-        "bge-base-en-v1.5" => (EmbeddingModel::BGEBaseENV15, 768),
-        "all-MiniLM-L6-v2" => (EmbeddingModel::AllMiniLML6V2, 384),
-        "nomic-embed-text-v1.5" => (EmbeddingModel::NomicEmbedTextV15, 768),
+        "bge-small-en-v1.5" => (EmbeddingModel::BGESmallENV15, 384, BGE_EN_QUERY_INSTRUCTION),
+        "bge-small-en-v1.5-q" => (EmbeddingModel::BGESmallENV15Q, 384, BGE_EN_QUERY_INSTRUCTION),
+        "bge-base-en-v1.5" => (EmbeddingModel::BGEBaseENV15, 768, BGE_EN_QUERY_INSTRUCTION),
+        "all-MiniLM-L6-v2" => (EmbeddingModel::AllMiniLML6V2, 384, ""),
+        "nomic-embed-text-v1.5" => (EmbeddingModel::NomicEmbedTextV15, 768, ""),
         other => bail!(
             "unknown text model '{other}' (try: bge-small-en-v1.5, bge-small-en-v1.5-q, \
              bge-base-en-v1.5, all-MiniLM-L6-v2, nomic-embed-text-v1.5)"
         ),
     };
     Ok(m)
+}
+
+/// The query instruction to prepend for `model_name`, or `""` when the model is
+/// symmetric or the user disabled the behavior.
+///
+/// Reads the instruction out of `resolve_text_model`'s table rather than keeping
+/// a second list of model names, so a model added there cannot silently lose
+/// its instruction.
+fn resolve_query_prefix(model_name: &str, enabled: bool) -> Result<&'static str> {
+    if !enabled {
+        return Ok("");
+    }
+    Ok(resolve_text_model(model_name)?.2)
 }
 
 /// Image embedder backed by a local fastembed (ONNX) CLIP vision model.
@@ -222,9 +263,72 @@ mod tests {
 
     #[test]
     fn resolve_text_model_recognizes_quantized_bge_small() {
-        let (model, dim) = resolve_text_model("bge-small-en-v1.5-q").expect("known model name");
+        let (model, dim, _) = resolve_text_model("bge-small-en-v1.5-q").expect("known model name");
         assert_eq!(model, EmbeddingModel::BGESmallENV15Q);
         assert_eq!(dim, 384);
+    }
+
+    #[test]
+    fn bge_models_carry_a_query_instruction_and_symmetric_ones_do_not() {
+        for bge in ["bge-small-en-v1.5", "bge-small-en-v1.5-q", "bge-base-en-v1.5"] {
+            assert_eq!(
+                resolve_query_prefix(bge, true).expect("known model"),
+                BGE_EN_QUERY_INSTRUCTION,
+                "{bge} is asymmetric and wants its instruction"
+            );
+        }
+        assert_eq!(
+            resolve_query_prefix("all-MiniLM-L6-v2", true).expect("known model"),
+            "",
+            "a symmetric model must not get an instruction"
+        );
+    }
+
+    #[test]
+    fn disabling_query_instruction_clears_it_even_for_a_model_that_wants_one() {
+        assert_eq!(
+            resolve_query_prefix("bge-small-en-v1.5", false).expect("known model"),
+            "",
+            "query_instruction = false must reproduce pre-instruction behavior exactly"
+        );
+    }
+
+    /// The instruction has to be prepended to the query and *only* the query:
+    /// prefixing indexed content as well would shift every stored vector and
+    /// silently invalidate the index.
+    ///
+    /// Loads the real model (downloads on first run), so it's network-gated.
+    /// Run with: cargo test --release -- --ignored --nocapture
+    #[test]
+    #[ignore = "downloads model and runs inference"]
+    fn query_instruction_changes_the_query_vector_but_not_the_document_vector() {
+        let text = "ergonomic keyboard layouts".to_string();
+
+        let mut with = TextEmbedder::new("bge-small-en-v1.5", 16, true).expect("load model");
+        let mut without = TextEmbedder::new("bge-small-en-v1.5", 16, false).expect("load model");
+
+        // Documents go through `embed`, which must be identical either way.
+        let doc_with = with.embed(std::slice::from_ref(&text)).expect("embed");
+        let doc_without = without.embed(std::slice::from_ref(&text)).expect("embed");
+        assert_eq!(
+            doc_with[0], doc_without[0],
+            "query_instruction must not touch indexed content"
+        );
+
+        // Queries go through `embed_query`, where it must take effect.
+        let q_with = with.embed_query(&text).expect("embed query");
+        let q_without = without.embed_query(&text).expect("embed query");
+        assert_ne!(
+            q_with, q_without,
+            "the instruction should change the query vector"
+        );
+        assert_eq!(
+            q_without, doc_without[0],
+            "with the instruction off, a query embeds exactly like a document"
+        );
+
+        let norm: f32 = q_with.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-3, "expected unit norm, got {norm}");
     }
 
     /// Loads the real model (downloads on first run), so it's network-gated and
@@ -233,7 +337,7 @@ mod tests {
     #[test]
     #[ignore = "downloads model and runs inference"]
     fn embeds_text_sanely() {
-        let mut embedder = TextEmbedder::new("bge-small-en-v1.5", 16).expect("load model");
+        let mut embedder = TextEmbedder::new("bge-small-en-v1.5", 16, true).expect("load model");
         assert_eq!(embedder.dim(), 384);
 
         let inputs = vec![
