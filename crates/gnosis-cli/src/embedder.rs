@@ -13,6 +13,8 @@ pub struct TextEmbedder {
     /// Instruction prepended to a search query, empty when the model wants
     /// none or the user turned it off. See `Embedder::embed_query`.
     query_prefix: &'static str,
+    /// Longest input the model accepts, in its own tokens.
+    max_input_tokens: usize,
     /// Chunks per model call. Bounds ONNX activation memory, which scales with
     /// batch size × sequence length; see `TextEmbedConfig::batch_size`.
     batch_size: usize,
@@ -21,7 +23,7 @@ pub struct TextEmbedder {
 impl TextEmbedder {
     /// Construct from a config model name. Downloads/caches the model on first use.
     pub fn new(model_name: &str, batch_size: usize, query_instruction: bool) -> Result<Self> {
-        let (model, dim, _) = resolve_text_model(model_name)?;
+        let (model, dim, _, max_input_tokens) = resolve_text_model(model_name)?;
         let prefix = resolve_query_prefix(model_name, query_instruction)?;
         let mut opts = InitOptions::new(model);
         if let Some(dir) = model_cache_dir() {
@@ -34,6 +36,7 @@ impl TextEmbedder {
             model_id: model_name.to_string(),
             dim,
             query_prefix: prefix,
+            max_input_tokens,
             batch_size: batch_size.max(1),
         })
     }
@@ -77,6 +80,10 @@ impl Embedder for TextEmbedder {
         Ok(vectors)
     }
 
+    fn max_input_tokens(&self) -> Option<usize> {
+        Some(self.max_input_tokens)
+    }
+
     fn embed_query(&mut self, query: &str) -> Result<Vec<f32>> {
         let prefixed = format!("{}{query}", self.query_prefix);
         self.embed(std::slice::from_ref(&prefixed))?
@@ -96,15 +103,19 @@ impl Embedder for TextEmbedder {
 /// symmetric and wants nothing.
 const BGE_EN_QUERY_INSTRUCTION: &str = "Represent this sentence for searching relevant passages: ";
 
-/// Map a config model name to a fastembed model enum, its dimensionality, and
-/// its query instruction.
-fn resolve_text_model(name: &str) -> Result<(EmbeddingModel, usize, &'static str)> {
+/// A resolved text model: fastembed enum, dimensionality, query instruction,
+/// and the longest input it accepts in its own tokens.
+type TextModel = (EmbeddingModel, usize, &'static str, usize);
+
+/// Map a config model name to its fastembed enum, dimensionality, query
+/// instruction, and input limit.
+fn resolve_text_model(name: &str) -> Result<TextModel> {
     let m = match name {
-        "bge-small-en-v1.5" => (EmbeddingModel::BGESmallENV15, 384, BGE_EN_QUERY_INSTRUCTION),
-        "bge-small-en-v1.5-q" => (EmbeddingModel::BGESmallENV15Q, 384, BGE_EN_QUERY_INSTRUCTION),
-        "bge-base-en-v1.5" => (EmbeddingModel::BGEBaseENV15, 768, BGE_EN_QUERY_INSTRUCTION),
-        "all-MiniLM-L6-v2" => (EmbeddingModel::AllMiniLML6V2, 384, ""),
-        "nomic-embed-text-v1.5" => (EmbeddingModel::NomicEmbedTextV15, 768, ""),
+        "bge-small-en-v1.5" => (EmbeddingModel::BGESmallENV15, 384, BGE_EN_QUERY_INSTRUCTION, 512),
+        "bge-small-en-v1.5-q" => (EmbeddingModel::BGESmallENV15Q, 384, BGE_EN_QUERY_INSTRUCTION, 512),
+        "bge-base-en-v1.5" => (EmbeddingModel::BGEBaseENV15, 768, BGE_EN_QUERY_INSTRUCTION, 512),
+        "all-MiniLM-L6-v2" => (EmbeddingModel::AllMiniLML6V2, 384, "", 256),
+        "nomic-embed-text-v1.5" => (EmbeddingModel::NomicEmbedTextV15, 768, "", 8192),
         other => bail!(
             "unknown text model '{other}' (try: bge-small-en-v1.5, bge-small-en-v1.5-q, \
              bge-base-en-v1.5, all-MiniLM-L6-v2, nomic-embed-text-v1.5)"
@@ -263,7 +274,7 @@ mod tests {
 
     #[test]
     fn resolve_text_model_recognizes_quantized_bge_small() {
-        let (model, dim, _) = resolve_text_model("bge-small-en-v1.5-q").expect("known model name");
+        let (model, dim, _, _) = resolve_text_model("bge-small-en-v1.5-q").expect("known model name");
         assert_eq!(model, EmbeddingModel::BGESmallENV15Q);
         assert_eq!(dim, 384);
     }
