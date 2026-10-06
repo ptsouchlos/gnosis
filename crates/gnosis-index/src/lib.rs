@@ -89,8 +89,14 @@ pub fn run(
     image_batch_size: usize,
 ) -> Result<IndexReport> {
     guard_model(&*args.store, &args.embedders, force)?;
+    warn_chunk_size(&args.embedders, chunk_cfg);
+    warn_chunk_params_changed(&*args.store, chunk_cfg)?;
     args.store
         .set_meta("model.text", args.embedders.text.model_id())?;
+    args.store
+        .set_meta("chunk.max_tokens", &chunk_cfg.max_tokens.to_string())?;
+    args.store
+        .set_meta("chunk.overlap", &chunk_cfg.overlap.to_string())?;
     args.store
         .set_meta("dim.text", &args.embedders.text.dim().to_string())?;
     if let Some(image) = &args.embedders.image {
@@ -909,6 +915,50 @@ fn write_title_doc(
     Ok(())
 }
 
+/// Warn when a chunk is large enough to overflow the text model's input window.
+///
+/// Overflow is silent at every layer below this: the model truncates, the vector
+/// represents only the prefix it saw, and the store still holds — and `search
+/// --full` still prints — the whole chunk. The result is text that is listed as
+/// indexed but was never embedded.
+fn warn_chunk_size(embedders: &EmbedderSet, chunk_cfg: &chunker::ChunkConfig) {
+    let limit = embedders.text.max_input_tokens();
+    if embed::chunk_fits_model(chunk_cfg.max_tokens, limit) {
+        return;
+    }
+    let Some(limit) = limit else { return };
+    let estimate = (chunk_cfg.max_tokens as f32 * embed::TOKENS_PER_WORD_P90).round();
+    let fits = (limit as f32 / embed::TOKENS_PER_WORD_P90).floor();
+    eprintln!(
+        "warning: [chunk] max_tokens = {} counts words, which is about {estimate} tokens for \
+         '{}' — past its {limit}-token limit, so the tail of a full-size chunk is not embedded. \
+         Consider max_tokens = {fits} or lower.",
+        chunk_cfg.max_tokens,
+        embedders.text.model_id(),
+    );
+}
+
+/// Warn when the chunk parameters differ from the ones the existing index was
+/// built with.
+///
+/// Unlike a model change this is not a correctness problem — chunks of
+/// different sizes rank against each other perfectly well — so it warns instead
+/// of refusing. But only changed files are re-chunked, so without a rebuild the
+/// index keeps a mix of both sizes indefinitely, which is worth saying out loud.
+fn warn_chunk_params_changed(store: &dyn Store, chunk_cfg: &chunker::ChunkConfig) -> Result<()> {
+    let previous = store.get_meta("chunk.max_tokens")?;
+    if let Some(previous) = previous
+        && previous != chunk_cfg.max_tokens.to_string()
+    {
+        eprintln!(
+            "warning: index was chunked at max_tokens = {previous}, config now says {} — \
+             only changed files are re-chunked, so run `gnosis rebuild` to apply it everywhere.",
+            chunk_cfg.max_tokens,
+        );
+    }
+    Ok(())
+}
+
 /// Refuse to mix vectors from a different model into an existing index, for
 /// any embedder currently in use.
 fn guard_model(store: &dyn Store, embedders: &EmbedderSet, force: bool) -> Result<()> {
@@ -957,6 +1007,9 @@ mod tests {
     #[derive(Default)]
     struct FakeStore {
         written: Vec<String>,
+        /// `meta` writes, so tests can assert what `run` pinned. `set_meta`
+        /// takes `&self`, hence the cell.
+        meta: std::cell::RefCell<Vec<(String, String)>>,
         /// (path, kind) per persisted document.
         kinds: Vec<(String, String)>,
         /// (path, heading_path) per persisted chunk.
@@ -964,11 +1017,19 @@ mod tests {
     }
 
     impl Store for FakeStore {
-        fn set_meta(&self, _key: &str, _value: &str) -> Result<()> {
+        fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+            let mut meta = self.meta.borrow_mut();
+            meta.retain(|(k, _)| k != key);
+            meta.push((key.to_string(), value.to_string()));
             Ok(())
         }
-        fn get_meta(&self, _key: &str) -> Result<Option<String>> {
-            Ok(None)
+        fn get_meta(&self, key: &str) -> Result<Option<String>> {
+            Ok(self
+                .meta
+                .borrow()
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone()))
         }
         fn stats(&self) -> Result<Stats> {
             Ok(Stats::default())
@@ -1471,6 +1532,44 @@ mod tests {
             fail_fast,
             8,
         )
+    }
+
+    /// Chunk parameters have to be recorded, or a later run cannot tell that
+    /// the index was built with different ones. The design has claimed this
+    /// since the start; only the model was actually pinned.
+    #[test]
+    fn run_pins_the_chunk_parameters_it_used() {
+        let mut store = FakeStore::default();
+        let walker = mixed_kind_walker();
+        run_with(&walker, &mut store, false).expect("index");
+
+        let cfg = chunker::ChunkConfig::default();
+        assert_eq!(
+            store.get_meta("chunk.max_tokens").unwrap(),
+            Some(cfg.max_tokens.to_string())
+        );
+        assert_eq!(
+            store.get_meta("chunk.overlap").unwrap(),
+            Some(cfg.overlap.to_string())
+        );
+    }
+
+    /// Re-chunking at a new size is allowed — unlike a model change it does not
+    /// corrupt anything — so a second run with different parameters must still
+    /// succeed rather than bail the way `guard_model` does.
+    #[test]
+    fn run_accepts_a_chunk_size_change_without_failing() {
+        let mut store = FakeStore::default();
+        let walker = mixed_kind_walker();
+        run_with(&walker, &mut store, false).expect("first index");
+        store.set_meta("chunk.max_tokens", "9999").expect("seed");
+
+        run_with(&walker, &mut store, false).expect("a chunk size change must not be fatal");
+        assert_eq!(
+            store.get_meta("chunk.max_tokens").unwrap(),
+            Some(chunker::ChunkConfig::default().max_tokens.to_string()),
+            "the new size replaces the stored one"
+        );
     }
 
     #[test]

@@ -31,6 +31,39 @@ pub trait Embedder {
             .next()
             .ok_or_else(|| anyhow::anyhow!("embedding produced no vector"))
     }
+
+    /// Longest input the model accepts, in its own tokens. Anything past this
+    /// is silently dropped by the model, so content beyond it is indexed in
+    /// name only: searchable text that no vector represents.
+    ///
+    /// `None` means unknown, in which case callers must not warn about it.
+    fn max_input_tokens(&self) -> Option<usize> {
+        None
+    }
+}
+
+/// Measured BERT WordPiece tokens per whitespace word, over 268 chunk-sized
+/// windows drawn from BEIR scifact, BEIR nfcorpus and a real Obsidian vault:
+/// mean 1.54, p90 1.80, max 2.13.
+///
+/// The chunker counts words because it has no tokenizer; every embedding model
+/// here counts subword tokens. Sizing chunks in words therefore needs a
+/// conversion, and an approximate one is why `chunk_fits_model` warns rather
+/// than enforces. Using the model's own tokenizer for chunk sizing is the real
+/// fix and is still open.
+pub const TOKENS_PER_WORD_P90: f32 = 1.8;
+
+/// Whether `max_tokens` words will fit the model's window at the p90 token
+/// ratio, which is the conservative end — sizing to the mean leaves one chunk
+/// in ten truncated.
+///
+/// `None` (unknown window) is treated as fitting: better silent than crying
+/// wolf about a model whose limit gnosis does not know.
+pub fn chunk_fits_model(max_tokens: usize, model_limit: Option<usize>) -> bool {
+    match model_limit {
+        None => true,
+        Some(limit) => (max_tokens as f32 * TOKENS_PER_WORD_P90) <= limit as f32,
+    }
 }
 
 /// Text/image embedding configuration, shared by every `Embedder` implementor
@@ -134,6 +167,23 @@ mod tests {
     fn omitting_text_batch_size_keeps_the_default() {
         let cfg: TextEmbedConfig = toml::from_str("model = \"all-MiniLM-L6-v2\"\n").unwrap();
         assert_eq!(cfg.batch_size, TextEmbedConfig::default().batch_size);
+    }
+
+    #[test]
+    fn chunk_fits_model_is_conservative_about_the_token_ratio() {
+        // bge-small: 512 tokens. 256 words fits at the p90 ratio, 384 does not.
+        assert!(chunk_fits_model(256, Some(512)));
+        assert!(!chunk_fits_model(384, Some(512)));
+        // all-MiniLM-L6-v2: 256 tokens, so even a 256-word chunk overflows.
+        assert!(!chunk_fits_model(256, Some(256)));
+        assert!(chunk_fits_model(128, Some(256)));
+    }
+
+    /// A model whose window gnosis does not know must not produce a warning —
+    /// guessing wrong in the noisy direction trains people to ignore warnings.
+    #[test]
+    fn chunk_fits_model_treats_an_unknown_window_as_fitting() {
+        assert!(chunk_fits_model(100_000, None));
     }
 
     #[test]
