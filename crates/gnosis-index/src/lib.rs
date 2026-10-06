@@ -328,7 +328,7 @@ fn embed_markdown_chunks(
         })
         .collect();
 
-    let vectors = args.embedders.text.embed(&texts)?;
+    let vectors = args.embedders.text.embed_document(&texts)?;
 
     let chunk_writes: Vec<ChunkWrite> = chunks
         .iter()
@@ -482,7 +482,7 @@ fn embed_pdf_chunks(
         .iter()
         .map(|c| format!("{}\n{}", c.heading_path, c.text))
         .collect();
-    let vectors = args.embedders.text.embed(&texts)?;
+    let vectors = args.embedders.text.embed_document(&texts)?;
 
     let chunk_writes: Vec<ChunkWrite> = chunks
         .iter()
