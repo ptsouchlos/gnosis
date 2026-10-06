@@ -16,7 +16,8 @@ pub use store::{Space, Store, TextQuery};
 use usearch::{Index, IndexOptions, Key, MetricKind, ScalarKind};
 
 /// Bumped whenever the schema changes in a backward-incompatible way.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// Bumped whenever the lexical index's contents would differ — a changed
 /// tokenizer, or a change to which chunks are indexed — to force a rebuild on
@@ -139,22 +140,38 @@ impl SqliteStore {
     }
 
     fn init_schema(&self) -> Result<()> {
+        // First, before any DDL: an existing database still has the
+        // absolute-path `documents`, and the batch below indexes `root_id`,
+        // which that table does not have yet. `CREATE TABLE IF NOT EXISTS`
+        // would not have fixed it either — it is a no-op against a table that
+        // exists in the wrong shape.
+        self.migrate_paths_to_roots()?;
+
         self.conn.execute_batch(
             r#"
+            -- One row per indexed vault root. Documents reference it instead of
+            -- repeating the root on every row, which is what makes the rows
+            -- portable: moving a vault means rewriting one string here.
+            CREATE TABLE IF NOT EXISTS roots (
+                id   INTEGER PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE               -- canonical absolute vault root
+            );
+
             CREATE TABLE IF NOT EXISTS documents (
                 id           INTEGER PRIMARY KEY,
-                path         TEXT NOT NULL UNIQUE,
+                root_id      INTEGER NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
+                rel_path     TEXT NOT NULL,            -- vault-relative, '/'-separated
                 kind         TEXT NOT NULL,           -- markdown | image | pdf
-                source_root  TEXT NOT NULL,           -- canonical vault root
                 content_hash BLOB NOT NULL,
                 mtime        INTEGER NOT NULL,
                 title        TEXT,
                 frontmatter  TEXT,                    -- JSON
                 indexed_at   INTEGER NOT NULL,
                 width        INTEGER,                 -- image documents only
-                height       INTEGER                  -- image documents only
+                height       INTEGER,                 -- image documents only
+                UNIQUE(root_id, rel_path)
             );
-            CREATE INDEX IF NOT EXISTS idx_documents_root ON documents(source_root);
+            CREATE INDEX IF NOT EXISTS idx_documents_root ON documents(root_id);
 
             CREATE TABLE IF NOT EXISTS chunks (
                 id           INTEGER PRIMARY KEY,
@@ -197,15 +214,109 @@ impl SqliteStore {
             "#,
         )?;
 
+        // Reads go through this view, so every `SELECT` keeps the column names
+        // it had when paths were stored absolutely. Joining with '/' is correct
+        // on Windows too — Win32 accepts forward slashes — and keeps `rel_path`
+        // identical across platforms, which is the point of storing it at all.
+        self.conn.execute_batch(
+            r#"
+            CREATE VIEW IF NOT EXISTS documents_abs AS
+            SELECT d.id, d.kind, d.content_hash, d.mtime, d.title, d.frontmatter,
+                   d.indexed_at, d.width, d.height, d.root_id, d.rel_path,
+                   r.path AS source_root,
+                   r.path || '/' || d.rel_path AS path
+            FROM documents d JOIN roots r ON r.id = d.root_id;
+            "#,
+        )?;
+
         self.conn.execute_batch(LEXICAL_INDEX_DDL)?;
         self.ensure_lexical_index()?;
 
         self.ensure_column("documents", "width", "width INTEGER")?;
         self.ensure_column("documents", "height", "height INTEGER")?;
 
-        self.set_meta("schema_version", &SCHEMA_VERSION.to_string())?;
+        self.set_meta(SCHEMA_VERSION_KEY, &SCHEMA_VERSION.to_string())?;
         Ok(())
     }
+
+    /// Move an absolute-path `documents` table to `(root_id, rel_path)`.
+    ///
+    /// Detection is by column presence rather than by the `schema_version`
+    /// marker, because the marker records what the writer *intended* and a
+    /// shape is what the reader actually has. Three bugs in this codebase came
+    /// from trusting a version marker over the table it described.
+    ///
+    /// `chunks`, `links` and `tags` all reference `documents(id)` with
+    /// `ON DELETE CASCADE`, and `foreign_keys` is on — so dropping the old
+    /// table with constraints enforced would delete every chunk in the
+    /// database. Hence the pragma dance, and hence `migration_preserves_chunks`.
+    fn migrate_paths_to_roots(&self) -> Result<()> {
+        let has_legacy_path = self
+            .conn
+            .prepare("PRAGMA table_info(documents)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|c| c == "path");
+        if !has_legacy_path {
+            return Ok(());
+        }
+
+        self.conn.pragma_update(None, "foreign_keys", false)?;
+        let result = self.conn.execute_batch(
+            r#"
+            BEGIN;
+            CREATE TABLE IF NOT EXISTS roots (
+                id   INTEGER PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE
+            );
+            INSERT OR IGNORE INTO roots(path) SELECT DISTINCT source_root FROM documents;
+
+            CREATE TABLE documents_migrated (
+                id           INTEGER PRIMARY KEY,
+                root_id      INTEGER NOT NULL REFERENCES roots(id) ON DELETE CASCADE,
+                rel_path     TEXT NOT NULL,
+                kind         TEXT NOT NULL,
+                content_hash BLOB NOT NULL,
+                mtime        INTEGER NOT NULL,
+                title        TEXT,
+                frontmatter  TEXT,
+                indexed_at   INTEGER NOT NULL,
+                width        INTEGER,
+                height       INTEGER,
+                UNIQUE(root_id, rel_path)
+            );
+
+            -- `id` is carried across verbatim: chunks.doc_id points at it.
+            -- substr(path, len(root) + 2) drops the root and its separator.
+            INSERT INTO documents_migrated
+                (id, root_id, rel_path, kind, content_hash, mtime, title,
+                 frontmatter, indexed_at, width, height)
+            SELECT d.id, r.id, substr(d.path, length(r.path) + 2), d.kind,
+                   d.content_hash, d.mtime, d.title, d.frontmatter,
+                   d.indexed_at, d.width, d.height
+            FROM documents d JOIN roots r ON r.path = d.source_root;
+
+            DROP TABLE documents;
+            ALTER TABLE documents_migrated RENAME TO documents;
+            CREATE INDEX IF NOT EXISTS idx_documents_root ON documents(root_id);
+            COMMIT;
+            "#,
+        );
+        self.conn.pragma_update(None, "foreign_keys", true)?;
+        result.context("migrating documents to vault-relative paths")?;
+
+        // Dropping the old table leaves its pages free but does not shrink the
+        // file, and the reclaimed space is a stated benefit of this change — so
+        // vacuum once, here, rather than leaving every existing index 13%
+        // larger than it needs to be forever. Must be outside a transaction.
+        self.conn
+            .execute_batch("VACUUM;")
+            .context("vacuuming after the path migration")?;
+        Ok(())
+    }
+
+
 
     /// Add `column` to `table` if it isn't already present. `CREATE TABLE IF
     /// NOT EXISTS` only helps brand-new databases; existing ones need an
@@ -231,7 +342,7 @@ impl SqliteStore {
     /// param types in `candidates_by_ids`).
     fn paths_with_any_tag(&self, tags: &[String]) -> Result<HashSet<String>> {
         let sql = format!(
-            "SELECT DISTINCT d.path FROM tags t JOIN documents d ON d.id = t.doc_id
+            "SELECT DISTINCT d.path FROM tags t JOIN documents_abs d ON d.id = t.doc_id
              WHERE t.tag IN ({})",
             in_placeholders(tags.len())
         );
@@ -335,7 +446,7 @@ impl SqliteStore {
         let mut sql = String::from(
             "SELECT d.path, d.title, d.source_root, c.heading_path, c.text, c.vector,
                     d.width, d.height, c.modality
-             FROM chunks c JOIN documents d ON d.id = c.doc_id
+             FROM chunks c JOIN documents_abs d ON d.id = c.doc_id
              WHERE c.space = ? AND c.vector IS NOT NULL",
         );
         if modality.is_some() {
@@ -379,7 +490,7 @@ impl SqliteStore {
         let sql = format!(
             "SELECT d.path, d.title, d.source_root, c.heading_path, c.text, c.vector,
                     d.width, d.height, c.modality
-             FROM chunks c JOIN documents d ON d.id = c.doc_id
+             FROM chunks c JOIN documents_abs d ON d.id = c.doc_id
              WHERE c.id IN ({})",
             in_placeholders(ids.len())
         );
@@ -602,7 +713,7 @@ impl Store for SqliteStore {
         let hash = self
             .conn
             .query_row(
-                "SELECT content_hash FROM documents WHERE path = ?1",
+                "SELECT content_hash FROM documents_abs WHERE path = ?1",
                 [path],
                 |r| r.get::<_, Vec<u8>>(0),
             )
@@ -615,7 +726,7 @@ impl Store for SqliteStore {
             return Ok(Vec::new());
         }
         let placeholders = in_placeholders(roots.len());
-        let sql = format!("SELECT path FROM documents WHERE source_root IN ({placeholders})");
+        let sql = format!("SELECT path FROM documents_abs WHERE source_root IN ({placeholders})");
         let mut stmt = self.conn.prepare(&sql)?;
         let paths = stmt
             .query_map(rusqlite::params_from_iter(roots), |r| {
@@ -627,8 +738,8 @@ impl Store for SqliteStore {
 
     fn counts_by_root(&self) -> Result<Vec<(String, i64)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT source_root, COUNT(*) FROM documents
-             GROUP BY source_root ORDER BY source_root",
+            "SELECT r.path, COUNT(d.id) FROM roots r JOIN documents d ON d.root_id = r.id
+             GROUP BY r.path ORDER BY r.path",
         )?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
@@ -637,21 +748,27 @@ impl Store for SqliteStore {
     }
 
     fn delete_by_root(&self, root: &str) -> Result<usize> {
-        let n = self
-            .conn
-            .execute("DELETE FROM documents WHERE source_root = ?1", [root])?;
+        let n = self.conn.execute(
+            "DELETE FROM documents WHERE root_id = (SELECT id FROM roots WHERE path = ?1)",
+            [root],
+        )?;
+        // The root row itself goes too, so `counts_by_root` and `status` do not
+        // list a vault with nothing in it.
+        self.conn
+            .execute("DELETE FROM roots WHERE path = ?1", [root])?;
         Ok(n)
     }
 
     fn replace_document(&mut self, doc: &DocWrite<'_>) -> Result<()> {
         let tx = self.conn.transaction()?;
+        let root_id = root_id_for(&tx, doc.source_root)?;
+        let rel_path = relative_to_root(doc.path, doc.source_root);
         tx.execute(
             "INSERT INTO documents
-                (path, kind, source_root, content_hash, mtime, title, frontmatter, indexed_at, width, height)
+                (root_id, rel_path, kind, content_hash, mtime, title, frontmatter, indexed_at, width, height)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(path) DO UPDATE SET
+             ON CONFLICT(root_id, rel_path) DO UPDATE SET
                 kind = excluded.kind,
-                source_root = excluded.source_root,
                 content_hash = excluded.content_hash,
                 mtime = excluded.mtime,
                 title = excluded.title,
@@ -660,9 +777,9 @@ impl Store for SqliteStore {
                 width = excluded.width,
                 height = excluded.height",
             rusqlite::params![
-                doc.path,
+                root_id,
+                rel_path,
                 doc.kind,
-                doc.source_root,
                 doc.content_hash,
                 doc.mtime,
                 doc.title,
@@ -673,10 +790,11 @@ impl Store for SqliteStore {
             ],
         )?;
 
-        let doc_id: i64 =
-            tx.query_row("SELECT id FROM documents WHERE path = ?1", [doc.path], |r| {
-                r.get(0)
-            })?;
+        let doc_id: i64 = tx.query_row(
+            "SELECT id FROM documents WHERE root_id = ?1 AND rel_path = ?2",
+            rusqlite::params![root_id, rel_path],
+            |r| r.get(0),
+        )?;
 
         tx.execute("DELETE FROM chunks WHERE doc_id = ?1", [doc_id])?;
         tx.execute("DELETE FROM links WHERE src_doc = ?1", [doc_id])?;
@@ -718,8 +836,10 @@ impl Store for SqliteStore {
     }
 
     fn delete_document(&self, path: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM documents WHERE path = ?1", [path])?;
+        self.conn.execute(
+            "DELETE FROM documents WHERE id = (SELECT id FROM documents_abs WHERE path = ?1)",
+            [path],
+        )?;
         Ok(())
     }
 
@@ -756,7 +876,7 @@ impl Store for SqliteStore {
                     d.width, d.height, c.modality
              FROM chunks_fts f
              JOIN chunks c ON c.id = f.rowid
-             JOIN documents d ON d.id = c.doc_id
+             JOIN documents_abs d ON d.id = c.doc_id
              WHERE chunks_fts MATCH ?",
         );
         let roots = filter.from.filter(|f| !f.is_empty());
@@ -819,7 +939,7 @@ impl Store for SqliteStore {
 
     fn chunk_vectors(&self, path: &str, space: Space) -> Result<Vec<Vec<f32>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT c.vector FROM chunks c JOIN documents d ON d.id = c.doc_id
+            "SELECT c.vector FROM chunks c JOIN documents_abs d ON d.id = c.doc_id
              WHERE c.space = ?1 AND c.vector IS NOT NULL AND d.path = ?2",
         )?;
         let vectors = stmt
@@ -833,7 +953,7 @@ impl Store for SqliteStore {
 
     fn linked_targets(&self, path: &str) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT l.dst_path FROM links l JOIN documents d ON d.id = l.src_doc
+            "SELECT l.dst_path FROM links l JOIN documents_abs d ON d.id = l.src_doc
              WHERE d.path = ?1",
         )?;
         let targets = stmt
@@ -843,7 +963,7 @@ impl Store for SqliteStore {
     }
 
     fn all_document_meta(&self) -> Result<Vec<(String, Option<String>)>> {
-        let mut stmt = self.conn.prepare("SELECT path, frontmatter FROM documents")?;
+        let mut stmt = self.conn.prepare("SELECT path, frontmatter FROM documents_abs")?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -897,6 +1017,28 @@ impl Store for SqliteStore {
     }
 }
 
+/// `roots.id` for `root`, inserting the row if this is its first document.
+fn root_id_for(tx: &rusqlite::Transaction<'_>, root: &str) -> Result<i64> {
+    tx.execute("INSERT OR IGNORE INTO roots(path) VALUES (?1)", [root])?;
+    let id = tx.query_row("SELECT id FROM roots WHERE path = ?1", [root], |r| r.get(0))?;
+    Ok(id)
+}
+
+/// Strip `root` and its separator from `path`, normalizing to '/' so the stored
+/// value is identical whichever platform produced it.
+///
+/// Falls back to the whole path when it does not sit under `root`. That should
+/// not happen — the indexer canonicalizes both — and silently storing an
+/// absolute value is better than losing the document, since the view will then
+/// produce a visibly wrong path rather than a missing row.
+fn relative_to_root(path: &str, root: &str) -> String {
+    let stripped = path
+        .strip_prefix(root)
+        .map(|rest| rest.trim_start_matches(['/', '\\']))
+        .unwrap_or(path);
+    stripped.replace('\\', "/")
+}
+
 /// Build `?,?,...` placeholders for an SQL `IN` clause of length `n`.
 fn in_placeholders(n: usize) -> String {
     std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
@@ -939,6 +1081,238 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("gnosis.db");
         (SqliteStore::open(&path).unwrap(), dir)
+    }
+
+    #[test]
+    fn relative_to_root_strips_the_root_and_normalizes_separators() {
+        assert_eq!(relative_to_root("/vault/a/b.md", "/vault"), "a/b.md");
+        assert_eq!(relative_to_root("/vault/b.md", "/vault/"), "b.md");
+        assert_eq!(
+            relative_to_root(r"C:\vault\a\b.md", r"C:\vault"),
+            "a/b.md",
+            "a stored rel_path must be identical whichever platform wrote it"
+        );
+    }
+
+    /// Should not happen — the indexer canonicalizes both sides — but losing the
+    /// document would be worse than storing something visibly wrong.
+    #[test]
+    fn relative_to_root_keeps_a_path_outside_the_root() {
+        assert_eq!(relative_to_root("/elsewhere/x.md", "/vault"), "/elsewhere/x.md");
+    }
+
+    #[test]
+    fn documents_are_stored_relative_with_one_row_per_root() {
+        let (mut store, dir) = temp_store();
+        write_doc(&mut store, "/vault/a.md", "/vault");
+        write_doc(&mut store, "/vault/nested/b.md", "/vault");
+
+        let rels: Vec<String> = store
+            .conn
+            .prepare("SELECT rel_path FROM documents ORDER BY rel_path")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rels, vec!["a.md".to_string(), "nested/b.md".to_string()]);
+
+        let roots: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM roots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(roots, 1, "the root is stored once, not once per document");
+
+        // Callers still see absolute paths: the storage changed, not the API.
+        let paths = store.paths_for_roots(&["/vault".to_string()]).unwrap();
+        assert!(paths.contains(&"/vault/nested/b.md".to_string()), "got {paths:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn all_document_meta_returns_absolute_paths() {
+        let (mut store, dir) = temp_store();
+        write_doc(&mut store, "/vault/a.md", "/vault");
+        let meta = store.all_document_meta().unwrap();
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta[0].0, "/vault/a.md");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn forgetting_a_root_removes_the_root_row_too() {
+        let (mut store, dir) = temp_store();
+        write_doc(&mut store, "/vault/a.md", "/vault");
+        write_doc(&mut store, "/other/b.md", "/other");
+        assert_eq!(store.delete_by_root("/vault").unwrap(), 1);
+
+        let remaining: Vec<String> = store
+            .counts_by_root()
+            .unwrap()
+            .into_iter()
+            .map(|(root, _)| root)
+            .collect();
+        assert_eq!(
+            remaining,
+            vec!["/other".to_string()],
+            "a forgotten vault must not linger as an empty root"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Build the pre-migration schema by hand and open it.
+    ///
+    /// This is the shape of test that three earlier bugs in this file needed and
+    /// did not have: a freshly created store always has the current schema, so
+    /// no upgrade path is exercised unless a test writes the old one out.
+    fn legacy_store(dir: &Path) -> PathBuf {
+        let db = dir.join("gnosis.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE documents (
+                id           INTEGER PRIMARY KEY,
+                path         TEXT NOT NULL UNIQUE,
+                kind         TEXT NOT NULL,
+                source_root  TEXT NOT NULL,
+                content_hash BLOB NOT NULL,
+                mtime        INTEGER NOT NULL,
+                title        TEXT,
+                frontmatter  TEXT,
+                indexed_at   INTEGER NOT NULL,
+                width        INTEGER,
+                height       INTEGER
+            );
+            CREATE TABLE chunks (
+                id           INTEGER PRIMARY KEY,
+                doc_id       INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                ord          INTEGER NOT NULL,
+                space        TEXT NOT NULL,
+                modality     TEXT NOT NULL,
+                text         TEXT,
+                heading_path TEXT,
+                vector       BLOB
+            );
+            CREATE TABLE links (src_doc INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, dst_path TEXT NOT NULL);
+            CREATE TABLE tags (doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, tag TEXT NOT NULL);
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+            INSERT INTO documents (id, path, kind, source_root, content_hash, mtime, title, indexed_at)
+            VALUES (7, '/home/alex/vault/note.md', 'markdown', '/home/alex/vault', x'00', 0, 'Note', 0),
+                   (9, '/home/alex/vault/deep/other.md', 'markdown', '/home/alex/vault', x'00', 0, 'Other', 0);
+            INSERT INTO chunks (doc_id, ord, space, modality, text, heading_path)
+            VALUES (7, 0, 'text', 'text', 'body of the note', ''),
+                   (9, 0, 'text', 'text', 'body of the other', '');
+            INSERT INTO tags (doc_id, tag) VALUES (7, 'project');
+            "#,
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn migration_rewrites_paths_relative_and_keeps_document_ids() {
+        let dir = std::env::temp_dir()
+            .join(format!("gnosis-migrate-{}-{}", std::process::id(), rand_suffix()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = legacy_store(&dir);
+
+        let store = SqliteStore::open(&db).unwrap();
+
+        let rows: Vec<(i64, String)> = store
+            .conn
+            .prepare("SELECT id, rel_path FROM documents ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(7, "note.md".to_string()), (9, "deep/other.md".to_string())],
+            "ids must survive verbatim — chunks.doc_id points at them"
+        );
+
+        // The view has to reproduce exactly what callers used to read.
+        let paths: Vec<String> = store
+            .conn
+            .prepare("SELECT path FROM documents_abs ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                "/home/alex/vault/note.md".to_string(),
+                "/home/alex/vault/deep/other.md".to_string()
+            ]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `chunks`, `links` and `tags` cascade from `documents(id)` and
+    /// `foreign_keys` is on, so dropping the old table with constraints enforced
+    /// would delete every chunk in the database — a total, silent data loss that
+    /// still leaves a working-looking index behind.
+    #[test]
+    fn migration_preserves_chunks_despite_cascading_foreign_keys() {
+        let dir = std::env::temp_dir()
+            .join(format!("gnosis-migrate-fk-{}-{}", std::process::id(), rand_suffix()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = legacy_store(&dir);
+
+        let store = SqliteStore::open(&db).unwrap();
+
+        let chunks: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(chunks, 2, "the migration must not cascade-delete chunks");
+        let tags: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tags, 1, "nor tags");
+
+        // And the migrated rows are still reachable the way callers reach them.
+        assert!(
+            store
+                .document_hash("/home/alex/vault/note.md")
+                .unwrap()
+                .is_some(),
+            "a migrated document must be findable by its absolute path"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Opening twice must be a no-op the second time: the migration keys off the
+    /// table's shape, so it has to recognize its own output.
+    #[test]
+    fn migration_is_idempotent_across_reopens() {
+        let dir = std::env::temp_dir()
+            .join(format!("gnosis-migrate-twice-{}-{}", std::process::id(), rand_suffix()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = legacy_store(&dir);
+
+        drop(SqliteStore::open(&db).unwrap());
+        let store = SqliteStore::open(&db).unwrap();
+
+        let docs: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(docs, 2);
+        let roots: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM roots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(roots, 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn rand_suffix() -> u64 {
