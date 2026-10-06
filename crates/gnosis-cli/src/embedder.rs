@@ -13,6 +13,8 @@ pub struct TextEmbedder {
     /// Instruction prepended to a search query, empty when the model wants
     /// none or the user turned it off. See `Embedder::embed_query`.
     query_prefix: &'static str,
+    /// Prepended to indexed content, empty unless the model instructs documents.
+    document_prefix: &'static str,
     /// Longest input the model accepts, in its own tokens.
     max_input_tokens: usize,
     /// Chunks per model call. Bounds ONNX activation memory, which scales with
@@ -23,8 +25,9 @@ pub struct TextEmbedder {
 impl TextEmbedder {
     /// Construct from a config model name. Downloads/caches the model on first use.
     pub fn new(model_name: &str, batch_size: usize, query_instruction: bool) -> Result<Self> {
-        let (model, dim, _, max_input_tokens) = resolve_text_model(model_name)?;
-        let prefix = resolve_query_prefix(model_name, query_instruction)?;
+        let resolved = resolve_text_model(model_name)?;
+        let (model, dim, max_input_tokens) = (resolved.model, resolved.dim, resolved.max_input_tokens);
+        let (query_prefix, document_prefix) = resolve_prefixes(model_name, query_instruction)?;
         let mut opts = InitOptions::new(model);
         if let Some(dir) = model_cache_dir() {
             std::fs::create_dir_all(&dir).ok();
@@ -35,7 +38,8 @@ impl TextEmbedder {
             model: embedding,
             model_id: model_name.to_string(),
             dim,
-            query_prefix: prefix,
+            query_prefix,
+            document_prefix,
             max_input_tokens,
             batch_size: batch_size.max(1),
         })
@@ -91,50 +95,119 @@ impl Embedder for TextEmbedder {
             .next()
             .context("embedding produced no vector")
     }
+
+    fn embed_document(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        if self.document_prefix.is_empty() {
+            return self.embed(inputs);
+        }
+        let prefixed: Vec<String> = inputs
+            .iter()
+            .map(|text| format!("{}{text}", self.document_prefix))
+            .collect();
+        self.embed(&prefixed)
+    }
 }
 
-/// The query-side instruction each model was trained with, or `""` for a
-/// symmetric model. fastembed applies none of these itself — it embeds queries
-/// and documents identically — so gnosis has to carry them.
-///
-/// BAAI's for the bge English v1.5 family; nomic's `search_query:`/
-/// `search_document:` pair, where the document side is *also* required, so it
-/// stays empty until indexing can prefix documents too. `all-MiniLM-L6-v2` is
-/// symmetric and wants nothing.
+/// BAAI's query-side instruction for the bge English v1.5 family. Queries only;
+/// documents get nothing.
 const BGE_EN_QUERY_INSTRUCTION: &str = "Represent this sentence for searching relevant passages: ";
 
-/// A resolved text model: fastembed enum, dimensionality, query instruction,
-/// and the longest input it accepts in its own tokens.
-type TextModel = (EmbeddingModel, usize, &'static str, usize);
+/// The E5 family's prefixes. Unlike bge, E5 instructs *both* sides, with
+/// different text on each, and omitting either is a material quality loss.
+const E5_QUERY_PREFIX: &str = "query: ";
+const E5_DOCUMENT_PREFIX: &str = "passage: ";
 
-/// Map a config model name to its fastembed enum, dimensionality, query
-/// instruction, and input limit.
+/// A resolved text model.
+///
+/// fastembed applies no prefixes of its own — it embeds queries and documents
+/// identically — so gnosis carries each model's own conventions here. This is
+/// the single source of truth for them: a model added to the table below cannot
+/// silently lose its prefixes or its input limit.
+struct TextModel {
+    model: EmbeddingModel,
+    dim: usize,
+    /// Prepended to a search query. Empty for a symmetric model.
+    query_prefix: &'static str,
+    /// Prepended to indexed content. Empty unless the model instructs documents
+    /// too, which only the E5 family does among those supported.
+    document_prefix: &'static str,
+    /// Longest input accepted, in the model's own tokens.
+    max_input_tokens: usize,
+}
+
+/// Every text model gnosis accepts in `[embed.text] model`.
+///
+/// `nomic-embed-text-v1.5` wants a `search_query:`/`search_document:` pair that
+/// is not filled in here: it is 768d and untested, so it keeps its historical
+/// prefix-free behavior rather than gaining an unmeasured change.
 fn resolve_text_model(name: &str) -> Result<TextModel> {
     let m = match name {
-        "bge-small-en-v1.5" => (EmbeddingModel::BGESmallENV15, 384, BGE_EN_QUERY_INSTRUCTION, 512),
-        "bge-small-en-v1.5-q" => (EmbeddingModel::BGESmallENV15Q, 384, BGE_EN_QUERY_INSTRUCTION, 512),
-        "bge-base-en-v1.5" => (EmbeddingModel::BGEBaseENV15, 768, BGE_EN_QUERY_INSTRUCTION, 512),
-        "all-MiniLM-L6-v2" => (EmbeddingModel::AllMiniLML6V2, 384, "", 256),
-        "nomic-embed-text-v1.5" => (EmbeddingModel::NomicEmbedTextV15, 768, "", 8192),
+        "bge-small-en-v1.5" => TextModel {
+            model: EmbeddingModel::BGESmallENV15,
+            dim: 384,
+            query_prefix: BGE_EN_QUERY_INSTRUCTION,
+            document_prefix: "",
+            max_input_tokens: 512,
+        },
+        "bge-small-en-v1.5-q" => TextModel {
+            model: EmbeddingModel::BGESmallENV15Q,
+            dim: 384,
+            query_prefix: BGE_EN_QUERY_INSTRUCTION,
+            document_prefix: "",
+            max_input_tokens: 512,
+        },
+        "bge-base-en-v1.5" => TextModel {
+            model: EmbeddingModel::BGEBaseENV15,
+            dim: 768,
+            query_prefix: BGE_EN_QUERY_INSTRUCTION,
+            document_prefix: "",
+            max_input_tokens: 512,
+        },
+        "all-MiniLM-L6-v2" => TextModel {
+            model: EmbeddingModel::AllMiniLML6V2,
+            dim: 384,
+            query_prefix: "",
+            document_prefix: "",
+            max_input_tokens: 256,
+        },
+        "nomic-embed-text-v1.5" => TextModel {
+            model: EmbeddingModel::NomicEmbedTextV15,
+            dim: 768,
+            query_prefix: "",
+            document_prefix: "",
+            max_input_tokens: 8192,
+        },
+        // Multilingual, and 384d like the default — so it costs no extra disk,
+        // no larger ANN index, and nothing downstream has to stop assuming 384.
+        "multilingual-e5-small" => TextModel {
+            model: EmbeddingModel::MultilingualE5Small,
+            dim: 384,
+            query_prefix: E5_QUERY_PREFIX,
+            document_prefix: E5_DOCUMENT_PREFIX,
+            max_input_tokens: 512,
+        },
         other => bail!(
             "unknown text model '{other}' (try: bge-small-en-v1.5, bge-small-en-v1.5-q, \
-             bge-base-en-v1.5, all-MiniLM-L6-v2, nomic-embed-text-v1.5)"
+             bge-base-en-v1.5, all-MiniLM-L6-v2, nomic-embed-text-v1.5, \
+             multilingual-e5-small)"
         ),
     };
     Ok(m)
 }
 
-/// The query instruction to prepend for `model_name`, or `""` when the model is
-/// symmetric or the user disabled the behavior.
+/// The `(query, document)` prefixes to use for `model_name`, both empty when the
+/// user disabled the behavior.
 ///
-/// Reads the instruction out of `resolve_text_model`'s table rather than keeping
-/// a second list of model names, so a model added there cannot silently lose
-/// its instruction.
-fn resolve_query_prefix(model_name: &str, enabled: bool) -> Result<&'static str> {
+/// Both sides are gated by the one `query_instruction` setting on purpose. They
+/// are not independent: an index built with document prefixes and queried
+/// without them (or the reverse) is measuring one convention against another,
+/// which is worse than using neither.
+fn resolve_prefixes(model_name: &str, enabled: bool) -> Result<(&'static str, &'static str)> {
+    let resolved = resolve_text_model(model_name)?;
     if !enabled {
-        return Ok("");
+        return Ok(("", ""));
     }
-    Ok(resolve_text_model(model_name)?.2)
+    Ok((resolved.query_prefix, resolved.document_prefix))
 }
 
 /// Image embedder backed by a local fastembed (ONNX) CLIP vision model.
@@ -274,33 +347,57 @@ mod tests {
 
     #[test]
     fn resolve_text_model_recognizes_quantized_bge_small() {
-        let (model, dim, _, _) = resolve_text_model("bge-small-en-v1.5-q").expect("known model name");
-        assert_eq!(model, EmbeddingModel::BGESmallENV15Q);
-        assert_eq!(dim, 384);
+        let resolved = resolve_text_model("bge-small-en-v1.5-q").expect("known model name");
+        assert_eq!(resolved.model, EmbeddingModel::BGESmallENV15Q);
+        assert_eq!(resolved.dim, 384);
     }
 
     #[test]
-    fn bge_models_carry_a_query_instruction_and_symmetric_ones_do_not() {
+    fn bge_instructs_queries_only_and_symmetric_models_neither_side() {
         for bge in ["bge-small-en-v1.5", "bge-small-en-v1.5-q", "bge-base-en-v1.5"] {
             assert_eq!(
-                resolve_query_prefix(bge, true).expect("known model"),
-                BGE_EN_QUERY_INSTRUCTION,
-                "{bge} is asymmetric and wants its instruction"
+                resolve_prefixes(bge, true).expect("known model"),
+                (BGE_EN_QUERY_INSTRUCTION, ""),
+                "{bge} instructs the query side only"
             );
         }
         assert_eq!(
-            resolve_query_prefix("all-MiniLM-L6-v2", true).expect("known model"),
-            "",
-            "a symmetric model must not get an instruction"
+            resolve_prefixes("all-MiniLM-L6-v2", true).expect("known model"),
+            ("", ""),
+            "a symmetric model must not get an instruction on either side"
+        );
+    }
+
+    /// E5 is the reason `embed_document` exists: it is the first supported model
+    /// that instructs documents, and with different text from its queries.
+    #[test]
+    fn e5_instructs_both_sides_with_different_text() {
+        let (query, document) = resolve_prefixes("multilingual-e5-small", true).expect("known model");
+        assert_eq!(query, "query: ");
+        assert_eq!(document, "passage: ");
+        assert_ne!(query, document);
+    }
+
+    #[test]
+    fn multilingual_e5_small_keeps_the_default_dimensionality() {
+        let resolved = resolve_text_model("multilingual-e5-small").expect("known model");
+        assert_eq!(
+            resolved.dim, 384,
+            "384d is why this model costs no extra disk or ANN index"
         );
     }
 
     #[test]
-    fn disabling_query_instruction_clears_it_even_for_a_model_that_wants_one() {
+    fn disabling_query_instruction_clears_both_sides() {
         assert_eq!(
-            resolve_query_prefix("bge-small-en-v1.5", false).expect("known model"),
-            "",
+            resolve_prefixes("bge-small-en-v1.5", false).expect("known model"),
+            ("", ""),
             "query_instruction = false must reproduce pre-instruction behavior exactly"
+        );
+        assert_eq!(
+            resolve_prefixes("multilingual-e5-small", false).expect("known model"),
+            ("", ""),
+            "both sides are gated together: a half-applied convention is worse than none"
         );
     }
 
@@ -340,6 +437,61 @@ mod tests {
 
         let norm: f32 = q_with.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-3, "expected unit norm, got {norm}");
+    }
+
+    /// `embed_document` has to prefix documents for a model that asks for it and
+    /// leave them alone for a model that does not — getting this backwards would
+    /// be invisible in any single-model test.
+    ///
+    /// Network-gated. Run with: cargo test --release -- --ignored --nocapture
+    #[test]
+    #[ignore = "downloads models and runs inference"]
+    fn document_prefix_applies_only_where_the_model_asks_for_it() {
+        let docs = vec!["the capital of Kenya is Nairobi".to_string()];
+
+        let mut e5 = TextEmbedder::new("multilingual-e5-small", 16, true).expect("load e5");
+        assert_ne!(
+            e5.embed_document(&docs).expect("embed")[0],
+            e5.embed(&docs).expect("embed")[0],
+            "E5 asks for a document prefix, so embed_document must differ from embed"
+        );
+
+        let mut bge = TextEmbedder::new("bge-small-en-v1.5", 16, true).expect("load bge");
+        assert_eq!(
+            bge.embed_document(&docs).expect("embed")[0],
+            bge.embed(&docs).expect("embed")[0],
+            "bge instructs queries only, so embed_document must be a pass-through"
+        );
+    }
+
+    /// The capability this model is being added for: text in one language has to
+    /// land near its translation and far from an unrelated sentence. An
+    /// English-only model fails this, which is the whole point.
+    ///
+    /// Network-gated. Run with: cargo test --release -- --ignored --nocapture
+    #[test]
+    #[ignore = "downloads model and runs inference"]
+    fn multilingual_e5_aligns_across_languages() {
+        let mut e5 = TextEmbedder::new("multilingual-e5-small", 16, true).expect("load model");
+        assert_eq!(e5.dim(), 384);
+
+        let inputs = vec![
+            "query: where is the capital of Kenya".to_string(),
+            "passage: Nairobi ni mji mkuu wa Kenya".to_string(),
+            "passage: ich habe gestern ein Fahrrad gekauft".to_string(),
+        ];
+        let v = e5.embed(&inputs).expect("embed");
+
+        let norm: f32 = v[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-3, "expected unit norm, got {norm}");
+
+        let aligned = cosine(&v[0], &v[1]);
+        let unrelated = cosine(&v[0], &v[2]);
+        println!("cos(en,sw_answer)={aligned:.4}  cos(en,de_unrelated)={unrelated:.4}");
+        assert!(
+            aligned > unrelated,
+            "cross-lingual alignment failed: {aligned} !> {unrelated}"
+        );
     }
 
     /// Loads the real model (downloads on first run), so it's network-gated and

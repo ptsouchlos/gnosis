@@ -32,6 +32,19 @@ pub trait Embedder {
             .ok_or_else(|| anyhow::anyhow!("embedding produced no vector"))
     }
 
+    /// Embed indexed content, as opposed to a search query.
+    ///
+    /// The counterpart to `embed_query`. Some asymmetric models want an
+    /// instruction on *both* sides with different text on each — the E5 family
+    /// uses `"query: "` and `"passage: "` — and omitting the document side is a
+    /// material quality loss, not a nicety.
+    ///
+    /// Defaults to `embed`, so a model that wants nothing on the document side
+    /// (`bge`, which instructs only queries) implements nothing.
+    fn embed_document(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.embed(inputs)
+    }
+
     /// Longest input the model accepts, in its own tokens. Anything past this
     /// is silently dropped by the model, so content beyond it is indexed in
     /// name only: searchable text that no vector represents.
