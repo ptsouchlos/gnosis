@@ -36,11 +36,24 @@ pub struct PdfConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AnnConfig {
-    /// On-disk ANN index vector precision: "f32" (full precision, today's
-    /// default), "f16" (half precision, ~2x smaller), or "i8" (8-bit,
-    /// ~4x smaller, most recall loss). SQLite always stores full f32
-    /// vectors regardless, so `gnosis rebuild` can always safely regenerate
-    /// the index at a new quantization.
+    /// On-disk ANN index vector precision: "f16" (the default), "f32" (full
+    /// precision), or "i8" (8-bit, smallest).
+    ///
+    /// Measured nDCG@10 and index size, three corpora:
+    ///
+    /// | corpus | f32 | f16 | i8 | f32 size | i8 size |
+    /// | --- | --- | --- | --- | --- | --- |
+    /// | scifact | 0.722 | 0.722 | 0.725 | 10.3 MB | 3.3 MB |
+    /// | nfcorpus | 0.347 | 0.346 | 0.342 | 7.6 MB | 2.4 MB |
+    /// | mr-tydi korean | 0.841 | 0.840 | 0.835 | 33.0 MB | 10.4 MB |
+    ///
+    /// f16 is free — within 0.001 everywhere, at 1.84x smaller — which is why it
+    /// is the default. i8 costs at most 0.005 for 3.16x, worth taking when disk
+    /// matters; the korean row is the honest one for both, since it is scored
+    /// with the lexical channel off and so nothing masks the dense error.
+    ///
+    /// SQLite always stores full f32 vectors regardless, so `gnosis rebuild`
+    /// can always safely regenerate the index at a new quantization.
     pub quantization: String,
 }
 
@@ -73,7 +86,7 @@ impl Default for PdfConfig {
 
 impl Default for AnnConfig {
     fn default() -> Self {
-        Self { quantization: "f32".to_string() }
+        Self { quantization: "f16".to_string() }
     }
 }
 
@@ -114,5 +127,31 @@ impl Config {
     /// Serialize the config to TOML.
     pub fn to_toml(&self) -> Result<String> {
         toml::to_string_pretty(self).context("serializing config")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// f16 is the default because it measured free — within 0.001 nDCG@10 of f32
+    /// on three corpora, at 1.84x smaller on disk. If this ever goes back to
+    /// f32, the measurement in `AnnConfig`'s docs is the thing to re-check.
+    #[test]
+    fn ann_quantization_defaults_to_f16() {
+        assert_eq!(AnnConfig::default().quantization, "f16");
+    }
+
+    /// Every supported value has to resolve, since the default is now one of
+    /// them and `gnosis index` resolves it on every run.
+    #[test]
+    fn every_documented_quantization_resolves() {
+        for name in ["f32", "f16", "i8"] {
+            assert!(
+                crate::store::resolve_quantization(name).is_ok(),
+                "{name} is documented in AnnConfig but does not resolve"
+            );
+        }
+        assert!(crate::store::resolve_quantization("f8").is_err());
     }
 }
