@@ -1472,6 +1472,38 @@ mod tests {
     /// through `Index::save`/`Index::restore` and preserve ranking — the
     /// exact score can shift slightly from rounding, but the nearer vector
     /// must still come out on top.
+    /// The shipped default, so the round-trip matters more here than for the
+    /// options: every `gnosis index` run rebuilds the ANN index at whatever
+    /// quantization is configured.
+    #[test]
+    fn rebuild_index_supports_the_default_f16_quantization() {
+        let (mut store, path) = temp_store();
+        write_full_doc(
+            &mut store,
+            "/vault/near.png",
+            "image",
+            &[chunk("image", "image", None, vec![1.0, 0.0])],
+            Some(1),
+            Some(1),
+        );
+        write_full_doc(
+            &mut store,
+            "/vault/far.png",
+            "image",
+            &[chunk("image", "image", None, vec![0.0, 1.0])],
+            Some(1),
+            Some(1),
+        );
+        store.rebuild_index(Space::Image, ScalarKind::F16).unwrap();
+
+        let hits = store
+            .search_space(Space::Image, &[1.0, 0.0], 10, &TextQuery::default())
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].path, "/vault/near.png");
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
     #[test]
     fn rebuild_index_supports_i8_quantization() {
         let (mut store, path) = temp_store();
