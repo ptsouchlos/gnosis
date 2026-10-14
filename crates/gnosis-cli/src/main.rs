@@ -37,6 +37,7 @@ fn main() -> Result<()> {
         Command::Eval(args) => commands::eval::execute(&ws, args),
         Command::Related(args) => commands::related::execute(&ws, args),
         Command::Forget(args) => commands::forget::execute(ws, args),
+        Command::Export(args) => commands::export::execute(&ws, args),
         Command::Status(args) => commands::status::execute(&ws, args),
         Command::Rebuild(args) => commands::rebuild::execute(&ws, args),
     }

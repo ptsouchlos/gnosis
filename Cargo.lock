@@ -3051,8 +3051,10 @@ name = "store"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "search",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

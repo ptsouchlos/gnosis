@@ -2,6 +2,8 @@
 //! concrete backend's dependencies (e.g. `rusqlite`) so it can be depended on
 //! by non-native targets (e.g. a future wasm build) that need only the shape
 //! of the store, not a SQLite implementation.
+pub mod artifact;
+
 use std::fmt;
 use std::str::FromStr;
 

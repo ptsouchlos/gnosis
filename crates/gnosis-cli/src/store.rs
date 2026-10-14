@@ -5,7 +5,7 @@
 //!
 // TODO: In the future consider using something like [sqlite-vec](https://github.com/asg017/sqlite-vec)
 // for faster vector search/retrieval.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -90,6 +90,81 @@ impl SqliteStore {
         let store = SqliteStore { conn, index_dir };
         store.init_schema()?;
         Ok(store)
+    }
+
+    /// Every document, with its links and tags, for `gnosis export`.
+    ///
+    /// Reads `rel_path` and the root separately rather than the joined
+    /// absolute path, since the artifact stores them apart.
+    pub fn export_documents(&self) -> Result<Vec<ExportDoc>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT d.id, r.path, d.rel_path, COALESCE(d.title, ''), d.kind,
+                    d.content_hash, d.mtime
+             FROM documents d JOIN roots r ON r.id = d.root_id
+             ORDER BY r.path, d.rel_path",
+        )?;
+        let mut docs = stmt
+            .query_map([], |row| {
+                Ok(ExportDoc {
+                    id: row.get(0)?,
+                    root: row.get(1)?,
+                    rel_path: row.get(2)?,
+                    title: row.get(3)?,
+                    kind: row.get(4)?,
+                    content_hash: row.get(5)?,
+                    mtime: row.get(6)?,
+                    links: Vec::new(),
+                    tags: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // Links and tags in one pass each rather than a query per document: a
+        // 20k-note vault would otherwise issue 40k statements.
+        let mut links: HashMap<i64, Vec<String>> = HashMap::new();
+        let mut stmt = self.conn.prepare("SELECT src_doc, dst_path FROM links")?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, target) = row?;
+            links.entry(id).or_default().push(target);
+        }
+        let mut tags: HashMap<i64, Vec<String>> = HashMap::new();
+        let mut stmt = self.conn.prepare("SELECT doc_id, tag FROM tags")?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, tag) = row?;
+            tags.entry(id).or_default().push(tag);
+        }
+        for doc in &mut docs {
+            doc.links = links.remove(&doc.id).unwrap_or_default();
+            doc.tags = tags.remove(&doc.id).unwrap_or_default();
+        }
+        Ok(docs)
+    }
+
+    /// Every chunk in `space` that carries a vector, for `gnosis export`.
+    ///
+    /// Vectorless chunks are skipped: they cannot be searched, so exporting
+    /// them would grow the artifact to no purpose.
+    pub fn export_chunks(&self, space: Space) -> Result<Vec<ExportChunk>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT doc_id, ord, modality, COALESCE(heading_path, ''), COALESCE(text, ''), vector
+             FROM chunks
+             WHERE space = ?1 AND vector IS NOT NULL
+             ORDER BY doc_id, ord",
+        )?;
+        let chunks = stmt
+            .query_map([space.as_str()], |row| {
+                Ok(ExportChunk {
+                    doc_id: row.get(0)?,
+                    ord: row.get::<_, i64>(1)? as u32,
+                    space,
+                    modality: row.get(2)?,
+                    heading_path: row.get(3)?,
+                    text: row.get(4)?,
+                    vector: search::blob_to_vec(&row.get::<_, Vec<u8>>(5)?),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(chunks)
     }
 
     /// Path to one `(space, modality)` pair's on-disk ANN index file.
@@ -630,6 +705,34 @@ fn search_modality(space: Space) -> &'static str {
         Space::Text => "text",
         Space::Image => "image",
     }
+}
+
+/// One document's metadata on its way into a portable artifact.
+///
+/// `root` is still the absolute vault root here; `gnosis export` reduces it to
+/// a label, because an artifact that carried machine paths would be neither
+/// portable nor safe to share.
+pub struct ExportDoc {
+    pub id: i64,
+    pub root: String,
+    pub rel_path: String,
+    pub title: String,
+    pub kind: String,
+    pub content_hash: Vec<u8>,
+    pub mtime: i64,
+    pub links: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+/// One chunk on its way into a portable artifact, still keyed by document id.
+pub struct ExportChunk {
+    pub doc_id: i64,
+    pub ord: u32,
+    pub space: Space,
+    pub modality: String,
+    pub heading_path: String,
+    pub text: String,
+    pub vector: Vec<f32>,
 }
 
 /// Map a config quantization name to a `usearch` scalar kind.
