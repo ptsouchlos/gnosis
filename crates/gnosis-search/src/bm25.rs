@@ -95,7 +95,8 @@ impl Default for SearchConfig {
 pub struct CorpusStats {
     /// Number of chunks in the searchable corpus.
     pub total_chunks: u64,
-    /// Mean chunk length in tokens. Must be > 0 for a non-empty corpus.
+    /// Mean chunk length, in the same unit as [`LexicalMatch::chunk_len`].
+    /// Must be > 0 for a non-empty corpus.
     pub avg_chunk_len: f32,
 }
 
@@ -109,7 +110,17 @@ pub struct QueryTerm {
 /// What one candidate chunk contributes for a query.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LexicalMatch {
-    /// Chunk length in tokens, for length normalization.
+    /// Chunk length, for length normalization — in **characters**, which is
+    /// what every caller measures and what `avg_chunk_len` is averaged over.
+    ///
+    /// The unit is arbitrary as far as BM25+ is concerned, since `chunk_len`
+    /// only ever appears divided by `avg_chunk_len`. What matters is that the
+    /// two are the same unit: characters here against tokens in the average
+    /// would scale the length-normalization term by the mean token length and
+    /// quietly mistune `b`. These said "tokens" while SQLite's `LENGTH()` and
+    /// the pipeline's `chars().count()` both counted characters — harmless as
+    /// long as nothing believed the comment, which a second implementation
+    /// would have.
     pub chunk_len: u32,
     /// Term frequency per query term, positionally aligned with the
     /// `&[QueryTerm]` passed alongside. Zero for a term this chunk lacks.

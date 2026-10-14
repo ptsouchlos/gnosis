@@ -1,7 +1,7 @@
 //! `gnosis eval` — score the current configuration against a qrels file.
 //!
 //! Runs every judged query through the *same* retrieval path `gnosis search`
-//! uses (`commands::search::run_query`) and reports nDCG@k, recall@k, MRR and
+//! uses (`query::run_query`) and reports nDCG@k, recall@k, MRR and
 //! unjudged@k, broken out per space. Per-space reporting is the point: an
 //! overall mean stays respectable while one space sits at zero, which is
 //! exactly how a whole-space retrieval failure can hide.
@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use crate::commands::search::{QueryEmbedders, resolve_spaces, run_query};
+use crate::commands::search::{QueryEmbedders, resolve_spaces};
 use crate::qrels::Qrels;
 use crate::store::{Space, SqliteStore, Store, TextQuery};
 use crate::workspace::{Workspace, expand_tilde};
@@ -118,6 +118,7 @@ pub fn execute(ws: &Workspace, args: EvalArgs) -> Result<()> {
 
     let available = resolve_spaces(ws, &[])?;
     let mut embedders = QueryEmbedders::new(ws);
+    let cfg = embedders.config().clone();
     let filter = TextQuery {
         from: None,
         tags: None,
@@ -135,7 +136,15 @@ pub fn execute(ws: &Workspace, args: EvalArgs) -> Result<()> {
             .filter(|p| !indexed.contains(p))
             .collect();
 
-        let hits = run_query(&store, &mut embedders, &q.text, &spaces, args.limit, &filter)?;
+        let hits = query::run_query(
+            &store,
+            &mut embedders,
+            &q.text,
+            &spaces,
+            args.limit,
+            &filter,
+            &cfg,
+        )?;
         let ranked: Vec<String> = hits.into_iter().map(|h| h.path).collect();
 
         let score = QueryScore {

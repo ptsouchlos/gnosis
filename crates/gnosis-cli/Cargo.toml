@@ -16,6 +16,7 @@ fs = { workspace = true }
 index = { workspace = true }
 parse = { workspace = true }
 progress = { workspace = true }
+query = { workspace = true }
 search = { workspace = true }
 store = { workspace = true }
 walk = { workspace = true }
