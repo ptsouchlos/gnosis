@@ -137,3 +137,240 @@ pub fn fuse_text_space(
 
     Ok(search::fuse_hits(dense, lexical, &terms, cfg, limit))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use search::Candidate;
+    use store::{DocWrite, LexicalMatches, Stats};
+
+    /// A store that answers only what the pipeline asks of it, so the
+    /// orchestration can be tested without SQLite — and, once the plugin
+    /// exists, in wasm. Everything else is left unimplemented on purpose: a
+    /// method the pipeline starts calling should show up as a failing test
+    /// rather than as a silently empty result.
+    struct FakeStore {
+        dense: Vec<search::Hit>,
+        lexical: LexicalMatches,
+    }
+
+    fn hit(path: &str, score: f32) -> search::Hit {
+        search::Hit {
+            path: path.to_string(),
+            title: path.trim_end_matches(".md").to_string(),
+            source_root: "/vault".to_string(),
+            heading_path: String::new(),
+            text: String::new(),
+            score,
+            width: None,
+            height: None,
+        }
+    }
+
+    fn candidate(path: &str, text: &str) -> Candidate {
+        Candidate {
+            path: path.to_string(),
+            title: path.trim_end_matches(".md").to_string(),
+            source_root: "/vault".to_string(),
+            heading_path: String::new(),
+            text: text.to_string(),
+            vector: vec![1.0, 0.0],
+            width: None,
+            height: None,
+            modality: "text".to_string(),
+        }
+    }
+
+    impl Store for FakeStore {
+        fn search_space(
+            &self,
+            _space: Space,
+            _query: &[f32],
+            limit: usize,
+            _filter: &TextQuery,
+        ) -> anyhow::Result<Vec<search::Hit>> {
+            Ok(self.dense.iter().take(limit).cloned().collect())
+        }
+
+        fn lexical_candidates(
+            &self,
+            _terms: &[String],
+            _limit: usize,
+            _filter: &TextQuery,
+        ) -> anyhow::Result<LexicalMatches> {
+            Ok(self.lexical.clone())
+        }
+
+        fn set_meta(&self, _k: &str, _v: &str) -> anyhow::Result<()> {
+            unimplemented!("the pipeline does not write")
+        }
+        fn get_meta(&self, _k: &str) -> anyhow::Result<Option<String>> {
+            unimplemented!("the pipeline does not read meta")
+        }
+        fn stats(&self) -> anyhow::Result<Stats> {
+            unimplemented!()
+        }
+        fn document_hash(&self, _p: &str) -> anyhow::Result<Option<Vec<u8>>> {
+            unimplemented!()
+        }
+        fn paths_for_roots(&self, _r: &[String]) -> anyhow::Result<Vec<String>> {
+            unimplemented!()
+        }
+        fn counts_by_root(&self) -> anyhow::Result<Vec<(String, i64)>> {
+            unimplemented!()
+        }
+        fn delete_by_root(&self, _r: &str) -> anyhow::Result<usize> {
+            unimplemented!()
+        }
+        fn replace_document(&mut self, _d: &DocWrite<'_>) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        fn delete_document(&self, _p: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        fn chunk_vectors(&self, _p: &str, _s: Space) -> anyhow::Result<Vec<Vec<f32>>> {
+            unimplemented!()
+        }
+        fn linked_targets(&self, _p: &str) -> anyhow::Result<Vec<String>> {
+            unimplemented!()
+        }
+        fn all_document_meta(&self) -> anyhow::Result<Vec<(String, Option<String>)>> {
+            unimplemented!()
+        }
+        fn related_space(
+            &self,
+            _s: Space,
+            _q: &[Vec<f32>],
+            _x: &[String],
+            _l: usize,
+            _f: &TextQuery,
+        ) -> anyhow::Result<Vec<search::Hit>> {
+            unimplemented!()
+        }
+    }
+
+    fn store(dense: Vec<search::Hit>, candidates: Vec<Candidate>) -> FakeStore {
+        FakeStore {
+            dense,
+            lexical: LexicalMatches {
+                stats: search::bm25::CorpusStats {
+                    total_chunks: 100,
+                    avg_chunk_len: 40.0,
+                },
+                doc_freqs: vec![3],
+                candidates,
+            },
+        }
+    }
+
+    struct FixedVector(Vec<f32>);
+
+    impl QueryEmbedder for FixedVector {
+        fn embed_query(&mut self, _space: Space, _query: &str) -> anyhow::Result<Vec<f32>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn config(lexical: bool) -> SearchConfig {
+        SearchConfig {
+            lexical,
+            ..SearchConfig::default()
+        }
+    }
+
+    /// A document only the lexical channel found must still reach the results.
+    /// That is the whole point of fusing, and it is the behavior a client
+    /// reimplementing the pipeline would most plausibly lose.
+    #[test]
+    fn fusion_surfaces_a_document_the_dense_channel_missed() {
+        let s = store(
+            vec![hit("dense.md", 0.9)],
+            vec![candidate("lexical.md", "hnsw hnsw hnsw graph")],
+        );
+        let hits = run_query(
+            &s,
+            &mut FixedVector(vec![1.0, 0.0]),
+            "hnsw",
+            &[Space::Text],
+            10,
+            &TextQuery::default(),
+            &config(true),
+        )
+        .unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert!(paths.contains(&"lexical.md"), "got {paths:?}");
+        assert!(paths.contains(&"dense.md"), "got {paths:?}");
+    }
+
+    /// With the lexical channel off, the store must not be asked for lexical
+    /// candidates at all — `FakeStore` would answer, but a real one would do
+    /// the work. The title bonus still applies, which is the part that is easy
+    /// to lose when removing a channel.
+    #[test]
+    fn lexical_off_still_applies_the_title_bonus() {
+        let s = store(vec![hit("alpha.md", 0.5), hit("beta.md", 0.5)], Vec::new());
+        let hits = run_query(
+            &s,
+            &mut FixedVector(vec![1.0, 0.0]),
+            "beta",
+            &[Space::Text],
+            10,
+            &TextQuery::default(),
+            &config(false),
+        )
+        .unwrap();
+        assert_eq!(
+            hits[0].path, "beta.md",
+            "the title match must outrank an equal-scoring non-match"
+        );
+    }
+
+    /// The image space has no lexical channel: image chunks carry no text and
+    /// its title proxies exist for `related` to traverse. Asking for one would
+    /// panic on this store, which is how the test knows.
+    #[test]
+    fn the_image_space_skips_the_lexical_channel() {
+        let s = FakeStore {
+            dense: vec![hit("photo.png", 0.4)],
+            lexical: LexicalMatches {
+                stats: search::bm25::CorpusStats {
+                    total_chunks: 0,
+                    avg_chunk_len: 0.0,
+                },
+                doc_freqs: Vec::new(),
+                candidates: Vec::new(),
+            },
+        };
+        let hits = run_query(
+            &s,
+            &mut FixedVector(vec![1.0, 0.0]),
+            "a fish",
+            &[Space::Image],
+            10,
+            &TextQuery::default(),
+            &config(true),
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "photo.png");
+    }
+
+    /// A query that tokenizes to nothing (punctuation, or a stop-free string of
+    /// symbols) must return the dense ranking rather than an empty one.
+    #[test]
+    fn a_query_with_no_lexical_terms_falls_back_to_dense() {
+        let s = store(vec![hit("dense.md", 0.9)], Vec::new());
+        let hits = run_query(
+            &s,
+            &mut FixedVector(vec![1.0, 0.0]),
+            "!!! ???",
+            &[Space::Text],
+            10,
+            &TextQuery::default(),
+            &config(true),
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "dense.md");
+    }
+}
