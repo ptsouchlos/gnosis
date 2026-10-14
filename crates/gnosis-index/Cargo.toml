@@ -13,7 +13,7 @@ parse = { workspace = true }
 progress = { workspace = true }
 store = { workspace = true }
 walk = { workspace = true }
-blake3 = "1.8.5"
+blake3 = { workspace = true }
 
 [dev-dependencies]
 search = { workspace = true }

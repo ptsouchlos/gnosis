@@ -39,6 +39,8 @@ pub enum Command {
     Forget(commands::forget::ForgetArgs),
     /// Score retrieval quality against a qrels file.
     Eval(commands::eval::EvalArgs),
+    /// Write a portable, query-only copy of the index.
+    Export(commands::export::ExportArgs),
     /// Show index statistics.
     Status(commands::status::StatusArgs),
     /// Force a full re-embed and rebuild of the index.

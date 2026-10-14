@@ -133,6 +133,15 @@ struct TextModel {
     document_prefix: &'static str,
     /// Longest input accepted, in the model's own tokens.
     max_input_tokens: usize,
+    /// How the model pools token vectors into one embedding: `"cls"` or
+    /// `"mean"`.
+    ///
+    /// Recorded in a portable artifact so a client can reproduce a query vector
+    /// in the index's own space. It cannot be inferred: fastembed pools CLS for
+    /// the whole BGE family and mean for every multilingual-E5 size, and
+    /// choosing wrong yields plausible unit-norm vectors that sit ~11% of
+    /// BGE's usable cosine range away from the truth — or ~55% of E5's.
+    pooling: &'static str,
 }
 
 /// Every text model gnosis accepts in `[embed.text] model`.
@@ -148,6 +157,7 @@ fn resolve_text_model(name: &str) -> Result<TextModel> {
             query_prefix: BGE_EN_QUERY_INSTRUCTION,
             document_prefix: "",
             max_input_tokens: 512,
+            pooling: "cls",
         },
         "bge-small-en-v1.5-q" => TextModel {
             model: EmbeddingModel::BGESmallENV15Q,
@@ -155,6 +165,7 @@ fn resolve_text_model(name: &str) -> Result<TextModel> {
             query_prefix: BGE_EN_QUERY_INSTRUCTION,
             document_prefix: "",
             max_input_tokens: 512,
+            pooling: "cls",
         },
         "bge-base-en-v1.5" => TextModel {
             model: EmbeddingModel::BGEBaseENV15,
@@ -162,6 +173,7 @@ fn resolve_text_model(name: &str) -> Result<TextModel> {
             query_prefix: BGE_EN_QUERY_INSTRUCTION,
             document_prefix: "",
             max_input_tokens: 512,
+            pooling: "cls",
         },
         "all-MiniLM-L6-v2" => TextModel {
             model: EmbeddingModel::AllMiniLML6V2,
@@ -169,6 +181,7 @@ fn resolve_text_model(name: &str) -> Result<TextModel> {
             query_prefix: "",
             document_prefix: "",
             max_input_tokens: 256,
+            pooling: "mean",
         },
         "nomic-embed-text-v1.5" => TextModel {
             model: EmbeddingModel::NomicEmbedTextV15,
@@ -176,6 +189,7 @@ fn resolve_text_model(name: &str) -> Result<TextModel> {
             query_prefix: "",
             document_prefix: "",
             max_input_tokens: 8192,
+            pooling: "mean",
         },
         // Multilingual, and 384d like the default — so it costs no extra disk,
         // no larger ANN index, and nothing downstream has to stop assuming 384.
@@ -185,6 +199,7 @@ fn resolve_text_model(name: &str) -> Result<TextModel> {
             query_prefix: E5_QUERY_PREFIX,
             document_prefix: E5_DOCUMENT_PREFIX,
             max_input_tokens: 512,
+            pooling: "mean",
         },
         other => bail!(
             "unknown text model '{other}' (try: bge-small-en-v1.5, bge-small-en-v1.5-q, \
@@ -193,6 +208,14 @@ fn resolve_text_model(name: &str) -> Result<TextModel> {
         ),
     };
     Ok(m)
+}
+
+/// How `model_name` pools token vectors, for recording in a portable artifact.
+///
+/// Mirrors fastembed's own `get_default_pooling_method`, read out of the same
+/// table as everything else about the model so the two cannot drift.
+pub fn resolve_pooling(model_name: &str) -> Result<&'static str> {
+    Ok(resolve_text_model(model_name)?.pooling)
 }
 
 /// The `(query, document)` prefixes to use for `model_name`, both empty when the
