@@ -30,6 +30,11 @@ walk = { path = "crates/gnosis-walk" }
 # dependencies
 anyhow = "1"
 blake3 = "1.8.5"
+# Pure-Rust deflate, for the portable artifact's text blocks. Chosen over a
+# zlib binding so the same code compresses natively and decompresses in wasm,
+# and held at the version `image` already pulls in so the binary carries one
+# copy rather than two.
+miniz_oxide = "0.8.9"
 pdf-extract = "0.12.1"
 pulldown-cmark = "0.13.4"
 serde = { version = "1", features = ["derive"] }

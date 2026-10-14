@@ -3052,6 +3052,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "miniz_oxide",
  "search",
  "serde",
  "serde_json",

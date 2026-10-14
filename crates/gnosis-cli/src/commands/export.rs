@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use store::artifact::{
-    ARTIFACT_FORMAT_VERSION, ArtifactChunk, DocumentEntry, Manifest, ModelInfo, Quantization,
-    ShardInfo, assign_shard, shard_hash, shard_name, write_shard,
+    ARTIFACT_FORMAT_VERSION, ArtifactChunk, Compression, DocumentEntry, Manifest, ModelInfo,
+    Quantization, ShardInfo, assign_shard, shard_hash, shard_name, write_shard,
 };
 use store::{Space, Store};
 
@@ -37,6 +37,10 @@ pub struct ExportArgs {
     /// Vector precision in the artifact. `f32` is exact; `i8` is ~4x smaller.
     #[arg(long, default_value = "f32")]
     pub quantize: String,
+    /// Compression for the artifact's text. `deflate` roughly halves it;
+    /// `none` leaves a shard's text greppable.
+    #[arg(long, default_value = "deflate")]
+    pub compress: String,
     /// Target documents per shard.
     #[arg(long, default_value_t = DEFAULT_SHARD_DOCS)]
     pub shard_docs: usize,
@@ -57,6 +61,11 @@ pub fn execute(ws: &Workspace, args: ExportArgs) -> Result<()> {
         "i8" => Quantization::I8,
         other => bail!("unknown --quantize '{other}' (try: f32, i8)"),
     };
+    let compression = match args.compress.as_str() {
+        "none" => Compression::None,
+        "deflate" => Compression::Deflate,
+        other => bail!("unknown --compress '{other}' (try: deflate, none)"),
+    };
     if args.shard_docs == 0 {
         bail!("--shard-docs must be at least 1");
     }
@@ -69,6 +78,7 @@ pub fn execute(ws: &Workspace, args: ExportArgs) -> Result<()> {
         &store,
         &ws.config.embed.text.model,
         quantization,
+        compression,
         args.shard_docs,
     )?;
 
@@ -76,20 +86,12 @@ pub fn execute(ws: &Workspace, args: ExportArgs) -> Result<()> {
     // only shards whose contents changed need rewriting, which is the point of
     // sharding at all.
     let previous = read_previous_manifest(&manifest_path);
-    let reusable = match &previous {
-        // A different model, precision or shard count reassigns or re-encodes
-        // every vector, so nothing carries over.
-        Some(old)
-            if !args.force
-                && old.model == manifest.model
-                && old.quantization == manifest.quantization
-                && old.shard_docs == manifest.shard_docs =>
-        {
-            old.shards
-                .iter()
-                .map(|s| (s.name.clone(), s.hash.clone()))
-                .collect()
-        }
+    let reusable: HashMap<String, String> = match &previous {
+        Some(old) if !args.force && carries_over(old, &manifest) => old
+            .shards
+            .iter()
+            .map(|s| (s.name.clone(), s.hash.clone()))
+            .collect(),
         _ => HashMap::new(),
     };
 
@@ -139,8 +141,12 @@ pub fn execute(ws: &Workspace, args: ExportArgs) -> Result<()> {
         out.display()
     );
     println!(
-        "  model {} ({} pooling, {}d), vectors {}",
-        manifest.model.id, manifest.model.pooling, manifest.model.dim, args.quantize
+        "  model {} ({} pooling, {}d), vectors {}, text {}",
+        manifest.model.id,
+        manifest.model.pooling,
+        manifest.model.dim,
+        args.quantize,
+        args.compress
     );
     print!(
         "  {} shard(s): {written} written ({})",
@@ -155,6 +161,22 @@ pub fn execute(ws: &Workspace, args: ExportArgs) -> Result<()> {
     }
     println!();
     Ok(())
+}
+
+/// Whether an existing artifact's shards can be compared against the new ones
+/// at all, rather than being rewritten wholesale.
+///
+/// Every field here re-encodes or reassigns the contents of *every* shard, so a
+/// change to any of them makes the old hashes meaningless: a model or dimension
+/// change replaces the vectors, quantization and compression change their
+/// encoding, and `shard_docs` moves documents between shards. Missing one would
+/// not fail loudly — it would leave stale shards in place and quietly serve an
+/// artifact that mixes two encodings.
+fn carries_over(old: &Manifest, new: &Manifest) -> bool {
+    old.model == new.model
+        && old.quantization == new.quantization
+        && old.compression == new.compression
+        && old.shard_docs == new.shard_docs
 }
 
 /// The manifest already in `path`, if there is a readable one.
@@ -179,6 +201,7 @@ pub(crate) fn build_artifact(
     store: &SqliteStore,
     configured_model: &str,
     quantization: Quantization,
+    compression: Compression,
     shard_docs: usize,
 ) -> Result<(Manifest, Vec<ShardBody>)> {
     let model = model_info(store, configured_model)?;
@@ -261,7 +284,13 @@ pub(crate) fn build_artifact(
     let mut infos = Vec::with_capacity(shard_count);
     let mut bodies = Vec::with_capacity(shard_count);
     for i in 0..shard_count {
-        let body = write_shard(&shard_docs_out[i], &shard_chunks[i], model.dim, quantization)?;
+        let body = write_shard(
+            &shard_docs_out[i],
+            &shard_chunks[i],
+            model.dim,
+            quantization,
+            compression,
+        )?;
         infos.push(ShardInfo {
             name: shard_name(i),
             hash: shard_hash(&body),
@@ -276,6 +305,7 @@ pub(crate) fn build_artifact(
         created_unix: now_unix(),
         model,
         quantization,
+        compression,
         roots,
         shard_docs,
         shards: infos,
@@ -404,8 +434,12 @@ mod tests {
     }
 
     /// One shard, so a test that does not care about sharding stays readable.
-    fn build_one(store: &SqliteStore, quantization: Quantization) -> (Manifest, Vec<ShardBody>) {
-        build_artifact(store, "bge-small-en-v1.5", quantization, 256).unwrap()
+    fn build_one(
+        store: &SqliteStore,
+        quantization: Quantization,
+        compression: Compression,
+    ) -> (Manifest, Vec<ShardBody>) {
+        build_artifact(store, "bge-small-en-v1.5", quantization, compression, 256).unwrap()
     }
 
     /// **The acceptance gate for this format.** Querying an artifact must
@@ -423,7 +457,7 @@ mod tests {
             .unwrap();
 
         let (manifest, shards) =
-            build_one(&store, Quantization::F32);
+            build_one(&store, Quantization::F32, Compression::Deflate);
         let artifact = open_artifact(&manifest, shards);
         let from_artifact = search::rank(&query, artifact.candidates(Space::Text), 10);
 
@@ -450,7 +484,7 @@ mod tests {
         let dir = temp_dir("vectors");
         let store = seeded_store(&dir);
         let (manifest, shards) =
-            build_one(&store, Quantization::F32);
+            build_one(&store, Quantization::F32, Compression::Deflate);
         let artifact = open_artifact(&manifest, shards);
 
         let mut vectors: Vec<Vec<f32>> = artifact
@@ -470,7 +504,7 @@ mod tests {
     fn artifact_records_no_absolute_paths() {
         let dir = temp_dir("relative");
         let store = seeded_store(&dir);
-        let (manifest, shards) = build_one(&store, Quantization::F32);
+        let (manifest, shards) = build_one(&store, Quantization::F32, Compression::Deflate);
         assert_eq!(manifest.roots, vec!["vault".to_string()], "roots are labels");
         let json = manifest.to_json().unwrap();
         assert!(!json.contains("/vault"), "an absolute path leaked into the manifest");
@@ -493,7 +527,7 @@ mod tests {
     fn artifact_carries_the_models_pooling_and_each_documents_hash() {
         let dir = temp_dir("meta");
         let store = seeded_store(&dir);
-        let (manifest, shards) = build_one(&store, Quantization::F32);
+        let (manifest, shards) = build_one(&store, Quantization::F32, Compression::Deflate);
 
         assert_eq!(manifest.model.id, "bge-small-en-v1.5");
         assert_eq!(
@@ -517,7 +551,7 @@ mod tests {
     fn artifact_carries_links_and_tags() {
         let dir = temp_dir("links");
         let store = seeded_store(&dir);
-        let (manifest, shards) = build_one(&store, Quantization::F32);
+        let (manifest, shards) = build_one(&store, Quantization::F32, Compression::Deflate);
         let artifact = open_artifact(&manifest, shards);
         for doc in artifact.documents() {
             assert_eq!(doc.links, vec!["mid".to_string()]);
@@ -544,7 +578,7 @@ mod tests {
         let dir = temp_dir("unknown");
         let store = seeded_store(&dir);
         store.set_meta("model.text", "some-future-model").unwrap();
-        let err = build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, 256)
+        let err = build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, Compression::Deflate, 256)
             .expect_err("should refuse");
         assert!(err.to_string().contains("some-future-model"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
@@ -556,7 +590,7 @@ mod tests {
         let store = seeded_store(&dir);
         // One document per shard, so the split is unambiguous.
         let (manifest, shards) =
-            build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, 1).unwrap();
+            build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, Compression::Deflate, 1).unwrap();
 
         assert_eq!(manifest.shards.len(), 3, "three documents, one per shard");
         assert_eq!(shards.len(), 3);
@@ -586,7 +620,7 @@ mod tests {
         let mut rankings = Vec::new();
         for shard_docs in [1, 2, 256] {
             let (manifest, shards) =
-                build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, shard_docs).unwrap();
+                build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, Compression::Deflate, shard_docs).unwrap();
             let artifact = open_artifact(&manifest, shards);
             let hits = search::rank(&query, artifact.candidates(Space::Text), 10);
             rankings.push(
@@ -617,7 +651,7 @@ mod tests {
     fn adding_a_note_dirties_only_the_shard_it_lands_in() {
         let dir = temp_dir("insert");
         let mut store = seeded_store(&dir);
-        let (_, before) = build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, 2).unwrap();
+        let (_, before) = build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, Compression::Deflate, 2).unwrap();
         assert_eq!(before.len(), 2, "three documents at two per shard");
 
         store
@@ -647,7 +681,7 @@ mod tests {
             .unwrap();
 
         let (manifest, after) =
-            build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, 2).unwrap();
+            build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, Compression::Deflate, 2).unwrap();
         assert_eq!(after.len(), 2, "four documents at two per shard is still two shards");
 
         let changed = before
@@ -676,7 +710,7 @@ mod tests {
         let mut store = seeded_store(&dir);
         // Three shards for three documents, and keep it there by exporting at
         // the same shard_docs after the edit.
-        let (_, before) = build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, 1).unwrap();
+        let (_, before) = build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, Compression::Deflate, 1).unwrap();
 
         store
             .replace_document(&DocWrite {
@@ -703,7 +737,7 @@ mod tests {
             })
             .unwrap();
 
-        let (_, after) = build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, 1).unwrap();
+        let (_, after) = build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, Compression::Deflate, 1).unwrap();
         assert_eq!(before.len(), after.len(), "shard count should not change");
 
         let changed = before
@@ -726,9 +760,9 @@ mod tests {
         let query = [1.0, 0.0, 0.0, 0.0];
 
         let (_, f32_shards) =
-            build_one(&store, Quantization::F32);
+            build_one(&store, Quantization::F32, Compression::Deflate);
         let (manifest, i8_shards) =
-            build_one(&store, Quantization::I8);
+            build_one(&store, Quantization::I8, Compression::Deflate);
         let i8_bytes: usize = i8_shards.iter().map(|(_, b)| b.len()).sum();
         let f32_bytes: usize = f32_shards.iter().map(|(_, b)| b.len()).sum();
         assert!(
@@ -740,6 +774,69 @@ mod tests {
         let hits = search::rank(&query, artifact.candidates(Space::Text), 10);
         let order: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
         assert_eq!(order, vec!["near.md", "mid.md", "deep/far.md"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Compression is lossless, so it must be invisible above the format: the
+    /// same documents, the same text, the same ranking, the same scores. Only
+    /// the bytes on disk differ.
+    #[test]
+    fn compression_changes_the_bytes_and_nothing_else() {
+        let dir = temp_dir("compress");
+        let store = seeded_store(&dir);
+        let query = [1.0, 0.0, 0.0, 0.0];
+
+        let (plain_manifest, plain_shards) = build_one(&store, Quantization::I8, Compression::None);
+        let (packed_manifest, packed_shards) =
+            build_one(&store, Quantization::I8, Compression::Deflate);
+        assert_ne!(
+            plain_shards[0].1, packed_shards[0].1,
+            "a deflated shard should not be byte-identical to a plain one"
+        );
+        assert_eq!(plain_manifest.compression, Compression::None);
+        assert_eq!(packed_manifest.compression, Compression::Deflate);
+
+        let plain = open_artifact(&plain_manifest, plain_shards);
+        let packed = open_artifact(&packed_manifest, packed_shards);
+        assert_eq!(packed.documents(), plain.documents());
+        let ranked = |a: &Artifact| -> Vec<(String, f32, String)> {
+            search::rank(&query, a.candidates(Space::Text), 10)
+                .into_iter()
+                .map(|h| (h.path, h.score, h.text))
+                .collect()
+        };
+        assert_eq!(ranked(&packed), ranked(&plain));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Re-exporting at a different setting must not keep a single old shard:
+    /// each of these re-encodes or reassigns every one of them, and a surviving
+    /// shard would leave the artifact a mixture of two encodings that still
+    /// passes its hash check.
+    #[test]
+    fn changing_how_shards_are_encoded_reuses_none_of_them() {
+        let dir = temp_dir("carryover");
+        let store = seeded_store(&dir);
+        let (base, _) = build_one(&store, Quantization::I8, Compression::Deflate);
+
+        assert!(carries_over(&base, &base), "an unchanged export reuses");
+
+        let mut other = base.clone();
+        other.compression = Compression::None;
+        assert!(!carries_over(&base, &other), "compression must invalidate");
+
+        let mut other = base.clone();
+        other.quantization = Quantization::F32;
+        assert!(!carries_over(&base, &other), "quantization must invalidate");
+
+        let mut other = base.clone();
+        other.shard_docs = 2;
+        assert!(!carries_over(&base, &other), "shard_docs must invalidate");
+
+        let mut other = base.clone();
+        other.model.id = "multilingual-e5-small".to_string();
+        assert!(!carries_over(&base, &other), "the model must invalidate");
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }

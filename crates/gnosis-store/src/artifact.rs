@@ -29,13 +29,18 @@ use crate::Space;
 /// Bumped whenever the manifest or shard layout changes incompatibly. A reader
 /// refuses an unknown version rather than mis-parsing one.
 ///
+/// **v3** deflates the two text-bearing blocks of a shard — the document JSON
+/// and the string blob. Measured on scifact, text was 70% of an i8 artifact and
+/// vectors 21%, so compression halves the artifact where quantization could not:
+/// 12.1 MB to 5.9 MB. Records and vectors stay raw, see [`write_shard`].
+///
 /// **v2** moved per-document metadata out of the manifest and into the shard
 /// that holds the document, and made shard assignment a hash of the document's
 /// path. v1 kept every document in the manifest, which measured 270 bytes each
 /// — 5.4 MB at 20k documents — and rewrote in full on every export, so sharding
 /// the chunks alone would have saved nothing. The artifact is derived and
 /// regenerable, so the fix was a version bump rather than a migration.
-pub const ARTIFACT_FORMAT_VERSION: u32 = 2;
+pub const ARTIFACT_FORMAT_VERSION: u32 = 3;
 
 /// Shard file magic: "GNSA" (gnosis artifact).
 const SHARD_MAGIC: &[u8; 4] = b"GNSA";
@@ -77,6 +82,56 @@ impl Quantization {
         match self {
             Quantization::F32 => 4,
             Quantization::I8 => 1,
+        }
+    }
+}
+
+/// How a shard's text-bearing blocks are stored.
+///
+/// Raw deflate, not gzip or zlib: the framing buys nothing here — a shard
+/// already carries its own magic, version and a blake3 in the manifest — and
+/// raw deflate is what a client without this crate can hand to the browser's
+/// `DecompressionStream("deflate-raw")`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Compression {
+    /// Stored as written. Leaves a shard's text greppable, which is worth
+    /// something while debugging and nothing in a synced vault.
+    #[default]
+    None,
+    Deflate,
+}
+
+impl Compression {
+    fn code(self) -> u16 {
+        match self {
+            Compression::None => 0,
+            Compression::Deflate => 1,
+        }
+    }
+
+    fn from_code(code: u16) -> Result<Self> {
+        match code {
+            0 => Ok(Compression::None),
+            1 => Ok(Compression::Deflate),
+            other => bail!("unknown compression code {other} in shard"),
+        }
+    }
+
+    fn pack(self, block: Vec<u8>) -> Vec<u8> {
+        match self {
+            Compression::None => block,
+            // Level 6. Level 9 measured 0.3% smaller for 1.7x the time, and
+            // zstd-19 (which would mean a C dependency in wasm) only 8%.
+            Compression::Deflate => miniz_oxide::deflate::compress_to_vec(&block, 6),
+        }
+    }
+
+    fn unpack(self, block: &[u8], what: &str) -> Result<Vec<u8>> {
+        match self {
+            Compression::None => Ok(block.to_vec()),
+            Compression::Deflate => miniz_oxide::inflate::decompress_to_vec(block)
+                .map_err(|e| anyhow::anyhow!("inflating a shard's {what} block: {e:?}")),
         }
     }
 }
@@ -134,6 +189,15 @@ pub struct Manifest {
     pub created_unix: i64,
     pub model: ModelInfo,
     pub quantization: Quantization,
+    /// How the shards' text blocks are stored. Each shard also states this in
+    /// its own header, which is what the reader parses by; the manifest records
+    /// it so a client can see what it will need before fetching a shard, and so
+    /// a re-export at a different setting knows every shard must be rewritten.
+    ///
+    /// Defaulted on the way in only so that a superseded manifest parses far
+    /// enough to reach the format-version check and its actionable error.
+    #[serde(default)]
+    pub compression: Compression,
     /// Root labels — a vault's final path component, never its absolute path.
     pub roots: Vec<String>,
     /// Target documents per shard, as asked for at export time. Recorded
@@ -237,15 +301,28 @@ fn quantize_i8(vector: &[f32]) -> (Vec<i8>, f32) {
 
 /// Serialize `chunks` into one shard.
 ///
-/// Layout, all little-endian: a header, then a fixed-size record per chunk,
-/// then the vector block, then the string blob. Vectors are contiguous and
-/// fixed-stride so a client can scan them without touching the strings, which
-/// is the whole shape of a brute-force query.
+/// Layout, all little-endian: a header, then the document block, then a
+/// fixed-size record per chunk, then the vector block, then the string blob.
+/// Vectors are contiguous and fixed-stride so a client can scan them without
+/// touching the strings, which is the whole shape of a brute-force query.
+///
+/// `compression` applies to the document block and the string blob — the two
+/// that hold text — and never to the records or the vectors. Measured on
+/// scifact: deflate takes the string blob 8.20 MB to 2.75 MB (3.0x) and the
+/// document JSON 1.34 MB to 0.50 MB, while i8 vectors give up only 1.33x, worth
+/// 0.6 MB of a 12 MB artifact. Paying that 0.6 MB keeps the vector block a
+/// fixed-stride array a client can scan in place, which is the one access
+/// pattern that has to stay cheap. Each block is deflated whole rather than per
+/// chunk, so chunks share a window; a shard is small enough to inflate on load.
+///
+/// The header's `docs_json_len` is the *stored* length, so the layout is
+/// unchanged by compression: only the reader differs.
 pub fn write_shard(
     documents: &[DocumentEntry],
     chunks: &[ArtifactChunk],
     dim: usize,
     quantization: Quantization,
+    compression: Compression,
 ) -> Result<Vec<u8>> {
     let mut records = Vec::with_capacity(chunks.len() * RECORD_LEN);
     let mut vectors = Vec::with_capacity(chunks.len() * dim * quantization.bytes_per_dim());
@@ -301,14 +378,17 @@ pub fn write_shard(
     // Documents ride inside the shard as JSON at a known offset: self-contained
     // in one file with one hash, still readable with `head -c`, and small enough
     // next to the vector block that a binary encoding would not pay for itself.
-    let docs_json = serde_json::to_vec(documents).context("serializing shard documents")?;
+    let docs_json = compression.pack(
+        serde_json::to_vec(documents).context("serializing shard documents")?,
+    );
+    let strings = compression.pack(strings);
 
     let mut out = Vec::with_capacity(
         SHARD_HEADER_LEN + docs_json.len() + records.len() + vectors.len() + strings.len(),
     );
     out.extend_from_slice(SHARD_MAGIC);
     out.extend_from_slice(&(ARTIFACT_FORMAT_VERSION as u16).to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes()); // flags, unused so far
+    out.extend_from_slice(&compression.code().to_le_bytes());
     out.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
     out.extend_from_slice(&(dim as u32).to_le_bytes());
     out.push(quantization.code());
@@ -382,6 +462,7 @@ pub fn read_shard(bytes: &[u8]) -> Result<(Vec<DocumentEntry>, Vec<ArtifactChunk
             ARTIFACT_FORMAT_VERSION
         );
     }
+    let compression = Compression::from_code(u16::from_le_bytes([bytes[6], bytes[7]]))?;
     let count = u32_at(bytes, 8) as usize;
     let dim = u32_at(bytes, 12) as usize;
     let quantization = Quantization::from_code(bytes[16])?;
@@ -392,8 +473,9 @@ pub fn read_shard(bytes: &[u8]) -> Result<(Vec<DocumentEntry>, Vec<ArtifactChunk
         .checked_add(docs_json_len)
         .filter(|end| *end <= bytes.len())
         .context("shard's document block runs past the end of the file")?;
-    let documents: Vec<DocumentEntry> = serde_json::from_slice(&bytes[docs_at..docs_end])
-        .context("parsing a shard's document block")?;
+    let docs_json = compression.unpack(&bytes[docs_at..docs_end], "document")?;
+    let documents: Vec<DocumentEntry> =
+        serde_json::from_slice(&docs_json).context("parsing a shard's document block")?;
 
     let records_at = docs_end;
     let vectors_at = records_at + count * RECORD_LEN;
@@ -404,7 +486,8 @@ pub fn read_shard(bytes: &[u8]) -> Result<(Vec<DocumentEntry>, Vec<ArtifactChunk
             bytes.len()
         );
     }
-    let strings = &bytes[strings_at..];
+    let strings = compression.unpack(&bytes[strings_at..], "string")?;
+    let strings = strings.as_slice();
 
     let mut chunks = Vec::with_capacity(count);
     for i in 0..count {
@@ -619,6 +702,7 @@ mod tests {
                 dim: 2,
             },
             quantization,
+            compression: Compression::None,
             roots: vec!["vault".to_string()],
             shard_docs: 256,
             shards,
@@ -626,7 +710,7 @@ mod tests {
     }
 
     fn one_shard(documents: &[DocumentEntry], chunks: &[ArtifactChunk]) -> (Manifest, Vec<u8>) {
-        let bytes = write_shard(documents, chunks, 2, Quantization::F32).expect("write");
+        let bytes = write_shard(documents, chunks, 2, Quantization::F32, Compression::None).expect("write");
         let m = manifest(
             vec![ShardInfo {
                 name: shard_name(0),
@@ -646,7 +730,7 @@ mod tests {
             chunk(0, "Heading", "first body", vec![1.0, 0.0]),
             chunk(1, "", "second body", vec![0.0, 1.0]),
         ];
-        let bytes = write_shard(&docs, &chunks, 2, Quantization::F32).expect("write");
+        let bytes = write_shard(&docs, &chunks, 2, Quantization::F32, Compression::None).expect("write");
         let (back_docs, back_chunks) = read_shard(&bytes).expect("read");
         assert_eq!(back_docs, docs);
         assert_eq!(
@@ -659,7 +743,7 @@ mod tests {
     fn i8_shard_round_trips_within_quantization_error() {
         let docs = vec![doc("a.md", "A")];
         let chunks = vec![chunk(0, "", "body", vec![0.6, -0.8])];
-        let bytes = write_shard(&docs, &chunks, 2, Quantization::I8).expect("write");
+        let bytes = write_shard(&docs, &chunks, 2, Quantization::I8, Compression::None).expect("write");
         let (_, back) = read_shard(&bytes).expect("read");
         for (original, restored) in chunks[0].vector.iter().zip(&back[0].vector) {
             assert!(
@@ -680,9 +764,117 @@ mod tests {
                 c
             })
             .collect();
-        let f32_len = write_shard(&docs, &chunks, 384, Quantization::F32).unwrap().len();
-        let i8_len = write_shard(&docs, &chunks, 384, Quantization::I8).unwrap().len();
+        let f32_len = write_shard(&docs, &chunks, 384, Quantization::F32, Compression::None).unwrap().len();
+        let i8_len = write_shard(&docs, &chunks, 384, Quantization::I8, Compression::None).unwrap().len();
         assert_eq!(f32_len - i8_len, 16 * 384 * 3);
+    }
+
+    /// Prose, so the ratio means something: 24 chunks of repeated vocabulary is
+    /// the shape a vault actually has.
+    fn prose_shard(compression: Compression) -> Vec<u8> {
+        let docs = vec![doc("a.md", "A")];
+        let chunks: Vec<ArtifactChunk> = (0..24)
+            .map(|i| {
+                let mut c = chunk(
+                    0,
+                    "Notes > Retrieval",
+                    "The lexical channel scores a chunk with BM25+ over the same tokens \
+                     the corpus statistics were gathered with, so the client's scores \
+                     agree with the indexer's by construction.",
+                    vec![0.5; 384],
+                );
+                c.ord = i;
+                c
+            })
+            .collect();
+        write_shard(&docs, &chunks, 384, Quantization::I8, compression).expect("write")
+    }
+
+    #[test]
+    fn deflate_shard_round_trips_exactly() {
+        let docs = vec![doc("a.md", "A"), doc("nested/b.md", "B")];
+        let chunks = vec![
+            chunk(0, "Heading", "first body", vec![1.0, 0.0]),
+            chunk(1, "", "second body", vec![0.0, 1.0]),
+        ];
+        let bytes = write_shard(&docs, &chunks, 2, Quantization::F32, Compression::Deflate)
+            .expect("write");
+        let (back_docs, back_chunks) = read_shard(&bytes).expect("read");
+        assert_eq!(back_docs, docs);
+        assert_eq!(
+            back_chunks, chunks,
+            "deflate is lossless — the only lossy step in the artifact is i8"
+        );
+    }
+
+    /// The reason this step exists. Measured on scifact, deflate took the
+    /// string blob 8.20 MB to 2.75 MB; if compression stopped paying off on
+    /// prose, the default should change. The whole-shard ratio is not the thing
+    /// to assert — it depends on how much text a vault has per vector, and this
+    /// fixture has far less than a real one.
+    #[test]
+    fn deflate_shrinks_a_shards_string_blob() {
+        let strings_len = |bytes: &[u8]| {
+            let count = u32_at(bytes, 8) as usize;
+            let dim = u32_at(bytes, 12) as usize;
+            let at = SHARD_HEADER_LEN
+                + u32_at(bytes, 20) as usize
+                + count * RECORD_LEN
+                + count * dim;
+            bytes.len() - at
+        };
+        let plain = strings_len(&prose_shard(Compression::None));
+        let packed = strings_len(&prose_shard(Compression::Deflate));
+        assert!(
+            (plain as f64) / (packed as f64) > 3.0,
+            "deflate took {plain} bytes of text to {packed} — below the measured 3x"
+        );
+    }
+
+    /// Compression must leave the vector block a fixed-stride array a client
+    /// can scan in place. Comparing the two shards' vector regions byte for
+    /// byte is what makes that a property rather than an intention.
+    #[test]
+    fn deflate_leaves_the_vector_block_byte_identical() {
+        let vectors = |bytes: &[u8]| {
+            let count = u32_at(bytes, 8) as usize;
+            let dim = u32_at(bytes, 12) as usize;
+            let at = SHARD_HEADER_LEN + u32_at(bytes, 20) as usize + count * RECORD_LEN;
+            bytes[at..at + count * dim].to_vec()
+        };
+        let plain = prose_shard(Compression::None);
+        let packed = prose_shard(Compression::Deflate);
+        assert_eq!(vectors(&plain), vectors(&packed));
+    }
+
+    /// Incremental re-export compares shard hashes, so the encoder has to be
+    /// deterministic: a codec that varied its output — by thread count, by a
+    /// timestamp — would rewrite every shard on every export and quietly undo
+    /// sharding.
+    #[test]
+    fn deflating_the_same_shard_twice_gives_identical_bytes() {
+        assert_eq!(
+            prose_shard(Compression::Deflate),
+            prose_shard(Compression::Deflate)
+        );
+    }
+
+    #[test]
+    fn read_shard_rejects_an_unknown_compression_code() {
+        let mut bytes = prose_shard(Compression::Deflate);
+        bytes[6] = 9;
+        let err = read_shard(&bytes).expect_err("should refuse");
+        assert!(err.to_string().contains("compression code 9"), "{err}");
+    }
+
+    /// A deflated block cannot be range-checked the way a raw one can, so
+    /// truncation has to surface as an inflate failure rather than be inflated
+    /// into a short blob and read as missing text.
+    #[test]
+    fn read_shard_rejects_a_truncated_deflated_shard() {
+        let bytes = prose_shard(Compression::Deflate);
+        let err = read_shard(&bytes[..bytes.len() - 64]).expect_err("should refuse");
+        assert!(err.to_string().contains("inflating"), "{err}");
     }
 
     #[test]
@@ -692,7 +884,7 @@ mod tests {
         // non-ASCII vaults.
         let docs = vec![doc("한국.md", "한국")];
         let chunks = vec![chunk(0, "제목", "대한민국의 수도는 서울이다", vec![1.0, 0.0])];
-        let bytes = write_shard(&docs, &chunks, 2, Quantization::F32).expect("write");
+        let bytes = write_shard(&docs, &chunks, 2, Quantization::F32, Compression::None).expect("write");
         let (back_docs, back_chunks) = read_shard(&bytes).expect("read");
         assert_eq!(back_docs, docs);
         assert_eq!(back_chunks, chunks);
@@ -700,7 +892,7 @@ mod tests {
 
     #[test]
     fn a_shard_with_no_chunks_is_valid() {
-        let bytes = write_shard(&[], &[], 384, Quantization::F32).expect("write");
+        let bytes = write_shard(&[], &[], 384, Quantization::F32, Compression::None).expect("write");
         let (docs, chunks) = read_shard(&bytes).expect("read");
         assert!(docs.is_empty());
         assert!(chunks.is_empty());
@@ -710,7 +902,7 @@ mod tests {
     fn write_shard_rejects_a_vector_of_the_wrong_dimensionality() {
         let docs = vec![doc("a.md", "A")];
         let chunks = vec![chunk(0, "", "body", vec![1.0, 0.0, 0.0])];
-        let err = write_shard(&docs, &chunks, 2, Quantization::F32).expect_err("should refuse");
+        let err = write_shard(&docs, &chunks, 2, Quantization::F32, Compression::None).expect_err("should refuse");
         assert!(err.to_string().contains("dimensions"), "{err}");
     }
 
@@ -721,7 +913,7 @@ mod tests {
     fn write_shard_rejects_a_chunk_with_a_dangling_document() {
         let docs = vec![doc("a.md", "A")];
         let chunks = vec![chunk(3, "", "body", vec![1.0, 0.0])];
-        let err = write_shard(&docs, &chunks, 2, Quantization::F32).expect_err("should refuse");
+        let err = write_shard(&docs, &chunks, 2, Quantization::F32, Compression::None).expect_err("should refuse");
         assert!(err.to_string().contains("refers to document"), "{err}");
     }
 
@@ -735,7 +927,7 @@ mod tests {
     fn read_shard_rejects_a_truncated_file() {
         let docs = vec![doc("a.md", "A")];
         let chunks = vec![chunk(0, "", "body", vec![1.0, 0.0])];
-        let bytes = write_shard(&docs, &chunks, 2, Quantization::F32).expect("write");
+        let bytes = write_shard(&docs, &chunks, 2, Quantization::F32, Compression::None).expect("write");
         let err = read_shard(&bytes[..bytes.len() - 4]).expect_err("should refuse");
         let msg = err.to_string();
         assert!(
@@ -798,6 +990,24 @@ mod tests {
         assert!(err.to_string().contains("re-export"), "{err}");
     }
 
+    /// A manifest written before compression existed has no `compression` field
+    /// at all. It must still reach the version check and its actionable error,
+    /// rather than fail as a parse error about a missing field.
+    #[test]
+    fn manifest_refuses_a_v2_manifest_that_predates_compression() {
+        let json = r#"{
+            "format_version": 2,
+            "created_unix": 0,
+            "model": {"id": "bge-small-en-v1.5", "pooling": "cls", "dim": 384},
+            "quantization": "i8",
+            "roots": ["vault"],
+            "shard_docs": 256,
+            "shards": []
+        }"#;
+        let err = Manifest::from_json(json).expect_err("should refuse");
+        assert!(err.to_string().contains("re-export"), "{err}");
+    }
+
     #[test]
     fn open_assembles_candidates_with_relative_paths() {
         let docs = vec![doc("a.md", "A"), doc("nested/b.md", "B")];
@@ -833,8 +1043,8 @@ mod tests {
             chunk(1, "", "gamma", vec![0.5, 0.5]),
         ];
 
-        let bytes_a = write_shard(&docs_a, &chunks_a, 2, Quantization::F32).unwrap();
-        let bytes_b = write_shard(&docs_b, &chunks_b, 2, Quantization::F32).unwrap();
+        let bytes_a = write_shard(&docs_a, &chunks_a, 2, Quantization::F32, Compression::None).unwrap();
+        let bytes_b = write_shard(&docs_b, &chunks_b, 2, Quantization::F32, Compression::None).unwrap();
         let m = manifest(
             vec![
                 ShardInfo {
@@ -876,7 +1086,7 @@ mod tests {
     #[test]
     fn open_rejects_a_shard_that_does_not_match_the_manifest() {
         let docs = vec![doc("a.md", "A")];
-        let bytes = write_shard(&docs, &[chunk(0, "", "x", vec![1.0, 0.0])], 2, Quantization::F32)
+        let bytes = write_shard(&docs, &[chunk(0, "", "x", vec![1.0, 0.0])], 2, Quantization::F32, Compression::None)
             .unwrap();
         let m = manifest(
             vec![ShardInfo {
