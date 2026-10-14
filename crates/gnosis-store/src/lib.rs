@@ -15,7 +15,9 @@ use search::Hit;
 /// scattered across index names, `--in` validation, and match arms) so an
 /// unsupported space is a compile error almost everywhere but the CLI
 /// boundary, where `FromStr` turns it into one clear, user-facing error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Space {
     Text,
@@ -56,6 +58,27 @@ impl FromStr for Space {
                     .join(", ")
             ),
         }
+    }
+}
+
+/// The one modality `search` retrieves from within a space.
+///
+/// A space can hold several modalities, but only one of them is what a user
+/// means by searching it. The `image` space additionally stores CLIP-text
+/// title proxies, which exist so `related` can traverse from an image to a note
+/// and back; they are not themselves search results. `related` therefore spans
+/// every modality while `search` targets exactly this one.
+///
+/// Lives here, in the portable crate, rather than beside the SQLite store:
+/// every backend that answers a search has to apply the same rule, and a client
+/// reading a portable artifact that got this wrong would reproduce P0 — CLIP's
+/// modality gap (measured on a real vault: text->image peaks around 0.36,
+/// text->title averages 0.76) put a title proxy ahead of every real image, so
+/// image search returned nothing.
+pub fn search_modality(space: Space) -> &'static str {
+    match space {
+        Space::Text => "text",
+        Space::Image => "image",
     }
 }
 
