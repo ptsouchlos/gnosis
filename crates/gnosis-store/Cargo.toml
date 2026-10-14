@@ -7,6 +7,7 @@ description = "Durable document/chunk storage interface for gnosis"
 [dependencies]
 anyhow = { workspace = true }
 blake3 = { workspace = true }
+miniz_oxide = { workspace = true }
 search = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
