@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use search::{Candidate, Hit};
-use store::{DocWrite, Stats};
+use store::{DocWrite, Stats, search_modality};
 pub use store::{Space, Store, TextQuery};
 use usearch::{Index, IndexOptions, Key, MetricKind, ScalarKind};
 
@@ -690,20 +690,6 @@ impl SqliteStore {
             .context("index path is not valid UTF-8")?;
         index.save(path_str)?;
         Ok(())
-    }
-}
-
-/// The one modality `search` retrieves from within a space.
-///
-/// A space can hold several modalities, but only one of them is what a user
-/// means by searching it. The `image` space additionally stores CLIP-text
-/// title proxies, which exist so `related` can traverse from an image to a
-/// note and back; they are not themselves search results. `related` therefore
-/// spans every modality while `search` targets exactly this one.
-fn search_modality(space: Space) -> &'static str {
-    match space {
-        Space::Text => "text",
-        Space::Image => "image",
     }
 }
 

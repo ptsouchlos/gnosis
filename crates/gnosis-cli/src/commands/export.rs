@@ -5,7 +5,8 @@ use anyhow::{Context, Result, bail};
 
 use store::artifact::{
     ARTIFACT_FORMAT_VERSION, ArtifactChunk, Compression, DocumentEntry, Manifest, ModelInfo,
-    Quantization, ShardInfo, assign_shard, shard_hash, shard_name, write_shard,
+    Quantization, ShardInfo, SpaceInfo, SpaceSpec, assign_shard, shard_hash, shard_name,
+    write_shard,
 };
 use store::{Space, Store};
 
@@ -34,13 +35,20 @@ pub struct ExportArgs {
     /// Directory to write the artifact into (created if missing).
     #[arg(long)]
     pub out: PathBuf,
-    /// Vector precision in the artifact. `f32` is exact; `i8` is ~4x smaller.
+    /// Vector precision in the artifact. `f32` is exact; `i8` is ~4x smaller,
+    /// measured at 0.98 recall@10 against exact in the text space but 0.93 in
+    /// the image space, where CLIP's scores sit in a much narrower band.
     #[arg(long, default_value = "f32")]
     pub quantize: String,
     /// Compression for the artifact's text. `deflate` roughly halves it;
     /// `none` leaves a shard's text greppable.
     #[arg(long, default_value = "deflate")]
     pub compress: String,
+    /// Vector spaces to export, comma-separated. Defaults to every space the
+    /// index holds; `--space text` drops the image space, whose title proxies
+    /// cost one vector per document even in a vault with no images.
+    #[arg(long, value_delimiter = ',')]
+    pub space: Vec<String>,
     /// Target documents per shard.
     #[arg(long, default_value_t = DEFAULT_SHARD_DOCS)]
     pub shard_docs: usize,
@@ -66,6 +74,14 @@ pub fn execute(ws: &Workspace, args: ExportArgs) -> Result<()> {
         "deflate" => Compression::Deflate,
         other => bail!("unknown --compress '{other}' (try: deflate, none)"),
     };
+    let wanted: Vec<Space> = if args.space.is_empty() {
+        Space::ALL.to_vec()
+    } else {
+        args.space
+            .iter()
+            .map(|s| s.parse::<Space>())
+            .collect::<Result<_>>()?
+    };
     if args.shard_docs == 0 {
         bail!("--shard-docs must be at least 1");
     }
@@ -79,6 +95,7 @@ pub fn execute(ws: &Workspace, args: ExportArgs) -> Result<()> {
         &ws.config.embed.text.model,
         quantization,
         compression,
+        &wanted,
         args.shard_docs,
     )?;
 
@@ -140,14 +157,17 @@ pub fn execute(ws: &Workspace, args: ExportArgs) -> Result<()> {
         "Exported {documents} documents, {chunks} chunks to {}",
         out.display()
     );
-    println!(
-        "  model {} ({} pooling, {}d), vectors {}, text {}",
-        manifest.model.id,
-        manifest.model.pooling,
-        manifest.model.dim,
-        args.quantize,
-        args.compress
-    );
+    for info in &manifest.spaces {
+        let query = match &info.model.query_id {
+            Some(id) => format!(", queried with {id}"),
+            None => String::new(),
+        };
+        println!(
+            "  {} space: {} ({} pooling, {}d){query}",
+            info.space, info.model.id, info.model.pooling, info.model.dim
+        );
+    }
+    println!("  vectors {}, text {}", args.quantize, args.compress);
     print!(
         "  {} shard(s): {written} written ({})",
         shards.len(),
@@ -168,12 +188,13 @@ pub fn execute(ws: &Workspace, args: ExportArgs) -> Result<()> {
 ///
 /// Every field here re-encodes or reassigns the contents of *every* shard, so a
 /// change to any of them makes the old hashes meaningless: a model or dimension
-/// change replaces the vectors, quantization and compression change their
-/// encoding, and `shard_docs` moves documents between shards. Missing one would
+/// change replaces the vectors, adding or dropping a space changes every
+/// shard's section table, quantization and compression change the encoding, and
+/// `shard_docs` moves documents between shards. Missing one would
 /// not fail loudly — it would leave stale shards in place and quietly serve an
 /// artifact that mixes two encodings.
 fn carries_over(old: &Manifest, new: &Manifest) -> bool {
-    old.model == new.model
+    old.spaces == new.spaces
         && old.quantization == new.quantization
         && old.compression == new.compression
         && old.shard_docs == new.shard_docs
@@ -202,9 +223,31 @@ pub(crate) fn build_artifact(
     configured_model: &str,
     quantization: Quantization,
     compression: Compression,
+    wanted: &[Space],
     shard_docs: usize,
 ) -> Result<(Manifest, Vec<ShardBody>)> {
-    let model = model_info(store, configured_model)?;
+    // One `SpaceInfo` per space the index holds *and* the caller asked for, in
+    // `Space::ALL` order so an artifact's section order does not depend on how
+    // `--space` was spelled.
+    let mut spaces: Vec<SpaceInfo> = Vec::new();
+    for space in Space::ALL {
+        if !wanted.contains(space) {
+            continue;
+        }
+        let model = match space {
+            Space::Text => Some(text_model_info(store, configured_model)?),
+            Space::Image => image_model_info(store)?,
+        };
+        if let Some(model) = model {
+            spaces.push(SpaceInfo {
+                space: *space,
+                model,
+            });
+        }
+    }
+    if !spaces.iter().any(|s| s.space == Space::Text) {
+        bail!("the text space is not exportable from this index — run `gnosis index`");
+    }
 
     let docs = store.export_documents()?;
     if docs.is_empty() {
@@ -246,48 +289,58 @@ pub(crate) fn build_artifact(
         placement.insert(doc.id, (shard, local));
     }
 
-    // Text only so far. Image chunks are 512d CLIP vectors, so a mixed artifact
-    // needs a per-space dim and that is its own step.
     let mut shard_chunks: Vec<Vec<ArtifactChunk>> = vec![Vec::new(); shard_count];
-    let mut total_chunks = 0usize;
-    for chunk in store.export_chunks(Space::Text)? {
-        let Some(&(shard, local)) = placement.get(&chunk.doc_id) else {
-            // A chunk whose document vanished between the two queries. Not
-            // expected inside one process, but skipping beats writing a
-            // dangling index into the artifact.
-            continue;
-        };
-        if chunk.vector.len() != model.dim {
-            bail!(
-                "chunk of document {} has {} dimensions but the index records {} — \
-                 run `gnosis rebuild`",
-                shard_docs_out[shard][local].path,
-                chunk.vector.len(),
-                model.dim
-            );
+    let mut text_chunks = 0usize;
+    for info in &spaces {
+        for chunk in store.export_chunks(info.space)? {
+            let Some(&(shard, local)) = placement.get(&chunk.doc_id) else {
+                // A chunk whose document vanished between the two queries. Not
+                // expected inside one process, but skipping beats writing a
+                // dangling index into the artifact.
+                continue;
+            };
+            if chunk.vector.len() != info.model.dim {
+                bail!(
+                    "{} chunk of document {} has {} dimensions but the index records {} — \
+                     run `gnosis rebuild`",
+                    info.space,
+                    shard_docs_out[shard][local].path,
+                    chunk.vector.len(),
+                    info.model.dim
+                );
+            }
+            shard_chunks[shard].push(ArtifactChunk {
+                doc_index: local,
+                ord: chunk.ord,
+                space: chunk.space,
+                modality: chunk.modality,
+                heading_path: chunk.heading_path,
+                text: chunk.text,
+                vector: chunk.vector,
+            });
+            if info.space == Space::Text {
+                text_chunks += 1;
+            }
         }
-        shard_chunks[shard].push(ArtifactChunk {
-            doc_index: local,
-            ord: chunk.ord,
-            space: chunk.space,
-            modality: chunk.modality,
-            heading_path: chunk.heading_path,
-            text: chunk.text,
-            vector: chunk.vector,
-        });
-        total_chunks += 1;
     }
-    if total_chunks == 0 {
+    if text_chunks == 0 {
         bail!("the index holds no text vectors — nothing to export");
     }
 
+    let specs: Vec<SpaceSpec> = spaces
+        .iter()
+        .map(|s| SpaceSpec {
+            space: s.space,
+            dim: s.model.dim,
+        })
+        .collect();
     let mut infos = Vec::with_capacity(shard_count);
     let mut bodies = Vec::with_capacity(shard_count);
     for i in 0..shard_count {
         let body = write_shard(
             &shard_docs_out[i],
             &shard_chunks[i],
-            model.dim,
+            &specs,
             quantization,
             compression,
         )?;
@@ -303,7 +356,7 @@ pub(crate) fn build_artifact(
     let manifest = Manifest {
         format_version: ARTIFACT_FORMAT_VERSION,
         created_unix: now_unix(),
-        model,
+        spaces,
         quantization,
         compression,
         roots,
@@ -313,13 +366,13 @@ pub(crate) fn build_artifact(
     Ok((manifest, bodies))
 }
 
-/// Which model built this index, and how a client reproduces a query vector in
-/// its space.
+/// Which model built this index's text space, and how a client reproduces a
+/// query vector in it.
 ///
 /// The model id comes from `meta` rather than from config: config can be edited
 /// after indexing, and what matters is what actually produced the stored
 /// vectors.
-fn model_info(store: &SqliteStore, configured: &str) -> Result<ModelInfo> {
+fn text_model_info(store: &SqliteStore, configured: &str) -> Result<ModelInfo> {
     let id = store
         .get_meta("model.text")?
         .unwrap_or_else(|| configured.to_string());
@@ -334,8 +387,45 @@ fn model_info(store: &SqliteStore, configured: &str) -> Result<ModelInfo> {
         id,
         pooling: pooling.to_string(),
         dim,
+        query_id: None,
     })
 }
+
+/// Which models built the image space, if this index has one.
+///
+/// Two models, not one. The stored vectors come from CLIP's vision tower
+/// (`model.image_vision`) for real images and from CLIP's text tower
+/// (`model.image_text`) for the title proxies; a client's *query* always goes
+/// through the text tower, which is why it is recorded separately. `pooling`
+/// describes that query path — fastembed pools mean over
+/// `Qdrant/clip-ViT-B-32-text`, which is not the EOS-token convention a client
+/// reaching for a stock CLIP text encoder would get, so it has to be stated.
+///
+/// Returns `None` when the index holds no image space, which is the default:
+/// image embedding is opt-in.
+fn image_model_info(store: &SqliteStore) -> Result<Option<ModelInfo>> {
+    let Some(vision) = store.get_meta("model.image_vision")? else {
+        return Ok(None);
+    };
+    let dim: usize = store
+        .get_meta("dim.image")?
+        .and_then(|d| d.parse().ok())
+        .context("the index records an image model but not its dimensionality — rebuild")?;
+    let query_id = store
+        .get_meta("model.image_text")?
+        .context("the index records an image model but not the text tower that queries it")?;
+    Ok(Some(ModelInfo {
+        id: vision,
+        pooling: CLIP_TEXT_POOLING.to_string(),
+        dim,
+        query_id: Some(query_id),
+    }))
+}
+
+/// How the CLIP text tower pools, as fastembed configures it. Hard-coded rather
+/// than resolved through `resolve_pooling`, which knows only the text-space
+/// models.
+const CLIP_TEXT_POOLING: &str = "mean";
 
 /// A vault's final path component — enough to tell two vaults apart in results
 /// without recording where either lives.
@@ -429,6 +519,97 @@ mod tests {
         store
     }
 
+    /// The seeded store plus an image space: a photo with a CLIP vision vector,
+    /// and a title proxy on a *note* — which is what the indexer does for every
+    /// markdown file once image embedding is on. The proxy has to belong to a
+    /// different document from the image, or best-chunk-per-document would hide
+    /// a reader that forgot to filter by modality.
+    ///
+    /// At 3d, so a wrong stride shows up rather than happening to line up with
+    /// the text space's 4.
+    fn with_image_space(store: &mut SqliteStore) {
+        store
+            .set_meta("model.image_vision", "clip-vit-b-32")
+            .unwrap();
+        store.set_meta("model.image_text", "clip-vit-b-32").unwrap();
+        store.set_meta("dim.image", "3").unwrap();
+        store
+            .replace_document(&DocWrite {
+                path: "/vault/photo.png",
+                kind: "image",
+                source_root: "/vault",
+                content_hash: b"img",
+                mtime: 7,
+                title: "Photo",
+                frontmatter: None,
+                indexed_at: 0,
+                chunks: &[
+                    ChunkWrite {
+                        ord: 0,
+                        space: "image".to_string(),
+                        modality: "image".to_string(),
+                        text: None,
+                        heading_path: String::new(),
+                        vector: vec![0.0, 0.0, 1.0],
+                    },
+                    ChunkWrite {
+                        ord: 1,
+                        space: "image".to_string(),
+                        modality: "text_title".to_string(),
+                        text: Some("Photo".to_string()),
+                        heading_path: String::new(),
+                        vector: vec![0.0, 1.0, 0.0],
+                    },
+                ],
+                links: &[],
+                tags: &[],
+                width: Some(800),
+                height: Some(600),
+            })
+            .unwrap();
+        // near.md as the indexer would write it with image embedding on: its
+        // text chunk, plus a CLIP-text proxy for its title.
+        store
+            .replace_document(&DocWrite {
+                path: "/vault/near.md",
+                kind: "markdown",
+                source_root: "/vault",
+                content_hash: b"hash",
+                mtime: 42,
+                title: "Near",
+                frontmatter: None,
+                indexed_at: 0,
+                chunks: &[
+                    ChunkWrite {
+                        ord: 0,
+                        space: "text".to_string(),
+                        modality: "text".to_string(),
+                        text: Some("alpha beta".to_string()),
+                        heading_path: "Heading".to_string(),
+                        vector: vec![1.0, 0.0, 0.0, 0.0],
+                    },
+                    ChunkWrite {
+                        ord: 1,
+                        space: "image".to_string(),
+                        modality: "text_title".to_string(),
+                        text: Some("Near".to_string()),
+                        heading_path: String::new(),
+                        vector: vec![0.0, 0.0, 1.0],
+                    },
+                ],
+                links: &["mid".to_string()],
+                tags: &["note".to_string()],
+                width: None,
+                height: None,
+            })
+            .unwrap();
+    }
+
+    /// The text space's model, which most tests are about.
+    fn text_space(manifest: &Manifest) -> &ModelInfo {
+        manifest.space(Space::Text).expect("a text space")
+    }
+
     fn open_artifact(manifest: &Manifest, shards: Vec<ShardBody>) -> Artifact {
         Artifact::open(&manifest.to_json().unwrap(), &shards).expect("artifact should open")
     }
@@ -439,7 +620,14 @@ mod tests {
         quantization: Quantization,
         compression: Compression,
     ) -> (Manifest, Vec<ShardBody>) {
-        build_artifact(store, "bge-small-en-v1.5", quantization, compression, 256).unwrap()
+        build_artifact(
+            store,
+            "bge-small-en-v1.5",
+            quantization,
+            compression,
+            Space::ALL,
+            256,
+        ).unwrap()
     }
 
     /// **The acceptance gate for this format.** Querying an artifact must
@@ -459,7 +647,7 @@ mod tests {
         let (manifest, shards) =
             build_one(&store, Quantization::F32, Compression::Deflate);
         let artifact = open_artifact(&manifest, shards);
-        let from_artifact = search::rank(&query, artifact.candidates(Space::Text), 10);
+        let from_artifact = search::rank(&query, artifact.search_candidates(Space::Text), 10);
 
         assert_eq!(from_db.len(), 3);
         assert_eq!(from_artifact.len(), from_db.len());
@@ -529,12 +717,12 @@ mod tests {
         let store = seeded_store(&dir);
         let (manifest, shards) = build_one(&store, Quantization::F32, Compression::Deflate);
 
-        assert_eq!(manifest.model.id, "bge-small-en-v1.5");
+        assert_eq!(text_space(&manifest).id, "bge-small-en-v1.5");
         assert_eq!(
-            manifest.model.pooling, "cls",
+            text_space(&manifest).pooling, "cls",
             "a client that guesses pooling produces plausible, wrong vectors"
         );
-        assert_eq!(manifest.model.dim, 4);
+        assert_eq!(text_space(&manifest).dim, 4);
         let artifact = open_artifact(&manifest, shards);
         assert_eq!(artifact.documents().len(), 3);
         for doc in artifact.documents() {
@@ -567,7 +755,7 @@ mod tests {
     fn model_info_prefers_what_the_index_recorded_over_config() {
         let dir = temp_dir("model");
         let store = seeded_store(&dir);
-        let model = model_info(&store, "all-MiniLM-L6-v2").unwrap();
+        let model = text_model_info(&store, "all-MiniLM-L6-v2").unwrap();
         assert_eq!(model.id, "bge-small-en-v1.5");
         assert_eq!(model.pooling, "cls");
         let _ = std::fs::remove_dir_all(dir);
@@ -578,7 +766,14 @@ mod tests {
         let dir = temp_dir("unknown");
         let store = seeded_store(&dir);
         store.set_meta("model.text", "some-future-model").unwrap();
-        let err = build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, Compression::Deflate, 256)
+        let err = build_artifact(
+            &store,
+            "bge-small-en-v1.5",
+            Quantization::F32,
+            Compression::Deflate,
+            Space::ALL,
+            256,
+        )
             .expect_err("should refuse");
         assert!(err.to_string().contains("some-future-model"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
@@ -590,7 +785,14 @@ mod tests {
         let store = seeded_store(&dir);
         // One document per shard, so the split is unambiguous.
         let (manifest, shards) =
-            build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, Compression::Deflate, 1).unwrap();
+            build_artifact(
+            &store,
+            "bge-small-en-v1.5",
+            Quantization::F32,
+            Compression::Deflate,
+            Space::ALL,
+            1,
+        ).unwrap();
 
         assert_eq!(manifest.shards.len(), 3, "three documents, one per shard");
         assert_eq!(shards.len(), 3);
@@ -620,9 +822,16 @@ mod tests {
         let mut rankings = Vec::new();
         for shard_docs in [1, 2, 256] {
             let (manifest, shards) =
-                build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, Compression::Deflate, shard_docs).unwrap();
+                build_artifact(
+            &store,
+            "bge-small-en-v1.5",
+            Quantization::F32,
+            Compression::Deflate,
+            Space::ALL,
+            shard_docs,
+        ).unwrap();
             let artifact = open_artifact(&manifest, shards);
-            let hits = search::rank(&query, artifact.candidates(Space::Text), 10);
+            let hits = search::rank(&query, artifact.search_candidates(Space::Text), 10);
             rankings.push(
                 hits.iter()
                     .map(|h| (h.path.clone(), h.score))
@@ -651,7 +860,14 @@ mod tests {
     fn adding_a_note_dirties_only_the_shard_it_lands_in() {
         let dir = temp_dir("insert");
         let mut store = seeded_store(&dir);
-        let (_, before) = build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, Compression::Deflate, 2).unwrap();
+        let (_, before) = build_artifact(
+            &store,
+            "bge-small-en-v1.5",
+            Quantization::F32,
+            Compression::Deflate,
+            Space::ALL,
+            2,
+        ).unwrap();
         assert_eq!(before.len(), 2, "three documents at two per shard");
 
         store
@@ -681,7 +897,14 @@ mod tests {
             .unwrap();
 
         let (manifest, after) =
-            build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, Compression::Deflate, 2).unwrap();
+            build_artifact(
+            &store,
+            "bge-small-en-v1.5",
+            Quantization::F32,
+            Compression::Deflate,
+            Space::ALL,
+            2,
+        ).unwrap();
         assert_eq!(after.len(), 2, "four documents at two per shard is still two shards");
 
         let changed = before
@@ -710,7 +933,14 @@ mod tests {
         let mut store = seeded_store(&dir);
         // Three shards for three documents, and keep it there by exporting at
         // the same shard_docs after the edit.
-        let (_, before) = build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, Compression::Deflate, 1).unwrap();
+        let (_, before) = build_artifact(
+            &store,
+            "bge-small-en-v1.5",
+            Quantization::F32,
+            Compression::Deflate,
+            Space::ALL,
+            1,
+        ).unwrap();
 
         store
             .replace_document(&DocWrite {
@@ -737,7 +967,14 @@ mod tests {
             })
             .unwrap();
 
-        let (_, after) = build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, Compression::Deflate, 1).unwrap();
+        let (_, after) = build_artifact(
+            &store,
+            "bge-small-en-v1.5",
+            Quantization::F32,
+            Compression::Deflate,
+            Space::ALL,
+            1,
+        ).unwrap();
         assert_eq!(before.len(), after.len(), "shard count should not change");
 
         let changed = before
@@ -771,7 +1008,7 @@ mod tests {
         );
 
         let artifact = open_artifact(&manifest, i8_shards);
-        let hits = search::rank(&query, artifact.candidates(Space::Text), 10);
+        let hits = search::rank(&query, artifact.search_candidates(Space::Text), 10);
         let order: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
         assert_eq!(order, vec!["near.md", "mid.md", "deep/far.md"]);
         let _ = std::fs::remove_dir_all(dir);
@@ -800,7 +1037,7 @@ mod tests {
         let packed = open_artifact(&packed_manifest, packed_shards);
         assert_eq!(packed.documents(), plain.documents());
         let ranked = |a: &Artifact| -> Vec<(String, f32, String)> {
-            search::rank(&query, a.candidates(Space::Text), 10)
+            search::rank(&query, a.search_candidates(Space::Text), 10)
                 .into_iter()
                 .map(|h| (h.path, h.score, h.text))
                 .collect()
@@ -834,9 +1071,115 @@ mod tests {
         assert!(!carries_over(&base, &other), "shard_docs must invalidate");
 
         let mut other = base.clone();
-        other.model.id = "multilingual-e5-small".to_string();
+        other.spaces[0].model.id = "multilingual-e5-small".to_string();
         assert!(!carries_over(&base, &other), "the model must invalidate");
 
+        let mut other = base.clone();
+        other.spaces.clear();
+        assert!(!carries_over(&base, &other), "dropping a space must invalidate");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The image space travels at its own dimensionality beside the text
+    /// space's, which is what v4 is for, and a search of it returns the image
+    /// rather than the title proxy.
+    #[test]
+    fn an_index_with_images_exports_both_spaces() {
+        let dir = temp_dir("images");
+        let mut store = seeded_store(&dir);
+        with_image_space(&mut store);
+
+        let (manifest, shards) = build_one(&store, Quantization::F32, Compression::Deflate);
+        assert_eq!(text_space(&manifest).dim, 4);
+        let image = manifest.space(Space::Image).expect("an image space");
+        assert_eq!(image.dim, 3);
+        assert_eq!(image.id, "clip-vit-b-32");
+        assert_eq!(
+            image.query_id.as_deref(),
+            Some("clip-vit-b-32"),
+            "a client queries the image space through CLIP's text tower"
+        );
+
+        let artifact = open_artifact(&manifest, shards);
+        let query = [0.0, 0.0, 1.0];
+        let hits = search::rank(&query, artifact.search_candidates(Space::Image), 10);
+        assert_eq!(
+            hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+            vec!["photo.png"],
+            "a search of the image space must not return the title proxy"
+        );
+        // The acceptance gate, now for the image space: the artifact's ranking
+        // is the database's ranking.
+        let from_db = store
+            .search_space(Space::Image, &query, 10, &TextQuery::default())
+            .unwrap();
+        assert_eq!(from_db.len(), hits.len());
+        for (db, art) in from_db.iter().zip(&hits) {
+            assert_eq!(db.path.trim_start_matches("/vault/"), art.path);
+            assert_eq!(db.score, art.score, "score diverged for {}", art.path);
+        }
+        assert_eq!(
+            artifact.related_candidates(Space::Image).len(),
+            3,
+            "related must still see both title proxies and the image"
+        );
+        // The text space is untouched by the image space riding along.
+        let text = search::rank(&[1.0, 0.0, 0.0, 0.0], artifact.search_candidates(Space::Text), 10);
+        assert_eq!(text.len(), 3);
+        assert_eq!(text[0].path, "near.md");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The image space costs one vector per document even in a vault with no
+    /// images, because every note gets a title proxy. `--space text` is how a
+    /// user who does not want image search declines that.
+    #[test]
+    fn space_text_drops_the_image_space_from_the_artifact() {
+        let dir = temp_dir("spacefilter");
+        let mut store = seeded_store(&dir);
+        with_image_space(&mut store);
+
+        let (manifest, shards) = build_artifact(
+            &store,
+            "bge-small-en-v1.5",
+            Quantization::F32,
+            Compression::Deflate,
+            &[Space::Text],
+            256,
+        )
+        .unwrap();
+        assert!(manifest.space(Space::Image).is_none());
+        let artifact = open_artifact(&manifest, shards);
+        assert!(artifact.related_candidates(Space::Image).is_empty());
+        assert_eq!(
+            artifact.documents().len(),
+            4,
+            "the image document still travels — its text-space neighbors link to it"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An index with image embedding switched off must not grow an empty image
+    /// space, and asking for one explicitly must not invent it.
+    #[test]
+    fn an_index_without_images_exports_only_the_text_space() {
+        let dir = temp_dir("noimages");
+        let store = seeded_store(&dir);
+        let (manifest, _) = build_one(&store, Quantization::F32, Compression::Deflate);
+        assert_eq!(manifest.spaces.len(), 1);
+        assert!(manifest.space(Space::Image).is_none());
+
+        let (explicit, _) = build_artifact(
+            &store,
+            "bge-small-en-v1.5",
+            Quantization::F32,
+            Compression::Deflate,
+            &[Space::Image, Space::Text],
+            256,
+        )
+        .unwrap();
+        assert!(explicit.space(Space::Image).is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

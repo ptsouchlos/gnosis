@@ -29,6 +29,11 @@ use crate::Space;
 /// Bumped whenever the manifest or shard layout changes incompatibly. A reader
 /// refuses an unknown version rather than mis-parsing one.
 ///
+/// **v4** gives a shard one section per vector space, each with its own
+/// dimensionality and its own fixed-stride vector block, so the image space
+/// (CLIP, 512d) can travel beside the text space (384d) in one artifact. v3 had
+/// a single dimensionality per shard and could carry only one space.
+///
 /// **v3** deflates the two text-bearing blocks of a shard — the document JSON
 /// and the string blob. Measured on scifact, text was 70% of an i8 artifact and
 /// vectors 21%, so compression halves the artifact where quantization could not:
@@ -40,13 +45,17 @@ use crate::Space;
 /// — 5.4 MB at 20k documents — and rewrote in full on every export, so sharding
 /// the chunks alone would have saved nothing. The artifact is derived and
 /// regenerable, so the fix was a version bump rather than a migration.
-pub const ARTIFACT_FORMAT_VERSION: u32 = 3;
+pub const ARTIFACT_FORMAT_VERSION: u32 = 4;
 
 /// Shard file magic: "GNSA" (gnosis artifact).
 const SHARD_MAGIC: &[u8; 4] = b"GNSA";
 
-/// Byte length of the shard header.
-const SHARD_HEADER_LEN: usize = 24;
+/// Byte length of the shard header, before the section table.
+const SHARD_HEADER_LEN: usize = 16;
+
+/// Byte length of one section-table entry: a space, its dimensionality and how
+/// many chunks it holds.
+const SECTION_LEN: usize = 12;
 
 /// Byte length of one per-chunk record in a shard.
 const RECORD_LEN: usize = 32;
@@ -136,17 +145,35 @@ impl Compression {
     }
 }
 
-/// Which model produced the vectors, and how to reproduce a query vector in
-/// the same space.
+/// Which model produced one space's vectors, and how to reproduce a query
+/// vector in the same space.
 ///
 /// `pooling` is not decoration. fastembed pools CLS for the whole BGE family
 /// and mean for every multilingual-E5 size, so a client cannot infer it from
 /// the dimensionality or guess one value for all models.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelInfo {
+    /// What produced the *stored* vectors.
     pub id: String,
     pub pooling: String,
     pub dim: usize,
+    /// What a client must embed a *query* with, when that is not `id`.
+    ///
+    /// The image space needs this: its stored vectors come from CLIP's vision
+    /// tower, which a client never runs, while a text query has to go through
+    /// CLIP's text tower to land in the same space. Both towers ship under one
+    /// name here, but they are two different models and only one of them can be
+    /// `id`. Absent for the text space, where a query and a document go through
+    /// the same model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_id: Option<String>,
+}
+
+/// One vector space in the artifact, and what a client needs to query it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceInfo {
+    pub space: Space,
+    pub model: ModelInfo,
 }
 
 /// One document in the artifact. Paths are vault-relative; `root` indexes
@@ -187,16 +214,16 @@ pub struct ShardInfo {
 pub struct Manifest {
     pub format_version: u32,
     pub created_unix: i64,
-    pub model: ModelInfo,
+    /// Every space the artifact carries, each with its own model and
+    /// dimensionality. A list rather than a single model because the image
+    /// space is CLIP at 512d while the text space is 384d or 768d, and a client
+    /// querying one must not reach for the other's model.
+    pub spaces: Vec<SpaceInfo>,
     pub quantization: Quantization,
     /// How the shards' text blocks are stored. Each shard also states this in
     /// its own header, which is what the reader parses by; the manifest records
     /// it so a client can see what it will need before fetching a shard, and so
     /// a re-export at a different setting knows every shard must be rewritten.
-    ///
-    /// Defaulted on the way in only so that a superseded manifest parses far
-    /// enough to reach the format-version check and its actionable error.
-    #[serde(default)]
     pub compression: Compression,
     /// Root labels — a vault's final path component, never its absolute path.
     pub roots: Vec<String>,
@@ -211,22 +238,53 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// What produced one space's vectors, if the artifact carries that space.
+    pub fn space(&self, space: Space) -> Option<&ModelInfo> {
+        self.spaces
+            .iter()
+            .find(|s| s.space == space)
+            .map(|s| &s.model)
+    }
+
+    /// Which spaces a shard declares, in manifest order — what `write_shard`
+    /// takes and what a reader checks its sections against.
+    pub fn specs(&self) -> Vec<SpaceSpec> {
+        self.spaces
+            .iter()
+            .map(|s| SpaceSpec {
+                space: s.space,
+                dim: s.model.dim,
+            })
+            .collect()
+    }
+
     pub fn to_json(&self) -> Result<String> {
         serde_json::to_string_pretty(self).context("serializing artifact manifest")
     }
 
+    /// Parse a manifest, refusing any version but this build's.
+    ///
+    /// The version is read on its own, before the rest is deserialized, so that
+    /// a manifest from a superseded version gets the actionable error rather
+    /// than a complaint about whichever field that version happened not to have
+    /// — v2 had no `compression`, v3 no `spaces`. Deserializing first made the
+    /// message depend on what the *next* format change does, which is the kind
+    /// of upgrade path that is never exercised until a user hits it.
     pub fn from_json(json: &str) -> Result<Self> {
-        let manifest: Manifest =
+        let value: serde_json::Value =
             serde_json::from_str(json).context("parsing artifact manifest")?;
-        if manifest.format_version != ARTIFACT_FORMAT_VERSION {
+        let version = value
+            .get("format_version")
+            .and_then(serde_json::Value::as_u64)
+            .context("artifact manifest has no format version")?;
+        if version != ARTIFACT_FORMAT_VERSION as u64 {
             bail!(
-                "artifact format version {} is not supported (this build reads version {}); \
-                 re-export with a matching gnosis",
-                manifest.format_version,
+                "artifact format version {version} is not supported (this build reads version \
+                 {}); re-export with a matching gnosis",
                 ARTIFACT_FORMAT_VERSION
             );
         }
-        Ok(manifest)
+        serde_json::from_value(value).context("parsing artifact manifest")
     }
 }
 
@@ -299,12 +357,31 @@ fn quantize_i8(vector: &[f32]) -> (Vec<i8>, f32) {
     (quantized, scale)
 }
 
+/// One vector space inside a shard: which space, and how wide its vectors are.
+///
+/// A shard declares these up front because the two spaces gnosis indexes have
+/// different dimensionalities — text at 384 or 768, CLIP at 512 — and each gets
+/// its own contiguous, fixed-stride vector block. A single stride for the whole
+/// shard was v3's limitation and the reason the image space could not travel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpaceSpec {
+    pub space: Space,
+    pub dim: usize,
+}
+
 /// Serialize `chunks` into one shard.
 ///
-/// Layout, all little-endian: a header, then the document block, then a
-/// fixed-size record per chunk, then the vector block, then the string blob.
-/// Vectors are contiguous and fixed-stride so a client can scan them without
-/// touching the strings, which is the whole shape of a brute-force query.
+/// Layout, all little-endian: a header, a section table, the document block,
+/// one fixed-size record per chunk, the vector blocks, then the string blob.
+/// Records and vectors are grouped by section, in the order `spaces` declares,
+/// so each space's vectors are contiguous and fixed-stride and a client can
+/// scan the one space it is querying without touching the other or the strings.
+/// That is the whole shape of a brute-force query.
+///
+/// Every chunk's space must be declared in `spaces`, and its vector must match
+/// that space's `dim`. Both are refused rather than coerced: a vector of the
+/// wrong width read at the wrong stride would turn the rest of the block into
+/// noise, and a chunk in an undeclared space would be silently dropped.
 ///
 /// `compression` applies to the document block and the string blob — the two
 /// that hold text — and never to the records or the vectors. Measured on
@@ -320,58 +397,86 @@ fn quantize_i8(vector: &[f32]) -> (Vec<i8>, f32) {
 pub fn write_shard(
     documents: &[DocumentEntry],
     chunks: &[ArtifactChunk],
-    dim: usize,
+    spaces: &[SpaceSpec],
     quantization: Quantization,
     compression: Compression,
 ) -> Result<Vec<u8>> {
+    for (i, spec) in spaces.iter().enumerate() {
+        if spaces[..i].iter().any(|s| s.space == spec.space) {
+            bail!("space '{}' is declared twice in one shard", spec.space);
+        }
+    }
+
     let mut records = Vec::with_capacity(chunks.len() * RECORD_LEN);
-    let mut vectors = Vec::with_capacity(chunks.len() * dim * quantization.bytes_per_dim());
+    let mut vectors: Vec<u8> = Vec::new();
     let mut strings: Vec<u8> = Vec::new();
+    let mut counts = vec![0usize; spaces.len()];
 
-    for chunk in chunks {
-        if chunk.doc_index >= documents.len() {
-            bail!(
-                "chunk refers to document {} but this shard holds {}",
-                chunk.doc_index,
-                documents.len()
-            );
-        }
-        if chunk.vector.len() != dim {
-            bail!(
-                "chunk vector has {} dimensions but the artifact declares {dim}",
-                chunk.vector.len()
-            );
-        }
+    // Grouped by section, in the declared order, so each space's vectors end up
+    // contiguous. The strings follow the same order; nothing outside this
+    // function depends on it, since every record carries its own offsets.
+    for (section, spec) in spaces.iter().enumerate() {
+        for chunk in chunks.iter().filter(|c| c.space == spec.space) {
+            if chunk.doc_index >= documents.len() {
+                bail!(
+                    "chunk refers to document {} but this shard holds {}",
+                    chunk.doc_index,
+                    documents.len()
+                );
+            }
+            if chunk.vector.len() != spec.dim {
+                bail!(
+                    "chunk vector has {} dimensions but the {} space declares {}",
+                    chunk.vector.len(),
+                    spec.space,
+                    spec.dim
+                );
+            }
 
-        let heading_off = strings.len() as u32;
-        strings.extend_from_slice(chunk.heading_path.as_bytes());
-        let text_off = strings.len() as u32;
-        strings.extend_from_slice(chunk.text.as_bytes());
+            let heading_off = strings.len() as u32;
+            strings.extend_from_slice(chunk.heading_path.as_bytes());
+            let text_off = strings.len() as u32;
+            strings.extend_from_slice(chunk.text.as_bytes());
 
-        let scale = match quantization {
-            Quantization::F32 => {
-                for value in &chunk.vector {
-                    vectors.extend_from_slice(&value.to_le_bytes());
+            let scale = match quantization {
+                Quantization::F32 => {
+                    for value in &chunk.vector {
+                        vectors.extend_from_slice(&value.to_le_bytes());
+                    }
+                    1.0f32
                 }
-                1.0f32
-            }
-            Quantization::I8 => {
-                let (quantized, scale) = quantize_i8(&chunk.vector);
-                vectors.extend(quantized.iter().map(|x| *x as u8));
-                scale
-            }
-        };
+                Quantization::I8 => {
+                    let (quantized, scale) = quantize_i8(&chunk.vector);
+                    vectors.extend(quantized.iter().map(|x| *x as u8));
+                    scale
+                }
+            };
 
-        records.extend_from_slice(&(chunk.doc_index as u32).to_le_bytes());
-        records.extend_from_slice(&chunk.ord.to_le_bytes());
-        records.push(space_code(chunk.space));
-        records.push(modality_code(&chunk.modality)?);
-        records.extend_from_slice(&0u16.to_le_bytes()); // reserved, keeps records 4-aligned
-        records.extend_from_slice(&heading_off.to_le_bytes());
-        records.extend_from_slice(&(chunk.heading_path.len() as u32).to_le_bytes());
-        records.extend_from_slice(&text_off.to_le_bytes());
-        records.extend_from_slice(&(chunk.text.len() as u32).to_le_bytes());
-        records.extend_from_slice(&scale.to_le_bytes());
+            records.extend_from_slice(&(chunk.doc_index as u32).to_le_bytes());
+            records.extend_from_slice(&chunk.ord.to_le_bytes());
+            records.push(space_code(chunk.space));
+            records.push(modality_code(&chunk.modality)?);
+            records.extend_from_slice(&0u16.to_le_bytes()); // reserved, keeps records 4-aligned
+            records.extend_from_slice(&heading_off.to_le_bytes());
+            records.extend_from_slice(&(chunk.heading_path.len() as u32).to_le_bytes());
+            records.extend_from_slice(&text_off.to_le_bytes());
+            records.extend_from_slice(&(chunk.text.len() as u32).to_le_bytes());
+            records.extend_from_slice(&scale.to_le_bytes());
+            counts[section] += 1;
+        }
+    }
+    let written: usize = counts.iter().sum();
+    if written != chunks.len() {
+        // The only way to get here is a chunk whose space no section declares.
+        let stray = chunks
+            .iter()
+            .find(|c| !spaces.iter().any(|s| s.space == c.space))
+            .map(|c| c.space.as_str())
+            .unwrap_or("?");
+        bail!(
+            "shard holds {} chunks in the '{stray}' space, which the artifact does not declare",
+            chunks.len() - written
+        );
     }
     debug_assert_eq!(records.len(), chunks.len() * RECORD_LEN);
 
@@ -384,16 +489,26 @@ pub fn write_shard(
     let strings = compression.pack(strings);
 
     let mut out = Vec::with_capacity(
-        SHARD_HEADER_LEN + docs_json.len() + records.len() + vectors.len() + strings.len(),
+        SHARD_HEADER_LEN
+            + spaces.len() * SECTION_LEN
+            + docs_json.len()
+            + records.len()
+            + vectors.len()
+            + strings.len(),
     );
     out.extend_from_slice(SHARD_MAGIC);
     out.extend_from_slice(&(ARTIFACT_FORMAT_VERSION as u16).to_le_bytes());
     out.extend_from_slice(&compression.code().to_le_bytes());
-    out.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(dim as u32).to_le_bytes());
     out.push(quantization.code());
-    out.extend_from_slice(&[0u8; 3]); // pad to a 4-byte boundary
+    out.push(u8::try_from(spaces.len()).context("a shard cannot declare 256 spaces")?);
+    out.extend_from_slice(&0u16.to_le_bytes()); // reserved, keeps the header 4-aligned
     out.extend_from_slice(&(docs_json.len() as u32).to_le_bytes());
+    for (spec, count) in spaces.iter().zip(&counts) {
+        out.push(space_code(spec.space));
+        out.extend_from_slice(&[0u8; 3]); // pad to a 4-byte boundary
+        out.extend_from_slice(&(spec.dim as u32).to_le_bytes());
+        out.extend_from_slice(&(*count as u32).to_le_bytes());
+    }
     out.extend_from_slice(&docs_json);
     out.extend_from_slice(&records);
     out.extend_from_slice(&vectors);
@@ -448,6 +563,9 @@ fn u32_at(bytes: &[u8], offset: usize) -> u32 {
 }
 
 /// Parse one shard back into its documents and chunks.
+///
+/// Chunks come back grouped by section, in the order the shard declares its
+/// spaces — the order [`write_shard`] wrote them in.
 pub fn read_shard(bytes: &[u8]) -> Result<(Vec<DocumentEntry>, Vec<ArtifactChunk>)> {
     if bytes.len() < SHARD_HEADER_LEN {
         bail!("shard is truncated: {} bytes", bytes.len());
@@ -463,12 +581,30 @@ pub fn read_shard(bytes: &[u8]) -> Result<(Vec<DocumentEntry>, Vec<ArtifactChunk
         );
     }
     let compression = Compression::from_code(u16::from_le_bytes([bytes[6], bytes[7]]))?;
-    let count = u32_at(bytes, 8) as usize;
-    let dim = u32_at(bytes, 12) as usize;
-    let quantization = Quantization::from_code(bytes[16])?;
-    let docs_json_len = u32_at(bytes, 20) as usize;
+    let quantization = Quantization::from_code(bytes[8])?;
+    let section_count = bytes[9] as usize;
+    let docs_json_len = u32_at(bytes, 12) as usize;
 
-    let docs_at = SHARD_HEADER_LEN;
+    let sections_at = SHARD_HEADER_LEN;
+    let docs_at = sections_at + section_count * SECTION_LEN;
+    if bytes.len() < docs_at {
+        bail!(
+            "shard is truncated: {} bytes, too short for {section_count} section(s)",
+            bytes.len()
+        );
+    }
+    // (space, dim, chunk count) per section, in the order the vector blocks and
+    // the records follow.
+    let mut sections = Vec::with_capacity(section_count);
+    for i in 0..section_count {
+        let at = sections_at + i * SECTION_LEN;
+        sections.push((
+            space_from_code(bytes[at])?,
+            u32_at(bytes, at + 4) as usize,
+            u32_at(bytes, at + 8) as usize,
+        ));
+    }
+
     let docs_end = docs_at
         .checked_add(docs_json_len)
         .filter(|end| *end <= bytes.len())
@@ -477,9 +613,14 @@ pub fn read_shard(bytes: &[u8]) -> Result<(Vec<DocumentEntry>, Vec<ArtifactChunk
     let documents: Vec<DocumentEntry> =
         serde_json::from_slice(&docs_json).context("parsing a shard's document block")?;
 
+    let count: usize = sections.iter().map(|(_, _, n)| n).sum();
+    let vector_bytes: usize = sections
+        .iter()
+        .map(|(_, dim, n)| n * dim * quantization.bytes_per_dim())
+        .sum();
     let records_at = docs_end;
     let vectors_at = records_at + count * RECORD_LEN;
-    let strings_at = vectors_at + count * dim * quantization.bytes_per_dim();
+    let strings_at = vectors_at + vector_bytes;
     if bytes.len() < strings_at {
         bail!(
             "shard is truncated: {} bytes, expected at least {strings_at} for {count} chunks",
@@ -490,56 +631,73 @@ pub fn read_shard(bytes: &[u8]) -> Result<(Vec<DocumentEntry>, Vec<ArtifactChunk
     let strings = strings.as_slice();
 
     let mut chunks = Vec::with_capacity(count);
-    for i in 0..count {
-        let r = records_at + i * RECORD_LEN;
-        let doc_index = u32_at(bytes, r) as usize;
-        let ord = u32_at(bytes, r + 4);
-        let space = space_from_code(bytes[r + 8])?;
-        let modality = modality_name(bytes[r + 9])?;
-        let heading_off = u32_at(bytes, r + 12) as usize;
-        let heading_len = u32_at(bytes, r + 16) as usize;
-        let text_off = u32_at(bytes, r + 20) as usize;
-        let text_len = u32_at(bytes, r + 24) as usize;
-        let scale = f32::from_le_bytes([
-            bytes[r + 28],
-            bytes[r + 29],
-            bytes[r + 30],
-            bytes[r + 31],
-        ]);
+    let mut record = 0usize;
+    let mut vector_at = vectors_at;
+    for (section_space, dim, section_count) in sections {
+        let stride = dim * quantization.bytes_per_dim();
+        for _ in 0..section_count {
+            let r = records_at + record * RECORD_LEN;
+            let doc_index = u32_at(bytes, r) as usize;
+            let ord = u32_at(bytes, r + 4);
+            let space = space_from_code(bytes[r + 8])?;
+            if space != section_space {
+                // The record and the section table disagree about which space
+                // this vector is in, so its stride is unknowable. Mixing spaces
+                // is the defect P0 was about, so this is refused rather than
+                // resolved in favor of either.
+                bail!(
+                    "shard record {record} says space '{space}' but its section holds \
+                     '{section_space}'"
+                );
+            }
+            let modality = modality_name(bytes[r + 9])?;
+            let heading_off = u32_at(bytes, r + 12) as usize;
+            let heading_len = u32_at(bytes, r + 16) as usize;
+            let text_off = u32_at(bytes, r + 20) as usize;
+            let text_len = u32_at(bytes, r + 24) as usize;
+            let scale = f32::from_le_bytes([
+                bytes[r + 28],
+                bytes[r + 29],
+                bytes[r + 30],
+                bytes[r + 31],
+            ]);
 
-        let heading_path = read_str(strings, heading_off, heading_len, "heading_path")?;
-        let text = read_str(strings, text_off, text_len, "text")?;
+            let heading_path = read_str(strings, heading_off, heading_len, "heading_path")?;
+            let text = read_str(strings, text_off, text_len, "text")?;
 
-        let v = vectors_at + i * dim * quantization.bytes_per_dim();
-        let vector = match quantization {
-            Quantization::F32 => (0..dim)
-                .map(|d| f32::from_le_bytes([
-                    bytes[v + d * 4],
-                    bytes[v + d * 4 + 1],
-                    bytes[v + d * 4 + 2],
-                    bytes[v + d * 4 + 3],
-                ]))
-                .collect(),
-            Quantization::I8 => (0..dim)
-                .map(|d| (bytes[v + d] as i8) as f32 * scale)
-                .collect(),
-        };
+            let v = vector_at;
+            let vector = match quantization {
+                Quantization::F32 => (0..dim)
+                    .map(|d| f32::from_le_bytes([
+                        bytes[v + d * 4],
+                        bytes[v + d * 4 + 1],
+                        bytes[v + d * 4 + 2],
+                        bytes[v + d * 4 + 3],
+                    ]))
+                    .collect(),
+                Quantization::I8 => (0..dim)
+                    .map(|d| (bytes[v + d] as i8) as f32 * scale)
+                    .collect(),
+            };
 
-        if doc_index >= documents.len() {
-            bail!(
-                "shard chunk refers to document {doc_index} but the shard holds {}",
-                documents.len()
-            );
+            if doc_index >= documents.len() {
+                bail!(
+                    "shard chunk refers to document {doc_index} but the shard holds {}",
+                    documents.len()
+                );
+            }
+            chunks.push(ArtifactChunk {
+                doc_index,
+                ord,
+                space,
+                modality: modality.to_string(),
+                heading_path,
+                text,
+                vector,
+            });
+            record += 1;
+            vector_at += stride;
         }
-        chunks.push(ArtifactChunk {
-            doc_index,
-            ord,
-            space,
-            modality: modality.to_string(),
-            heading_path,
-            text,
-            vector,
-        });
     }
     Ok((documents, chunks))
 }
@@ -632,18 +790,45 @@ impl Artifact {
         &self.chunks
     }
 
-    /// Candidates for one space, ready for `search::rank` and the rest of the
-    /// ranking code the CLI uses.
+    /// Candidates a **search** of one space ranks over, ready for
+    /// `search::rank` and the rest of the ranking code the CLI uses.
     ///
     /// This is the reuse surface the plugin exists on: scoring an artifact goes
     /// through the same `gnosis-search` functions as scoring the database, so
     /// the two cannot drift. `path` is **vault-relative** and `source_root` is
     /// a label, not a machine path — a client joins them to whatever the vault
     /// is called locally.
-    pub fn candidates(&self, space: Space) -> Vec<search::Candidate> {
+    ///
+    /// Restricted to the space's search modality, exactly as
+    /// `Store::search_space` is. In the image space that excludes the CLIP-text
+    /// title proxies, and it is not an optimization: CLIP's modality gap puts
+    /// every title proxy ahead of every real image for a text query, which is
+    /// the defect P0 was about. A client that ranked
+    /// [`Artifact::related_candidates`] for a search would reproduce it.
+    pub fn search_candidates(&self, space: Space) -> Vec<search::Candidate> {
+        let modality = crate::search_modality(space);
+        self.collect(space, |c| c.modality == modality)
+    }
+
+    /// Candidates a **`related`** traversal of one space ranks over: every
+    /// modality, as `Store::related_space` does.
+    ///
+    /// The image space's title proxies are the point here — they are what lets
+    /// `related` cross from an image to a note that merely mentions it. S3
+    /// measured that `related` constructs no embedder at all, so this is the
+    /// one full-quality feature a client can offer with no model loaded.
+    pub fn related_candidates(&self, space: Space) -> Vec<search::Candidate> {
+        self.collect(space, |_| true)
+    }
+
+    fn collect(
+        &self,
+        space: Space,
+        keep: impl Fn(&ArtifactChunk) -> bool,
+    ) -> Vec<search::Candidate> {
         self.chunks
             .iter()
-            .filter(|c| c.space == space)
+            .filter(|c| c.space == space && keep(c))
             .filter_map(|c| {
                 let doc = self.documents.get(c.doc_index)?;
                 let root = self.manifest.roots.get(doc.root).cloned().unwrap_or_default();
@@ -666,6 +851,35 @@ impl Artifact {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where a shard's vector block and string blob start, computed from the
+    /// header the way a non-Rust client has to. Used by the tests that assert
+    /// on the raw layout rather than on parsed chunks.
+    fn block_offsets(bytes: &[u8]) -> (usize, usize) {
+        let quantization = Quantization::from_code(bytes[8]).expect("quantization");
+        let sections = bytes[9] as usize;
+        let docs_at = SHARD_HEADER_LEN + sections * SECTION_LEN;
+        let records_at = docs_at + u32_at(bytes, 12) as usize;
+        let mut chunks = 0usize;
+        let mut vector_bytes = 0usize;
+        for i in 0..sections {
+            let at = SHARD_HEADER_LEN + i * SECTION_LEN;
+            let dim = u32_at(bytes, at + 4) as usize;
+            let count = u32_at(bytes, at + 8) as usize;
+            chunks += count;
+            vector_bytes += count * dim * quantization.bytes_per_dim();
+        }
+        let vectors_at = records_at + chunks * RECORD_LEN;
+        (vectors_at, vectors_at + vector_bytes)
+    }
+
+    /// The text space at a width a test can read: two dimensions.
+    fn text2() -> Vec<SpaceSpec> {
+        vec![SpaceSpec {
+            space: Space::Text,
+            dim: 2,
+        }]
+    }
 
     fn chunk(doc_index: usize, heading: &str, text: &str, vector: Vec<f32>) -> ArtifactChunk {
         ArtifactChunk {
@@ -696,11 +910,15 @@ mod tests {
         Manifest {
             format_version: ARTIFACT_FORMAT_VERSION,
             created_unix: 0,
-            model: ModelInfo {
-                id: "bge-small-en-v1.5".to_string(),
-                pooling: "cls".to_string(),
-                dim: 2,
-            },
+            spaces: vec![SpaceInfo {
+                space: Space::Text,
+                model: ModelInfo {
+                    id: "bge-small-en-v1.5".to_string(),
+                    pooling: "cls".to_string(),
+                    dim: 2,
+                    query_id: None,
+                },
+            }],
             quantization,
             compression: Compression::None,
             roots: vec!["vault".to_string()],
@@ -710,7 +928,8 @@ mod tests {
     }
 
     fn one_shard(documents: &[DocumentEntry], chunks: &[ArtifactChunk]) -> (Manifest, Vec<u8>) {
-        let bytes = write_shard(documents, chunks, 2, Quantization::F32, Compression::None).expect("write");
+        let bytes = write_shard(documents, chunks, &text2(), Quantization::F32, Compression::None)
+            .expect("write");
         let m = manifest(
             vec![ShardInfo {
                 name: shard_name(0),
@@ -730,7 +949,7 @@ mod tests {
             chunk(0, "Heading", "first body", vec![1.0, 0.0]),
             chunk(1, "", "second body", vec![0.0, 1.0]),
         ];
-        let bytes = write_shard(&docs, &chunks, 2, Quantization::F32, Compression::None).expect("write");
+        let bytes = write_shard(&docs, &chunks, &text2(), Quantization::F32, Compression::None).expect("write");
         let (back_docs, back_chunks) = read_shard(&bytes).expect("read");
         assert_eq!(back_docs, docs);
         assert_eq!(
@@ -743,7 +962,7 @@ mod tests {
     fn i8_shard_round_trips_within_quantization_error() {
         let docs = vec![doc("a.md", "A")];
         let chunks = vec![chunk(0, "", "body", vec![0.6, -0.8])];
-        let bytes = write_shard(&docs, &chunks, 2, Quantization::I8, Compression::None).expect("write");
+        let bytes = write_shard(&docs, &chunks, &text2(), Quantization::I8, Compression::None).expect("write");
         let (_, back) = read_shard(&bytes).expect("read");
         for (original, restored) in chunks[0].vector.iter().zip(&back[0].vector) {
             assert!(
@@ -764,8 +983,8 @@ mod tests {
                 c
             })
             .collect();
-        let f32_len = write_shard(&docs, &chunks, 384, Quantization::F32, Compression::None).unwrap().len();
-        let i8_len = write_shard(&docs, &chunks, 384, Quantization::I8, Compression::None).unwrap().len();
+        let f32_len = write_shard(&docs, &chunks, &[SpaceSpec { space: Space::Text, dim: 384 }], Quantization::F32, Compression::None).unwrap().len();
+        let i8_len = write_shard(&docs, &chunks, &[SpaceSpec { space: Space::Text, dim: 384 }], Quantization::I8, Compression::None).unwrap().len();
         assert_eq!(f32_len - i8_len, 16 * 384 * 3);
     }
 
@@ -787,7 +1006,7 @@ mod tests {
                 c
             })
             .collect();
-        write_shard(&docs, &chunks, 384, Quantization::I8, compression).expect("write")
+        write_shard(&docs, &chunks, &[SpaceSpec { space: Space::Text, dim: 384 }], Quantization::I8, compression).expect("write")
     }
 
     #[test]
@@ -797,7 +1016,7 @@ mod tests {
             chunk(0, "Heading", "first body", vec![1.0, 0.0]),
             chunk(1, "", "second body", vec![0.0, 1.0]),
         ];
-        let bytes = write_shard(&docs, &chunks, 2, Quantization::F32, Compression::Deflate)
+        let bytes = write_shard(&docs, &chunks, &text2(), Quantization::F32, Compression::Deflate)
             .expect("write");
         let (back_docs, back_chunks) = read_shard(&bytes).expect("read");
         assert_eq!(back_docs, docs);
@@ -814,15 +1033,7 @@ mod tests {
     /// fixture has far less than a real one.
     #[test]
     fn deflate_shrinks_a_shards_string_blob() {
-        let strings_len = |bytes: &[u8]| {
-            let count = u32_at(bytes, 8) as usize;
-            let dim = u32_at(bytes, 12) as usize;
-            let at = SHARD_HEADER_LEN
-                + u32_at(bytes, 20) as usize
-                + count * RECORD_LEN
-                + count * dim;
-            bytes.len() - at
-        };
+        let strings_len = |bytes: &[u8]| bytes.len() - block_offsets(bytes).1;
         let plain = strings_len(&prose_shard(Compression::None));
         let packed = strings_len(&prose_shard(Compression::Deflate));
         assert!(
@@ -837,10 +1048,8 @@ mod tests {
     #[test]
     fn deflate_leaves_the_vector_block_byte_identical() {
         let vectors = |bytes: &[u8]| {
-            let count = u32_at(bytes, 8) as usize;
-            let dim = u32_at(bytes, 12) as usize;
-            let at = SHARD_HEADER_LEN + u32_at(bytes, 20) as usize + count * RECORD_LEN;
-            bytes[at..at + count * dim].to_vec()
+            let (at, end) = block_offsets(bytes);
+            bytes[at..end].to_vec()
         };
         let plain = prose_shard(Compression::None);
         let packed = prose_shard(Compression::Deflate);
@@ -877,6 +1086,108 @@ mod tests {
         assert!(err.to_string().contains("inflating"), "{err}");
     }
 
+    /// Text at 2d beside images at 3d: the shape v4 exists for. Different
+    /// strides in one file is exactly what v3 could not express, so this is the
+    /// step's round trip.
+    #[test]
+    fn a_shard_carries_two_spaces_at_different_dimensionalities() {
+        let spaces = vec![
+            SpaceSpec {
+                space: Space::Text,
+                dim: 2,
+            },
+            SpaceSpec {
+                space: Space::Image,
+                dim: 3,
+            },
+        ];
+        let docs = vec![doc("note.md", "Note"), doc("photo.png", "Photo")];
+        let chunks = vec![
+            chunk(0, "Heading", "body text", vec![1.0, 0.0]),
+            ArtifactChunk {
+                doc_index: 0,
+                ord: 1,
+                space: Space::Image,
+                modality: "text_title".to_string(),
+                heading_path: String::new(),
+                text: "Note".to_string(),
+                vector: vec![0.0, 1.0, 0.0],
+            },
+            ArtifactChunk {
+                doc_index: 1,
+                ord: 0,
+                space: Space::Image,
+                modality: "image".to_string(),
+                heading_path: String::new(),
+                text: String::new(),
+                vector: vec![0.0, 0.0, 1.0],
+            },
+        ];
+        let bytes =
+            write_shard(&docs, &chunks, &spaces, Quantization::F32, Compression::None).unwrap();
+        let (back_docs, back_chunks) = read_shard(&bytes).expect("read");
+        assert_eq!(back_docs, docs);
+        // Grouped by section: the text chunk first, then both image chunks.
+        assert_eq!(back_chunks.len(), 3);
+        assert_eq!(back_chunks[0], chunks[0]);
+        assert_eq!(back_chunks[1], chunks[1]);
+        assert_eq!(back_chunks[2], chunks[2]);
+    }
+
+    /// A chunk whose space no section declares has no stride to be read at, so
+    /// it must be refused on the way in. Dropping it silently would ship an
+    /// artifact that is missing vectors the index has.
+    #[test]
+    fn write_shard_rejects_a_chunk_in_an_undeclared_space() {
+        let docs = vec![doc("photo.png", "Photo")];
+        let chunks = vec![ArtifactChunk {
+            doc_index: 0,
+            ord: 0,
+            space: Space::Image,
+            modality: "image".to_string(),
+            heading_path: String::new(),
+            text: String::new(),
+            vector: vec![1.0, 0.0],
+        }];
+        let err = write_shard(&docs, &chunks, &text2(), Quantization::F32, Compression::None)
+            .expect_err("should refuse");
+        assert!(err.to_string().contains("does not declare"), "{err}");
+    }
+
+    #[test]
+    fn write_shard_rejects_a_space_declared_twice() {
+        let spaces = vec![
+            SpaceSpec {
+                space: Space::Text,
+                dim: 2,
+            },
+            SpaceSpec {
+                space: Space::Text,
+                dim: 4,
+            },
+        ];
+        let err = write_shard(&[], &[], &spaces, Quantization::F32, Compression::None)
+            .expect_err("should refuse");
+        assert!(err.to_string().contains("declared twice"), "{err}");
+    }
+
+    /// A record and the section table disagreeing about a chunk's space means
+    /// its vector would be read at the wrong stride, turning the rest of the
+    /// block into noise. Refused rather than resolved in favor of either.
+    #[test]
+    fn read_shard_rejects_a_record_whose_space_contradicts_its_section() {
+        let docs = vec![doc("a.md", "A")];
+        let chunks = vec![chunk(0, "", "body", vec![1.0, 0.0])];
+        let mut bytes =
+            write_shard(&docs, &chunks, &text2(), Quantization::F32, Compression::None).unwrap();
+        // The first record's space byte: past the header, the one section and
+        // the document block.
+        let records_at = SHARD_HEADER_LEN + SECTION_LEN + u32_at(&bytes, 12) as usize;
+        bytes[records_at + 8] = space_code(Space::Image);
+        let err = read_shard(&bytes).expect_err("should refuse");
+        assert!(err.to_string().contains("but its section holds"), "{err}");
+    }
+
     #[test]
     fn utf8_text_survives_the_string_blob() {
         // Offsets and lengths are byte counts, not character counts — getting
@@ -884,7 +1195,7 @@ mod tests {
         // non-ASCII vaults.
         let docs = vec![doc("한국.md", "한국")];
         let chunks = vec![chunk(0, "제목", "대한민국의 수도는 서울이다", vec![1.0, 0.0])];
-        let bytes = write_shard(&docs, &chunks, 2, Quantization::F32, Compression::None).expect("write");
+        let bytes = write_shard(&docs, &chunks, &text2(), Quantization::F32, Compression::None).expect("write");
         let (back_docs, back_chunks) = read_shard(&bytes).expect("read");
         assert_eq!(back_docs, docs);
         assert_eq!(back_chunks, chunks);
@@ -892,7 +1203,7 @@ mod tests {
 
     #[test]
     fn a_shard_with_no_chunks_is_valid() {
-        let bytes = write_shard(&[], &[], 384, Quantization::F32, Compression::None).expect("write");
+        let bytes = write_shard(&[], &[], &[SpaceSpec { space: Space::Text, dim: 384 }], Quantization::F32, Compression::None).expect("write");
         let (docs, chunks) = read_shard(&bytes).expect("read");
         assert!(docs.is_empty());
         assert!(chunks.is_empty());
@@ -902,7 +1213,7 @@ mod tests {
     fn write_shard_rejects_a_vector_of_the_wrong_dimensionality() {
         let docs = vec![doc("a.md", "A")];
         let chunks = vec![chunk(0, "", "body", vec![1.0, 0.0, 0.0])];
-        let err = write_shard(&docs, &chunks, 2, Quantization::F32, Compression::None).expect_err("should refuse");
+        let err = write_shard(&docs, &chunks, &text2(), Quantization::F32, Compression::None).expect_err("should refuse");
         assert!(err.to_string().contains("dimensions"), "{err}");
     }
 
@@ -913,7 +1224,7 @@ mod tests {
     fn write_shard_rejects_a_chunk_with_a_dangling_document() {
         let docs = vec![doc("a.md", "A")];
         let chunks = vec![chunk(3, "", "body", vec![1.0, 0.0])];
-        let err = write_shard(&docs, &chunks, 2, Quantization::F32, Compression::None).expect_err("should refuse");
+        let err = write_shard(&docs, &chunks, &text2(), Quantization::F32, Compression::None).expect_err("should refuse");
         assert!(err.to_string().contains("refers to document"), "{err}");
     }
 
@@ -927,7 +1238,7 @@ mod tests {
     fn read_shard_rejects_a_truncated_file() {
         let docs = vec![doc("a.md", "A")];
         let chunks = vec![chunk(0, "", "body", vec![1.0, 0.0])];
-        let bytes = write_shard(&docs, &chunks, 2, Quantization::F32, Compression::None).expect("write");
+        let bytes = write_shard(&docs, &chunks, &text2(), Quantization::F32, Compression::None).expect("write");
         let err = read_shard(&bytes[..bytes.len() - 4]).expect_err("should refuse");
         let msg = err.to_string();
         assert!(
@@ -1019,14 +1330,111 @@ mod tests {
         let artifact =
             Artifact::open(&m.to_json().unwrap(), &[(shard_name(0), bytes)]).expect("open");
 
-        let candidates = artifact.candidates(Space::Text);
+        let candidates = artifact.search_candidates(Space::Text);
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].path, "a.md", "paths stay vault-relative");
         assert_eq!(
             candidates[0].source_root, "vault",
             "the root is a label, never a machine path"
         );
-        assert!(artifact.candidates(Space::Image).is_empty());
+        assert!(artifact.search_candidates(Space::Image).is_empty());
+    }
+
+    /// The image space holds real images *and* CLIP-text title proxies, and a
+    /// text query scores every proxy above every image (P0). So a search of the
+    /// image space must see only images, while `related` must see both — the
+    /// proxies are what let it cross from an image to a note.
+    #[test]
+    fn a_search_of_the_image_space_excludes_title_proxies_but_related_keeps_them() {
+        let spaces = vec![
+            SpaceSpec {
+                space: Space::Text,
+                dim: 2,
+            },
+            SpaceSpec {
+                space: Space::Image,
+                dim: 2,
+            },
+        ];
+        let docs = vec![doc("note.md", "Note"), doc("photo.png", "Photo")];
+        let proxy = ArtifactChunk {
+            doc_index: 0,
+            ord: 1,
+            space: Space::Image,
+            modality: "text_title".to_string(),
+            heading_path: String::new(),
+            text: "Note".to_string(),
+            vector: vec![1.0, 0.0],
+        };
+        let image = ArtifactChunk {
+            doc_index: 1,
+            ord: 0,
+            space: Space::Image,
+            modality: "image".to_string(),
+            heading_path: String::new(),
+            text: String::new(),
+            vector: vec![0.0, 1.0],
+        };
+        let chunks = vec![chunk(0, "", "body", vec![1.0, 0.0]), proxy, image];
+        let bytes =
+            write_shard(&docs, &chunks, &spaces, Quantization::F32, Compression::None).unwrap();
+        let mut m = manifest(
+            vec![ShardInfo {
+                name: shard_name(0),
+                hash: shard_hash(&bytes),
+                documents: docs.len(),
+                chunks: chunks.len(),
+            }],
+            Quantization::F32,
+        );
+        m.spaces.push(SpaceInfo {
+            space: Space::Image,
+            model: ModelInfo {
+                id: "clip-vit-b-32".to_string(),
+                pooling: "mean".to_string(),
+                dim: 2,
+                query_id: Some("clip-vit-b-32".to_string()),
+            },
+        });
+        let artifact = Artifact::open(&m.to_json().unwrap(), &[(shard_name(0), bytes)]).unwrap();
+
+        let searched = artifact.search_candidates(Space::Image);
+        assert_eq!(searched.len(), 1, "a search must see only real images");
+        assert_eq!(searched[0].path, "photo.png");
+
+        let related: Vec<String> = artifact
+            .related_candidates(Space::Image)
+            .into_iter()
+            .map(|c| c.modality)
+            .collect();
+        assert_eq!(related.len(), 2, "related must see the title proxies too");
+        assert!(related.iter().any(|m| m == "text_title"));
+    }
+
+    /// A query has to be embedded with the model that produced the vectors it
+    /// is scored against, and for the image space that is not the model that
+    /// produced them: a client runs CLIP's text tower, never its vision tower.
+    #[test]
+    fn the_image_space_records_the_model_a_query_goes_through() {
+        let mut m = manifest(Vec::new(), Quantization::F32);
+        m.spaces.push(SpaceInfo {
+            space: Space::Image,
+            model: ModelInfo {
+                id: "clip-vit-b-32-vision".to_string(),
+                pooling: "mean".to_string(),
+                dim: 512,
+                query_id: Some("clip-vit-b-32-text".to_string()),
+            },
+        });
+        let back = Manifest::from_json(&m.to_json().unwrap()).expect("round trip");
+        let image = back.space(Space::Image).expect("an image space");
+        assert_eq!(image.dim, 512);
+        assert_eq!(image.query_id.as_deref(), Some("clip-vit-b-32-text"));
+        assert_eq!(
+            back.space(Space::Text).expect("a text space").query_id,
+            None,
+            "the text space queries with the model that wrote it"
+        );
     }
 
     /// Each shard numbers its documents from zero, so assembling several has to
@@ -1043,8 +1451,8 @@ mod tests {
             chunk(1, "", "gamma", vec![0.5, 0.5]),
         ];
 
-        let bytes_a = write_shard(&docs_a, &chunks_a, 2, Quantization::F32, Compression::None).unwrap();
-        let bytes_b = write_shard(&docs_b, &chunks_b, 2, Quantization::F32, Compression::None).unwrap();
+        let bytes_a = write_shard(&docs_a, &chunks_a, &text2(), Quantization::F32, Compression::None).unwrap();
+        let bytes_b = write_shard(&docs_b, &chunks_b, &text2(), Quantization::F32, Compression::None).unwrap();
         let m = manifest(
             vec![
                 ShardInfo {
@@ -1086,7 +1494,7 @@ mod tests {
     #[test]
     fn open_rejects_a_shard_that_does_not_match_the_manifest() {
         let docs = vec![doc("a.md", "A")];
-        let bytes = write_shard(&docs, &[chunk(0, "", "x", vec![1.0, 0.0])], 2, Quantization::F32, Compression::None)
+        let bytes = write_shard(&docs, &[chunk(0, "", "x", vec![1.0, 0.0])], &text2(), Quantization::F32, Compression::None)
             .unwrap();
         let m = manifest(
             vec![ShardInfo {
