@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 
 use store::artifact::{
     ARTIFACT_FORMAT_VERSION, ArtifactChunk, DocumentEntry, Manifest, ModelInfo, Quantization,
-    ShardInfo, shard_hash, write_shard,
+    ShardInfo, assign_shard, shard_hash, shard_name, write_shard,
 };
 use store::{Space, Store};
 
@@ -13,12 +13,20 @@ use crate::embedder::resolve_pooling;
 use crate::store::SqliteStore;
 use crate::workspace::{Workspace, expand_tilde};
 
-/// The shard file every v1 export writes. Sharding by document group is the
-/// next step; the manifest already carries a list, so adding shards is not a
-/// format change.
-const SHARD_NAME: &str = "shard-0000.bin";
-
 const MANIFEST_NAME: &str = "manifest.json";
+
+/// Default documents per shard.
+///
+/// Sharding exists so one edited note does not retransmit the artifact. At this
+/// size a 20k-document vault comes to ~80 shards of roughly 100–150 KB of
+/// vectors each — small enough that an edit costs little, few enough that a
+/// directory stays legible. The number is a judgment about that tradeoff rather
+/// than a measurement, and it is recorded in the manifest so it can change.
+const DEFAULT_SHARD_DOCS: usize = 256;
+
+/// A shard's file name and its bytes, as `build_artifact` hands them back for
+/// the caller to write (or to skip, when unchanged).
+type ShardBody = (String, Vec<u8>);
 
 /// Write a portable, query-only copy of the index.
 #[derive(Debug, clap::Args)]
@@ -29,7 +37,10 @@ pub struct ExportArgs {
     /// Vector precision in the artifact. `f32` is exact; `i8` is ~4x smaller.
     #[arg(long, default_value = "f32")]
     pub quantize: String,
-    /// Overwrite an existing artifact in `--out`.
+    /// Target documents per shard.
+    #[arg(long, default_value_t = DEFAULT_SHARD_DOCS)]
+    pub shard_docs: usize,
+    /// Rewrite every shard, even ones whose contents have not changed.
     #[arg(long)]
     pub force: bool,
 }
@@ -46,45 +57,118 @@ pub fn execute(ws: &Workspace, args: ExportArgs) -> Result<()> {
         "i8" => Quantization::I8,
         other => bail!("unknown --quantize '{other}' (try: f32, i8)"),
     };
+    if args.shard_docs == 0 {
+        bail!("--shard-docs must be at least 1");
+    }
 
     let out = expand_tilde(&args.out);
     let manifest_path = out.join(MANIFEST_NAME);
-    if manifest_path.exists() && !args.force {
-        bail!(
-            "{} already holds an artifact; pass --force to overwrite",
-            out.display()
-        );
-    }
 
     let store = SqliteStore::open(&ws.db_path)?;
-    let (manifest, shard) = build_artifact(&store, &ws.config.embed.text.model, quantization)?;
+    let (manifest, shards) = build_artifact(
+        &store,
+        &ws.config.embed.text.model,
+        quantization,
+        args.shard_docs,
+    )?;
+
+    // Re-exporting into an existing artifact is the normal case, not an error:
+    // only shards whose contents changed need rewriting, which is the point of
+    // sharding at all.
+    let previous = read_previous_manifest(&manifest_path);
+    let reusable = match &previous {
+        // A different model, precision or shard count reassigns or re-encodes
+        // every vector, so nothing carries over.
+        Some(old)
+            if !args.force
+                && old.model == manifest.model
+                && old.quantization == manifest.quantization
+                && old.shard_docs == manifest.shard_docs =>
+        {
+            old.shards
+                .iter()
+                .map(|s| (s.name.clone(), s.hash.clone()))
+                .collect()
+        }
+        _ => HashMap::new(),
+    };
 
     std::fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
-    let shard_path = out.join(SHARD_NAME);
-    std::fs::write(&shard_path, &shard)
-        .with_context(|| format!("writing {}", shard_path.display()))?;
+
+    let mut written = 0usize;
+    let mut unchanged = 0usize;
+    let mut bytes_written = 0usize;
+    for (name, body) in &shards {
+        let path = out.join(name);
+        let hash = shard_hash(body);
+        // The hash has to agree with the file actually on disk, not just with
+        // the old manifest: a shard deleted or truncated outside gnosis would
+        // otherwise be skipped and leave the artifact unreadable.
+        if reusable.get(name) == Some(&hash) && path.exists() {
+            unchanged += 1;
+            continue;
+        }
+        std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+        written += 1;
+        bytes_written += body.len();
+    }
+
+    // A shrunken vault needs fewer shards; leaving the extras behind would mean
+    // a directory of files no manifest refers to, growing forever.
+    let mut removed = 0usize;
+    if let Some(old) = &previous {
+        let current: std::collections::HashSet<&str> =
+            shards.iter().map(|(n, _)| n.as_str()).collect();
+        for stale in old.shards.iter().filter(|s| !current.contains(s.name.as_str())) {
+            if std::fs::remove_file(out.join(&stale.name)).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+
     // Manifest last: it is what names and checksums the shards, so a run
     // interrupted mid-write leaves the old manifest rather than one pointing at
     // a half-written shard.
     std::fs::write(&manifest_path, manifest.to_json()?)
         .with_context(|| format!("writing {}", manifest_path.display()))?;
 
-    let bytes = shard.len() + manifest_path.metadata().map(|m| m.len() as usize).unwrap_or(0);
+    let chunks: usize = manifest.shards.iter().map(|s| s.chunks).sum();
+    let documents: usize = manifest.shards.iter().map(|s| s.documents).sum();
     println!(
-        "Exported {} documents, {} chunks ({}) to {}",
-        manifest.documents.len(),
-        manifest.shards.iter().map(|s| s.chunks).sum::<usize>(),
-        human_bytes(bytes),
+        "Exported {documents} documents, {chunks} chunks to {}",
         out.display()
     );
     println!(
         "  model {} ({} pooling, {}d), vectors {}",
         manifest.model.id, manifest.model.pooling, manifest.model.dim, args.quantize
     );
+    print!(
+        "  {} shard(s): {written} written ({})",
+        shards.len(),
+        human_bytes(bytes_written)
+    );
+    if unchanged > 0 {
+        print!(", {unchanged} unchanged");
+    }
+    if removed > 0 {
+        print!(", {removed} removed");
+    }
+    println!();
     Ok(())
 }
 
-/// Assemble a manifest and its shard from a store, without touching the
+/// The manifest already in `path`, if there is a readable one.
+///
+/// A manifest that cannot be parsed — most likely written by an older gnosis
+/// with a superseded format version — is treated as absent rather than fatal,
+/// so a re-export silently upgrades it instead of demanding the user delete a
+/// directory.
+fn read_previous_manifest(path: &Path) -> Option<Manifest> {
+    let json = std::fs::read_to_string(path).ok()?;
+    Manifest::from_json(&json).ok()
+}
+
+/// Assemble a manifest and its shards from a store, without touching the
 /// filesystem.
 ///
 /// Separate from `execute` so the round-trip test can exercise it: the
@@ -95,17 +179,14 @@ pub(crate) fn build_artifact(
     store: &SqliteStore,
     configured_model: &str,
     quantization: Quantization,
-) -> Result<(Manifest, Vec<u8>)> {
+    shard_docs: usize,
+) -> Result<(Manifest, Vec<ShardBody>)> {
     let model = model_info(store, configured_model)?;
 
     let docs = store.export_documents()?;
     if docs.is_empty() {
         bail!("the index holds no documents — nothing to export");
     }
-    // Document order fixes the indices chunks refer to, so it is decided once
-    // here and never recomputed.
-    let doc_index: HashMap<i64, usize> =
-        docs.iter().enumerate().map(|(i, d)| (d.id, i)).collect();
 
     // Root *labels*, not paths: an artifact that carried `/home/alex/notes`
     // would leak the author's layout and mean nothing on another machine.
@@ -118,10 +199,19 @@ pub(crate) fn build_artifact(
         }
     }
 
-    let documents: Vec<DocumentEntry> = docs
-        .iter()
-        .map(|doc| DocumentEntry {
-            root: root_index[doc.root.as_str()],
+    let shard_count = docs.len().div_ceil(shard_docs).max(1);
+
+    // Which shard each document lands in, and its index within that shard.
+    // Assignment hashes the path so that adding a note cannot move any other
+    // note between shards.
+    let mut shard_docs_out: Vec<Vec<DocumentEntry>> = vec![Vec::new(); shard_count];
+    let mut placement: HashMap<i64, (usize, usize)> = HashMap::new();
+    for doc in &docs {
+        let root = root_index[doc.root.as_str()];
+        let shard = assign_shard(root, &doc.rel_path, shard_count);
+        let local = shard_docs_out[shard].len();
+        shard_docs_out[shard].push(DocumentEntry {
+            root,
             path: doc.rel_path.clone(),
             title: doc.title.clone(),
             kind: doc.kind.clone(),
@@ -129,14 +219,16 @@ pub(crate) fn build_artifact(
             mtime: doc.mtime,
             links: doc.links.clone(),
             tags: doc.tags.clone(),
-        })
-        .collect();
+        });
+        placement.insert(doc.id, (shard, local));
+    }
 
-    // Text only in v1. Image chunks are 512d CLIP vectors, so a mixed artifact
+    // Text only so far. Image chunks are 512d CLIP vectors, so a mixed artifact
     // needs a per-space dim and that is its own step.
-    let mut chunks: Vec<ArtifactChunk> = Vec::new();
+    let mut shard_chunks: Vec<Vec<ArtifactChunk>> = vec![Vec::new(); shard_count];
+    let mut total_chunks = 0usize;
     for chunk in store.export_chunks(Space::Text)? {
-        let Some(&index) = doc_index.get(&chunk.doc_id) else {
+        let Some(&(shard, local)) = placement.get(&chunk.doc_id) else {
             // A chunk whose document vanished between the two queries. Not
             // expected inside one process, but skipping beats writing a
             // dangling index into the artifact.
@@ -146,13 +238,13 @@ pub(crate) fn build_artifact(
             bail!(
                 "chunk of document {} has {} dimensions but the index records {} — \
                  run `gnosis rebuild`",
-                documents[index].path,
+                shard_docs_out[shard][local].path,
                 chunk.vector.len(),
                 model.dim
             );
         }
-        chunks.push(ArtifactChunk {
-            doc_index: index,
+        shard_chunks[shard].push(ArtifactChunk {
+            doc_index: local,
             ord: chunk.ord,
             space: chunk.space,
             modality: chunk.modality,
@@ -160,27 +252,35 @@ pub(crate) fn build_artifact(
             text: chunk.text,
             vector: chunk.vector,
         });
+        total_chunks += 1;
     }
-    if chunks.is_empty() {
+    if total_chunks == 0 {
         bail!("the index holds no text vectors — nothing to export");
     }
 
-    let shard = write_shard(&chunks, model.dim, quantization)?;
+    let mut infos = Vec::with_capacity(shard_count);
+    let mut bodies = Vec::with_capacity(shard_count);
+    for i in 0..shard_count {
+        let body = write_shard(&shard_docs_out[i], &shard_chunks[i], model.dim, quantization)?;
+        infos.push(ShardInfo {
+            name: shard_name(i),
+            hash: shard_hash(&body),
+            documents: shard_docs_out[i].len(),
+            chunks: shard_chunks[i].len(),
+        });
+        bodies.push((shard_name(i), body));
+    }
+
     let manifest = Manifest {
         format_version: ARTIFACT_FORMAT_VERSION,
         created_unix: now_unix(),
         model,
         quantization,
         roots,
-        documents,
-        shards: vec![ShardInfo {
-            name: SHARD_NAME.to_string(),
-            hash: shard_hash(&shard),
-            chunks: chunks.len(),
-        }],
+        shard_docs,
+        shards: infos,
     };
-
-    Ok((manifest, shard))
+    Ok((manifest, bodies))
 }
 
 /// Which model built this index, and how a client reproduces a query vector in
@@ -299,12 +399,13 @@ mod tests {
         store
     }
 
-    fn open_artifact(manifest: &Manifest, shard: Vec<u8>) -> Artifact {
-        Artifact::open(
-            &manifest.to_json().unwrap(),
-            &[(SHARD_NAME.to_string(), shard)],
-        )
-        .expect("artifact should open")
+    fn open_artifact(manifest: &Manifest, shards: Vec<ShardBody>) -> Artifact {
+        Artifact::open(&manifest.to_json().unwrap(), &shards).expect("artifact should open")
+    }
+
+    /// One shard, so a test that does not care about sharding stays readable.
+    fn build_one(store: &SqliteStore, quantization: Quantization) -> (Manifest, Vec<ShardBody>) {
+        build_artifact(store, "bge-small-en-v1.5", quantization, 256).unwrap()
     }
 
     /// **The acceptance gate for this format.** Querying an artifact must
@@ -321,9 +422,9 @@ mod tests {
             .search_space(Space::Text, &query, 10, &TextQuery::default())
             .unwrap();
 
-        let (manifest, shard) =
-            build_artifact(&store, "bge-small-en-v1.5", Quantization::F32).unwrap();
-        let artifact = open_artifact(&manifest, shard);
+        let (manifest, shards) =
+            build_one(&store, Quantization::F32);
+        let artifact = open_artifact(&manifest, shards);
         let from_artifact = search::rank(&query, artifact.candidates(Space::Text), 10);
 
         assert_eq!(from_db.len(), 3);
@@ -348,9 +449,9 @@ mod tests {
     fn f32_export_preserves_vectors_bit_for_bit() {
         let dir = temp_dir("vectors");
         let store = seeded_store(&dir);
-        let (manifest, shard) =
-            build_artifact(&store, "bge-small-en-v1.5", Quantization::F32).unwrap();
-        let artifact = open_artifact(&manifest, shard);
+        let (manifest, shards) =
+            build_one(&store, Quantization::F32);
+        let artifact = open_artifact(&manifest, shards);
 
         let mut vectors: Vec<Vec<f32>> = artifact
             .chunks()
@@ -369,14 +470,22 @@ mod tests {
     fn artifact_records_no_absolute_paths() {
         let dir = temp_dir("relative");
         let store = seeded_store(&dir);
-        let (manifest, _) = build_artifact(&store, "bge-small-en-v1.5", Quantization::F32).unwrap();
-
+        let (manifest, shards) = build_one(&store, Quantization::F32);
         assert_eq!(manifest.roots, vec!["vault".to_string()], "roots are labels");
-        for doc in &manifest.documents {
-            assert!(!doc.path.starts_with('/'), "{} is absolute", doc.path);
-        }
         let json = manifest.to_json().unwrap();
         assert!(!json.contains("/vault"), "an absolute path leaked into the manifest");
+
+        // Documents live in the shards now, so check the bytes that ship.
+        for (_, body) in &shards {
+            assert!(
+                !String::from_utf8_lossy(body).contains("/vault"),
+                "an absolute path leaked into a shard"
+            );
+        }
+        let artifact = open_artifact(&manifest, shards);
+        for doc in artifact.documents() {
+            assert!(!doc.path.starts_with('/'), "{} is absolute", doc.path);
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -384,7 +493,7 @@ mod tests {
     fn artifact_carries_the_models_pooling_and_each_documents_hash() {
         let dir = temp_dir("meta");
         let store = seeded_store(&dir);
-        let (manifest, _) = build_artifact(&store, "bge-small-en-v1.5", Quantization::F32).unwrap();
+        let (manifest, shards) = build_one(&store, Quantization::F32);
 
         assert_eq!(manifest.model.id, "bge-small-en-v1.5");
         assert_eq!(
@@ -392,8 +501,10 @@ mod tests {
             "a client that guesses pooling produces plausible, wrong vectors"
         );
         assert_eq!(manifest.model.dim, 4);
-        for doc in &manifest.documents {
-            assert_eq!(doc.content_hash, "68617368", "blake3 hex of the source");
+        let artifact = open_artifact(&manifest, shards);
+        assert_eq!(artifact.documents().len(), 3);
+        for doc in artifact.documents() {
+            assert_eq!(doc.content_hash, "68617368", "hex of the source hash");
             assert_eq!(doc.mtime, 42, "needed to report staleness");
         }
         let _ = std::fs::remove_dir_all(dir);
@@ -406,8 +517,9 @@ mod tests {
     fn artifact_carries_links_and_tags() {
         let dir = temp_dir("links");
         let store = seeded_store(&dir);
-        let (manifest, _) = build_artifact(&store, "bge-small-en-v1.5", Quantization::F32).unwrap();
-        for doc in &manifest.documents {
+        let (manifest, shards) = build_one(&store, Quantization::F32);
+        let artifact = open_artifact(&manifest, shards);
+        for doc in artifact.documents() {
             assert_eq!(doc.links, vec!["mid".to_string()]);
             assert_eq!(doc.tags, vec!["note".to_string()]);
         }
@@ -432,9 +544,178 @@ mod tests {
         let dir = temp_dir("unknown");
         let store = seeded_store(&dir);
         store.set_meta("model.text", "some-future-model").unwrap();
-        let err = build_artifact(&store, "bge-small-en-v1.5", Quantization::F32)
+        let err = build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, 256)
             .expect_err("should refuse");
         assert!(err.to_string().contains("some-future-model"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn documents_are_split_across_shards_and_still_all_present() {
+        let dir = temp_dir("shards");
+        let store = seeded_store(&dir);
+        // One document per shard, so the split is unambiguous.
+        let (manifest, shards) =
+            build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, 1).unwrap();
+
+        assert_eq!(manifest.shards.len(), 3, "three documents, one per shard");
+        assert_eq!(shards.len(), 3);
+        assert_eq!(
+            manifest.shards.iter().map(|s| s.documents).sum::<usize>(),
+            3
+        );
+        assert_eq!(manifest.shards.iter().map(|s| s.chunks).sum::<usize>(), 3);
+
+        // And the assembled artifact is indistinguishable from a single-shard
+        // one, which is the property that matters to a reader.
+        let artifact = open_artifact(&manifest, shards);
+        let mut paths: Vec<&str> = artifact.documents().iter().map(|d| d.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["deep/far.md", "mid.md", "near.md"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Sharded or not, the ranking has to be identical — a client must not get
+    /// different results because the exporter chose a different shard size.
+    #[test]
+    fn shard_size_does_not_change_the_ranking() {
+        let dir = temp_dir("shardrank");
+        let store = seeded_store(&dir);
+        let query = [1.0, 0.0, 0.0, 0.0];
+
+        let mut rankings = Vec::new();
+        for shard_docs in [1, 2, 256] {
+            let (manifest, shards) =
+                build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, shard_docs).unwrap();
+            let artifact = open_artifact(&manifest, shards);
+            let hits = search::rank(&query, artifact.candidates(Space::Text), 10);
+            rankings.push(
+                hits.iter()
+                    .map(|h| (h.path.clone(), h.score))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(rankings[0], rankings[1]);
+        assert_eq!(rankings[1], rankings[2]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// **Adding** a note must dirty only the shard it lands in.
+    ///
+    /// Exported at `--shard-docs 2`, so three documents and then four both come
+    /// to two shards and the count is held fixed — otherwise every document
+    /// would be legitimately reassigned and this would prove nothing. The added
+    /// note sorts before every existing one, so a bug that let document
+    /// *ordering* leak across shards would dirty both.
+    ///
+    /// Note what this does *not* test: that assignment ignores the rest of the
+    /// corpus. `assign_shard` takes no document list, so that is enforced by its
+    /// signature — a positional scheme cannot be expressed through it — and a
+    /// test cannot distinguish the two. Golden values in `artifact.rs` pin the
+    /// mapping itself.
+    #[test]
+    fn adding_a_note_dirties_only_the_shard_it_lands_in() {
+        let dir = temp_dir("insert");
+        let mut store = seeded_store(&dir);
+        let (_, before) = build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, 2).unwrap();
+        assert_eq!(before.len(), 2, "three documents at two per shard");
+
+        store
+            .replace_document(&DocWrite {
+                // Sorts before every existing document on purpose.
+                path: "/vault/aaa-added.md",
+                kind: "markdown",
+                source_root: "/vault",
+                content_hash: b"hash",
+                mtime: 42,
+                title: "Added",
+                frontmatter: None,
+                indexed_at: 0,
+                chunks: &[ChunkWrite {
+                    ord: 0,
+                    space: "text".to_string(),
+                    modality: "text".to_string(),
+                    text: Some("epsilon".to_string()),
+                    heading_path: "Heading".to_string(),
+                    vector: vec![0.0, 0.0, 1.0, 0.0],
+                }],
+                links: &[],
+                tags: &[],
+                width: None,
+                height: None,
+            })
+            .unwrap();
+
+        let (manifest, after) =
+            build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, 2).unwrap();
+        assert_eq!(after.len(), 2, "four documents at two per shard is still two shards");
+
+        let changed = before
+            .iter()
+            .zip(&after)
+            .filter(|((_, a), (_, b))| a != b)
+            .count();
+        assert_eq!(
+            changed, 1,
+            "adding one note should dirty exactly one of two shards"
+        );
+        assert_eq!(
+            open_artifact(&manifest, after).documents().len(),
+            4,
+            "and nothing may be lost in the process"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// At a fixed shard count, editing one note must leave every other shard
+    /// byte-identical. This is the property `--shard-docs` exists to deliver,
+    /// and it holds only because assignment hashes the path.
+    #[test]
+    fn editing_one_note_changes_exactly_one_shard() {
+        let dir = temp_dir("oneshard");
+        let mut store = seeded_store(&dir);
+        // Three shards for three documents, and keep it there by exporting at
+        // the same shard_docs after the edit.
+        let (_, before) = build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, 1).unwrap();
+
+        store
+            .replace_document(&DocWrite {
+                path: "/vault/mid.md",
+                kind: "markdown",
+                source_root: "/vault",
+                content_hash: b"changed",
+                mtime: 99,
+                title: "Mid",
+                frontmatter: None,
+                indexed_at: 0,
+                chunks: &[ChunkWrite {
+                    ord: 0,
+                    space: "text".to_string(),
+                    modality: "text".to_string(),
+                    text: Some("beta gamma edited".to_string()),
+                    heading_path: "Heading".to_string(),
+                    vector: vec![0.7, 0.7, 0.0, 0.0],
+                }],
+                links: &["mid".to_string()],
+                tags: &["note".to_string()],
+                width: None,
+                height: None,
+            })
+            .unwrap();
+
+        let (_, after) = build_artifact(&store, "bge-small-en-v1.5", Quantization::F32, 1).unwrap();
+        assert_eq!(before.len(), after.len(), "shard count should not change");
+
+        let changed = before
+            .iter()
+            .zip(&after)
+            .filter(|((_, a), (_, b))| a != b)
+            .count();
+        assert_eq!(
+            changed, 1,
+            "editing one note should rewrite exactly one of {} shards",
+            before.len()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -444,18 +725,18 @@ mod tests {
         let store = seeded_store(&dir);
         let query = [1.0, 0.0, 0.0, 0.0];
 
-        let (_, f32_shard) =
-            build_artifact(&store, "bge-small-en-v1.5", Quantization::F32).unwrap();
-        let (manifest, i8_shard) =
-            build_artifact(&store, "bge-small-en-v1.5", Quantization::I8).unwrap();
+        let (_, f32_shards) =
+            build_one(&store, Quantization::F32);
+        let (manifest, i8_shards) =
+            build_one(&store, Quantization::I8);
+        let i8_bytes: usize = i8_shards.iter().map(|(_, b)| b.len()).sum();
+        let f32_bytes: usize = f32_shards.iter().map(|(_, b)| b.len()).sum();
         assert!(
-            i8_shard.len() < f32_shard.len(),
-            "i8 {} should be smaller than f32 {}",
-            i8_shard.len(),
-            f32_shard.len()
+            i8_bytes < f32_bytes,
+            "i8 {i8_bytes} should be smaller than f32 {f32_bytes}"
         );
 
-        let artifact = open_artifact(&manifest, i8_shard);
+        let artifact = open_artifact(&manifest, i8_shards);
         let hits = search::rank(&query, artifact.candidates(Space::Text), 10);
         let order: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
         assert_eq!(order, vec!["near.md", "mid.md", "deep/far.md"]);

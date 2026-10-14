@@ -28,13 +28,20 @@ use crate::Space;
 
 /// Bumped whenever the manifest or shard layout changes incompatibly. A reader
 /// refuses an unknown version rather than mis-parsing one.
-pub const ARTIFACT_FORMAT_VERSION: u32 = 1;
+///
+/// **v2** moved per-document metadata out of the manifest and into the shard
+/// that holds the document, and made shard assignment a hash of the document's
+/// path. v1 kept every document in the manifest, which measured 270 bytes each
+/// — 5.4 MB at 20k documents — and rewrote in full on every export, so sharding
+/// the chunks alone would have saved nothing. The artifact is derived and
+/// regenerable, so the fix was a version bump rather than a migration.
+pub const ARTIFACT_FORMAT_VERSION: u32 = 2;
 
 /// Shard file magic: "GNSA" (gnosis artifact).
 const SHARD_MAGIC: &[u8; 4] = b"GNSA";
 
 /// Byte length of the shard header.
-const SHARD_HEADER_LEN: usize = 20;
+const SHARD_HEADER_LEN: usize = 24;
 
 /// Byte length of one per-chunk record in a shard.
 const RECORD_LEN: usize = 32;
@@ -117,6 +124,7 @@ pub struct DocumentEntry {
 pub struct ShardInfo {
     pub name: String,
     pub hash: String,
+    pub documents: usize,
     pub chunks: usize,
 }
 
@@ -128,7 +136,13 @@ pub struct Manifest {
     pub quantization: Quantization,
     /// Root labels — a vault's final path component, never its absolute path.
     pub roots: Vec<String>,
-    pub documents: Vec<DocumentEntry>,
+    /// Target documents per shard, as asked for at export time. Recorded
+    /// because it determines `shards.len()`, and changing it reassigns every
+    /// document and so rewrites the whole artifact.
+    pub shard_docs: usize,
+    /// Every shard, in name order. Documents live inside their shard, not here:
+    /// a manifest holding them all would rewrite on any change, which is what
+    /// sharding exists to avoid.
     pub shards: Vec<ShardInfo>,
 }
 
@@ -155,7 +169,8 @@ impl Manifest {
 /// One chunk on its way into or out of a shard.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArtifactChunk {
-    /// Index into [`Manifest::documents`].
+    /// Index into **this shard's** document list, not a global one. Shards are
+    /// self-contained so a client can load one without the others.
     pub doc_index: usize,
     pub ord: u32,
     pub space: Space,
@@ -227,6 +242,7 @@ fn quantize_i8(vector: &[f32]) -> (Vec<i8>, f32) {
 /// fixed-stride so a client can scan them without touching the strings, which
 /// is the whole shape of a brute-force query.
 pub fn write_shard(
+    documents: &[DocumentEntry],
     chunks: &[ArtifactChunk],
     dim: usize,
     quantization: Quantization,
@@ -236,6 +252,13 @@ pub fn write_shard(
     let mut strings: Vec<u8> = Vec::new();
 
     for chunk in chunks {
+        if chunk.doc_index >= documents.len() {
+            bail!(
+                "chunk refers to document {} but this shard holds {}",
+                chunk.doc_index,
+                documents.len()
+            );
+        }
         if chunk.vector.len() != dim {
             bail!(
                 "chunk vector has {} dimensions but the artifact declares {dim}",
@@ -275,18 +298,58 @@ pub fn write_shard(
     }
     debug_assert_eq!(records.len(), chunks.len() * RECORD_LEN);
 
-    let mut out = Vec::with_capacity(SHARD_HEADER_LEN + records.len() + vectors.len() + strings.len());
+    // Documents ride inside the shard as JSON at a known offset: self-contained
+    // in one file with one hash, still readable with `head -c`, and small enough
+    // next to the vector block that a binary encoding would not pay for itself.
+    let docs_json = serde_json::to_vec(documents).context("serializing shard documents")?;
+
+    let mut out = Vec::with_capacity(
+        SHARD_HEADER_LEN + docs_json.len() + records.len() + vectors.len() + strings.len(),
+    );
     out.extend_from_slice(SHARD_MAGIC);
     out.extend_from_slice(&(ARTIFACT_FORMAT_VERSION as u16).to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes()); // flags, unused in v1
+    out.extend_from_slice(&0u16.to_le_bytes()); // flags, unused so far
     out.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
     out.extend_from_slice(&(dim as u32).to_le_bytes());
     out.push(quantization.code());
     out.extend_from_slice(&[0u8; 3]); // pad to a 4-byte boundary
+    out.extend_from_slice(&(docs_json.len() as u32).to_le_bytes());
+    out.extend_from_slice(&docs_json);
     out.extend_from_slice(&records);
     out.extend_from_slice(&vectors);
     out.extend_from_slice(&strings);
     Ok(out)
+}
+
+/// Which shard a document belongs in, from a hash of its path.
+///
+/// Hashed rather than positional on purpose. With documents assigned by
+/// position, inserting one note shifts every document after it and so rewrites
+/// every later shard — which is most of the artifact, for the commonest edit a
+/// vault sees. Hashing makes a document's shard independent of what else exists,
+/// so adding, editing or deleting a note touches exactly one shard.
+///
+/// That independence is enforced by this signature rather than by any test:
+/// taking only `(root, rel_path, shard_count)`, there is no corpus to depend on.
+///
+/// The cost is that `shard_count` is baked in: changing it reassigns everything.
+/// That is why it is recorded in the manifest.
+pub fn assign_shard(root: usize, rel_path: &str, shard_count: usize) -> usize {
+    if shard_count <= 1 {
+        return 0;
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(root as u64).to_le_bytes());
+    hasher.update(rel_path.as_bytes());
+    let digest = hasher.finalize();
+    let bucket = u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("8 bytes"));
+    (bucket % shard_count as u64) as usize
+}
+
+/// A shard's file name. Zero-padded so a directory listing sorts in shard
+/// order.
+pub fn shard_name(index: usize) -> String {
+    format!("shard-{index:04}.bin")
 }
 
 /// blake3 of a shard's bytes, hex — what the manifest records so a client can
@@ -304,8 +367,8 @@ fn u32_at(bytes: &[u8], offset: usize) -> u32 {
     ])
 }
 
-/// Parse one shard back into chunks.
-pub fn read_shard(bytes: &[u8]) -> Result<Vec<ArtifactChunk>> {
+/// Parse one shard back into its documents and chunks.
+pub fn read_shard(bytes: &[u8]) -> Result<(Vec<DocumentEntry>, Vec<ArtifactChunk>)> {
     if bytes.len() < SHARD_HEADER_LEN {
         bail!("shard is truncated: {} bytes", bytes.len());
     }
@@ -322,8 +385,17 @@ pub fn read_shard(bytes: &[u8]) -> Result<Vec<ArtifactChunk>> {
     let count = u32_at(bytes, 8) as usize;
     let dim = u32_at(bytes, 12) as usize;
     let quantization = Quantization::from_code(bytes[16])?;
+    let docs_json_len = u32_at(bytes, 20) as usize;
 
-    let records_at = SHARD_HEADER_LEN;
+    let docs_at = SHARD_HEADER_LEN;
+    let docs_end = docs_at
+        .checked_add(docs_json_len)
+        .filter(|end| *end <= bytes.len())
+        .context("shard's document block runs past the end of the file")?;
+    let documents: Vec<DocumentEntry> = serde_json::from_slice(&bytes[docs_at..docs_end])
+        .context("parsing a shard's document block")?;
+
+    let records_at = docs_end;
     let vectors_at = records_at + count * RECORD_LEN;
     let strings_at = vectors_at + count * dim * quantization.bytes_per_dim();
     if bytes.len() < strings_at {
@@ -370,6 +442,12 @@ pub fn read_shard(bytes: &[u8]) -> Result<Vec<ArtifactChunk>> {
                 .collect(),
         };
 
+        if doc_index >= documents.len() {
+            bail!(
+                "shard chunk refers to document {doc_index} but the shard holds {}",
+                documents.len()
+            );
+        }
         chunks.push(ArtifactChunk {
             doc_index,
             ord,
@@ -380,7 +458,7 @@ pub fn read_shard(bytes: &[u8]) -> Result<Vec<ArtifactChunk>> {
             vector,
         });
     }
-    Ok(chunks)
+    Ok((documents, chunks))
 }
 
 fn read_str(strings: &[u8], offset: usize, len: usize, what: &str) -> Result<String> {
@@ -392,10 +470,11 @@ fn read_str(strings: &[u8], offset: usize, len: usize, what: &str) -> Result<Str
         .with_context(|| format!("{what} is not valid UTF-8"))
 }
 
-/// A manifest plus its shards' chunks, ready to query.
+/// A manifest plus its shards' documents and chunks, ready to query.
 #[derive(Debug)]
 pub struct Artifact {
     manifest: Manifest,
+    documents: Vec<DocumentEntry>,
     chunks: Vec<ArtifactChunk>,
 }
 
@@ -406,12 +485,17 @@ impl Artifact {
     /// Shards are verified against the manifest's hashes. A mismatch is an
     /// error rather than a warning: a half-synced artifact would otherwise
     /// answer queries from a mixture of two indexes.
+    ///
+    /// Each shard numbers its documents from zero; this rebases them onto one
+    /// list, so `ArtifactChunk::doc_index` on an assembled `Artifact` indexes
+    /// [`Artifact::documents`] rather than any one shard.
     pub fn open(manifest_json: &str, shards: &[(String, Vec<u8>)]) -> Result<Self> {
         let manifest = Manifest::from_json(manifest_json)?;
         let supplied: HashMap<&str, &Vec<u8>> =
             shards.iter().map(|(n, b)| (n.as_str(), b)).collect();
 
-        let mut chunks = Vec::new();
+        let mut documents: Vec<DocumentEntry> = Vec::new();
+        let mut chunks: Vec<ArtifactChunk> = Vec::new();
         for info in &manifest.shards {
             let bytes = supplied
                 .get(info.name.as_str())
@@ -425,23 +509,40 @@ impl Artifact {
                     info.hash
                 );
             }
-            let shard = read_shard(bytes)
+            let (shard_docs, shard_chunks) = read_shard(bytes)
                 .with_context(|| format!("reading artifact shard '{}'", info.name))?;
-            if shard.len() != info.chunks {
+            if shard_docs.len() != info.documents || shard_chunks.len() != info.chunks {
                 bail!(
-                    "artifact shard '{}' holds {} chunks but the manifest says {}",
+                    "artifact shard '{}' holds {} documents and {} chunks but the manifest says \
+                     {} and {}",
                     info.name,
-                    shard.len(),
+                    shard_docs.len(),
+                    shard_chunks.len(),
+                    info.documents,
                     info.chunks
                 );
             }
-            chunks.extend(shard);
+            let base = documents.len();
+            documents.extend(shard_docs);
+            chunks.extend(shard_chunks.into_iter().map(|mut c| {
+                c.doc_index += base;
+                c
+            }));
         }
-        Ok(Self { manifest, chunks })
+        Ok(Self {
+            manifest,
+            documents,
+            chunks,
+        })
     }
 
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// Every document across every shard, in shard order.
+    pub fn documents(&self) -> &[DocumentEntry] {
+        &self.documents
     }
 
     pub fn chunks(&self) -> &[ArtifactChunk] {
@@ -461,7 +562,7 @@ impl Artifact {
             .iter()
             .filter(|c| c.space == space)
             .filter_map(|c| {
-                let doc = self.manifest.documents.get(c.doc_index)?;
+                let doc = self.documents.get(c.doc_index)?;
                 let root = self.manifest.roots.get(doc.root).cloned().unwrap_or_default();
                 Some(search::Candidate {
                     path: doc.path.clone(),
@@ -495,6 +596,19 @@ mod tests {
         }
     }
 
+    fn doc(path: &str, title: &str) -> DocumentEntry {
+        DocumentEntry {
+            root: 0,
+            path: path.to_string(),
+            title: title.to_string(),
+            kind: "markdown".to_string(),
+            content_hash: "00".to_string(),
+            mtime: 0,
+            links: Vec::new(),
+            tags: Vec::new(),
+        }
+    }
+
     fn manifest(shards: Vec<ShardInfo>, quantization: Quantization) -> Manifest {
         Manifest {
             format_version: ARTIFACT_FORMAT_VERSION,
@@ -506,51 +620,47 @@ mod tests {
             },
             quantization,
             roots: vec!["vault".to_string()],
-            documents: vec![
-                DocumentEntry {
-                    root: 0,
-                    path: "a.md".to_string(),
-                    title: "A".to_string(),
-                    kind: "markdown".to_string(),
-                    content_hash: "00".to_string(),
-                    mtime: 0,
-                    links: vec!["b".to_string()],
-                    tags: vec!["t".to_string()],
-                },
-                DocumentEntry {
-                    root: 0,
-                    path: "nested/b.md".to_string(),
-                    title: "B".to_string(),
-                    kind: "markdown".to_string(),
-                    content_hash: "01".to_string(),
-                    mtime: 0,
-                    links: Vec::new(),
-                    tags: Vec::new(),
-                },
-            ],
+            shard_docs: 256,
             shards,
         }
     }
 
+    fn one_shard(documents: &[DocumentEntry], chunks: &[ArtifactChunk]) -> (Manifest, Vec<u8>) {
+        let bytes = write_shard(documents, chunks, 2, Quantization::F32).expect("write");
+        let m = manifest(
+            vec![ShardInfo {
+                name: shard_name(0),
+                hash: shard_hash(&bytes),
+                documents: documents.len(),
+                chunks: chunks.len(),
+            }],
+            Quantization::F32,
+        );
+        (m, bytes)
+    }
+
     #[test]
     fn f32_shard_round_trips_exactly() {
+        let docs = vec![doc("a.md", "A"), doc("b.md", "B")];
         let chunks = vec![
             chunk(0, "Heading", "first body", vec![1.0, 0.0]),
             chunk(1, "", "second body", vec![0.0, 1.0]),
         ];
-        let bytes = write_shard(&chunks, 2, Quantization::F32).expect("write");
-        let back = read_shard(&bytes).expect("read");
+        let bytes = write_shard(&docs, &chunks, 2, Quantization::F32).expect("write");
+        let (back_docs, back_chunks) = read_shard(&bytes).expect("read");
+        assert_eq!(back_docs, docs);
         assert_eq!(
-            back, chunks,
+            back_chunks, chunks,
             "f32 is the exact form — a round trip must change nothing at all"
         );
     }
 
     #[test]
     fn i8_shard_round_trips_within_quantization_error() {
+        let docs = vec![doc("a.md", "A")];
         let chunks = vec![chunk(0, "", "body", vec![0.6, -0.8])];
-        let bytes = write_shard(&chunks, 2, Quantization::I8).expect("write");
-        let back = read_shard(&bytes).expect("read");
+        let bytes = write_shard(&docs, &chunks, 2, Quantization::I8).expect("write");
+        let (_, back) = read_shard(&bytes).expect("read");
         for (original, restored) in chunks[0].vector.iter().zip(&back[0].vector) {
             assert!(
                 (original - restored).abs() < 0.01,
@@ -561,26 +671,18 @@ mod tests {
     }
 
     #[test]
-    fn i8_is_four_times_smaller_than_f32() {
+    fn i8_saves_exactly_three_bytes_per_dimension() {
+        let docs = vec![doc("a.md", "A")];
         let chunks: Vec<ArtifactChunk> = (0..16)
-            .map(|i| chunk(0, "", "x", vec![0.5; 384]).tap(i))
+            .map(|i| {
+                let mut c = chunk(0, "", "x", vec![0.5; 384]);
+                c.ord = i;
+                c
+            })
             .collect();
-        let f32_len = write_shard(&chunks, 384, Quantization::F32).unwrap().len();
-        let i8_len = write_shard(&chunks, 384, Quantization::I8).unwrap().len();
-        let vectors_f32 = 16 * 384 * 4;
-        let vectors_i8 = 16 * 384;
-        assert_eq!(f32_len - i8_len, vectors_f32 - vectors_i8);
-    }
-
-    /// Helper so the size test can build distinct chunks without another fn.
-    trait Tap {
-        fn tap(self, ord: u32) -> Self;
-    }
-    impl Tap for ArtifactChunk {
-        fn tap(mut self, ord: u32) -> Self {
-            self.ord = ord;
-            self
-        }
+        let f32_len = write_shard(&docs, &chunks, 384, Quantization::F32).unwrap().len();
+        let i8_len = write_shard(&docs, &chunks, 384, Quantization::I8).unwrap().len();
+        assert_eq!(f32_len - i8_len, 16 * 384 * 3);
     }
 
     #[test]
@@ -588,23 +690,39 @@ mod tests {
         // Offsets and lengths are byte counts, not character counts — getting
         // that wrong would split a multi-byte character and fail only on
         // non-ASCII vaults.
+        let docs = vec![doc("한국.md", "한국")];
         let chunks = vec![chunk(0, "제목", "대한민국의 수도는 서울이다", vec![1.0, 0.0])];
-        let bytes = write_shard(&chunks, 2, Quantization::F32).expect("write");
-        let back = read_shard(&bytes).expect("read");
-        assert_eq!(back, chunks);
+        let bytes = write_shard(&docs, &chunks, 2, Quantization::F32).expect("write");
+        let (back_docs, back_chunks) = read_shard(&bytes).expect("read");
+        assert_eq!(back_docs, docs);
+        assert_eq!(back_chunks, chunks);
     }
 
     #[test]
     fn a_shard_with_no_chunks_is_valid() {
-        let bytes = write_shard(&[], 384, Quantization::F32).expect("write");
-        assert!(read_shard(&bytes).expect("read").is_empty());
+        let bytes = write_shard(&[], &[], 384, Quantization::F32).expect("write");
+        let (docs, chunks) = read_shard(&bytes).expect("read");
+        assert!(docs.is_empty());
+        assert!(chunks.is_empty());
     }
 
     #[test]
     fn write_shard_rejects_a_vector_of_the_wrong_dimensionality() {
+        let docs = vec![doc("a.md", "A")];
         let chunks = vec![chunk(0, "", "body", vec![1.0, 0.0, 0.0])];
-        let err = write_shard(&chunks, 2, Quantization::F32).expect_err("should refuse");
+        let err = write_shard(&docs, &chunks, 2, Quantization::F32).expect_err("should refuse");
         assert!(err.to_string().contains("dimensions"), "{err}");
+    }
+
+    /// A chunk pointing past its shard's document list would read as a
+    /// different note's content, so it is refused on the way in and on the way
+    /// out.
+    #[test]
+    fn write_shard_rejects_a_chunk_with_a_dangling_document() {
+        let docs = vec![doc("a.md", "A")];
+        let chunks = vec![chunk(3, "", "body", vec![1.0, 0.0])];
+        let err = write_shard(&docs, &chunks, 2, Quantization::F32).expect_err("should refuse");
+        assert!(err.to_string().contains("refers to document"), "{err}");
     }
 
     #[test]
@@ -615,18 +733,24 @@ mod tests {
 
     #[test]
     fn read_shard_rejects_a_truncated_file() {
+        let docs = vec![doc("a.md", "A")];
         let chunks = vec![chunk(0, "", "body", vec![1.0, 0.0])];
-        let bytes = write_shard(&chunks, 2, Quantization::F32).expect("write");
+        let bytes = write_shard(&docs, &chunks, 2, Quantization::F32).expect("write");
         let err = read_shard(&bytes[..bytes.len() - 4]).expect_err("should refuse");
-        assert!(err.to_string().contains("truncated") || err.to_string().contains("past the end"), "{err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("truncated") || msg.contains("past the end"),
+            "{msg}"
+        );
     }
 
     #[test]
     fn manifest_round_trips_through_json() {
         let m = manifest(
             vec![ShardInfo {
-                name: "shard-0000.bin".to_string(),
+                name: shard_name(0),
                 hash: "deadbeef".to_string(),
+                documents: 2,
                 chunks: 2,
             }],
             Quantization::F32,
@@ -635,8 +759,27 @@ mod tests {
         assert_eq!(back, m);
     }
 
+    /// The manifest must not grow with the vault: that is the whole reason
+    /// documents moved into shards in v2. A v1 manifest measured 270 bytes per
+    /// document, so 20k notes came to 5.4 MB rewritten on every export.
+    #[test]
+    fn manifest_size_is_independent_of_document_count() {
+        let shards = vec![ShardInfo {
+            name: shard_name(0),
+            hash: "0".repeat(64),
+            documents: 20_000,
+            chunks: 20_048,
+        }];
+        let json = manifest(shards, Quantization::F32).to_json().unwrap();
+        assert!(
+            json.len() < 1024,
+            "a manifest describing 20k documents should stay tiny, got {} bytes",
+            json.len()
+        );
+    }
+
     /// A future format change must fail loudly here rather than be mis-parsed
-    /// into plausible nonsense.
+    /// into plausible nonsense. This is also what let v1 be replaced outright.
     #[test]
     fn manifest_refuses_an_unknown_format_version() {
         let mut m = manifest(Vec::new(), Quantization::F32);
@@ -647,23 +790,24 @@ mod tests {
     }
 
     #[test]
+    fn manifest_refuses_the_superseded_v1() {
+        let mut m = manifest(Vec::new(), Quantization::F32);
+        m.format_version = 1;
+        let json = serde_json::to_string(&m).unwrap();
+        let err = Manifest::from_json(&json).expect_err("should refuse");
+        assert!(err.to_string().contains("re-export"), "{err}");
+    }
+
+    #[test]
     fn open_assembles_candidates_with_relative_paths() {
+        let docs = vec![doc("a.md", "A"), doc("nested/b.md", "B")];
         let chunks = vec![
             chunk(0, "Heading", "first", vec![1.0, 0.0]),
             chunk(1, "", "second", vec![0.0, 1.0]),
         ];
-        let bytes = write_shard(&chunks, 2, Quantization::F32).unwrap();
-        let m = manifest(
-            vec![ShardInfo {
-                name: "shard-0000.bin".to_string(),
-                hash: shard_hash(&bytes),
-                chunks: 2,
-            }],
-            Quantization::F32,
-        );
+        let (m, bytes) = one_shard(&docs, &chunks);
         let artifact =
-            Artifact::open(&m.to_json().unwrap(), &[("shard-0000.bin".to_string(), bytes)])
-                .expect("open");
+            Artifact::open(&m.to_json().unwrap(), &[(shard_name(0), bytes)]).expect("open");
 
         let candidates = artifact.candidates(Space::Text);
         assert_eq!(candidates.len(), 2);
@@ -675,20 +819,75 @@ mod tests {
         assert!(artifact.candidates(Space::Image).is_empty());
     }
 
+    /// Each shard numbers its documents from zero, so assembling several has to
+    /// rebase them. Getting this wrong would attribute one note's chunks to
+    /// another — and it would only show up with more than one shard, which is
+    /// why this test exists at two.
+    #[test]
+    fn open_rebases_document_indices_across_shards() {
+        let docs_a = vec![doc("a.md", "A")];
+        let chunks_a = vec![chunk(0, "", "alpha", vec![1.0, 0.0])];
+        let docs_b = vec![doc("b.md", "B"), doc("c.md", "C")];
+        let chunks_b = vec![
+            chunk(0, "", "beta", vec![0.0, 1.0]),
+            chunk(1, "", "gamma", vec![0.5, 0.5]),
+        ];
+
+        let bytes_a = write_shard(&docs_a, &chunks_a, 2, Quantization::F32).unwrap();
+        let bytes_b = write_shard(&docs_b, &chunks_b, 2, Quantization::F32).unwrap();
+        let m = manifest(
+            vec![
+                ShardInfo {
+                    name: shard_name(0),
+                    hash: shard_hash(&bytes_a),
+                    documents: 1,
+                    chunks: 1,
+                },
+                ShardInfo {
+                    name: shard_name(1),
+                    hash: shard_hash(&bytes_b),
+                    documents: 2,
+                    chunks: 2,
+                },
+            ],
+            Quantization::F32,
+        );
+        let artifact = Artifact::open(
+            &m.to_json().unwrap(),
+            &[(shard_name(0), bytes_a), (shard_name(1), bytes_b)],
+        )
+        .expect("open");
+
+        assert_eq!(artifact.documents().len(), 3);
+        let by_text: Vec<(&str, &str)> = artifact
+            .chunks()
+            .iter()
+            .map(|c| (c.text.as_str(), artifact.documents()[c.doc_index].path.as_str()))
+            .collect();
+        assert_eq!(
+            by_text,
+            vec![("alpha", "a.md"), ("beta", "b.md"), ("gamma", "c.md")],
+            "every chunk must still point at its own document"
+        );
+    }
+
     /// A half-synced artifact must not answer queries from a mixture of two
     /// indexes, so a hash mismatch is fatal rather than a warning.
     #[test]
     fn open_rejects_a_shard_that_does_not_match_the_manifest() {
-        let bytes = write_shard(&[chunk(0, "", "x", vec![1.0, 0.0])], 2, Quantization::F32).unwrap();
+        let docs = vec![doc("a.md", "A")];
+        let bytes = write_shard(&docs, &[chunk(0, "", "x", vec![1.0, 0.0])], 2, Quantization::F32)
+            .unwrap();
         let m = manifest(
             vec![ShardInfo {
-                name: "shard-0000.bin".to_string(),
+                name: shard_name(0),
                 hash: "0".repeat(64),
+                documents: 1,
                 chunks: 1,
             }],
             Quantization::F32,
         );
-        let err = Artifact::open(&m.to_json().unwrap(), &[("shard-0000.bin".to_string(), bytes)])
+        let err = Artifact::open(&m.to_json().unwrap(), &[(shard_name(0), bytes)])
             .expect_err("should refuse");
         assert!(err.to_string().contains("partially synced"), "{err}");
     }
@@ -697,13 +896,67 @@ mod tests {
     fn open_reports_a_missing_shard_by_name() {
         let m = manifest(
             vec![ShardInfo {
-                name: "shard-0000.bin".to_string(),
+                name: shard_name(0),
                 hash: "0".repeat(64),
+                documents: 1,
                 chunks: 1,
             }],
             Quantization::F32,
         );
         let err = Artifact::open(&m.to_json().unwrap(), &[]).expect_err("should refuse");
         assert!(err.to_string().contains("shard-0000.bin"), "{err}");
+    }
+
+    /// Golden values. `assign_shard` is a pure function of `(root, path,
+    /// count)` by signature, so stability under insertion is structural — what
+    /// needs locking down is the mapping itself, because changing the hash
+    /// silently reassigns every document in every existing artifact and so
+    /// rewrites all of it on the next export. Change these only with a format
+    /// version bump.
+    #[test]
+    fn shard_assignment_is_pinned_to_known_buckets() {
+        assert_eq!(assign_shard(0, "a.md", 8), 1);
+        assert_eq!(assign_shard(0, "m.md", 8), 5);
+        assert_eq!(assign_shard(0, "z.md", 8), 4);
+        assert_eq!(assign_shard(0, "deep/nested/note.md", 8), 0);
+    }
+
+    #[test]
+    fn shard_assignment_spreads_documents_across_shards() {
+        let mut counts = [0usize; 8];
+        for i in 0..800 {
+            counts[assign_shard(0, &format!("note{i}.md"), 8)] += 1;
+        }
+        for (shard, count) in counts.iter().enumerate() {
+            assert!(
+                *count > 40,
+                "shard {shard} got only {count} of 800 documents — assignment is lopsided"
+            );
+        }
+    }
+
+    #[test]
+    fn shard_assignment_separates_identical_paths_in_different_roots() {
+        assert_ne!(
+            assign_shard(0, "notes/a.md", 64),
+            assign_shard(1, "notes/a.md", 64),
+            "two vaults with the same relative path must not collide by construction"
+        );
+    }
+
+    #[test]
+    fn a_single_shard_takes_every_document() {
+        for path in ["a.md", "deep/b.md", "z.md"] {
+            assert_eq!(assign_shard(0, path, 1), 0);
+        }
+    }
+
+    #[test]
+    fn shard_names_sort_in_shard_order() {
+        assert_eq!(shard_name(0), "shard-0000.bin");
+        assert_eq!(shard_name(12), "shard-0012.bin");
+        let mut names = vec![shard_name(10), shard_name(2), shard_name(1)];
+        names.sort();
+        assert_eq!(names, vec![shard_name(1), shard_name(2), shard_name(10)]);
     }
 }
