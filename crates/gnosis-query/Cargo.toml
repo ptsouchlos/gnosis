@@ -1,0 +1,10 @@
+[package]
+name = "query"
+version = "0.1.0"
+edition = "2024"
+description = "The retrieval pipeline for gnosis: two channels, fused, shared by every frontend"
+
+[dependencies]
+anyhow = { workspace = true }
+search = { workspace = true }
+store = { workspace = true }
