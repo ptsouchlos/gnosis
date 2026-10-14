@@ -3,6 +3,7 @@
 //! by non-native targets (e.g. a future wasm build) that need only the shape
 //! of the store, not a SQLite implementation.
 pub mod artifact;
+pub mod artifact_store;
 
 use std::fmt;
 use std::str::FromStr;
