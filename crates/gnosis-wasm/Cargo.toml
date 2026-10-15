@@ -1,0 +1,40 @@
+[package]
+name = "gnosis-wasm"
+version = "0.1.0"
+edition = "2024"
+description = "WebAssembly bindings for querying a portable gnosis artifact"
+
+[lib]
+# `cdylib` is what wasm-pack links; `rlib` keeps the crate testable on the
+# host, which is how the non-wasm tests below run at all.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+query = { workspace = true }
+search = { workspace = true }
+store = { workspace = true }
+
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+js-sys = "0.3.81"
+# Pinned exactly, not floated: the `wasm-bindgen` CLI and the crate share an
+# unstable bindgen schema and refuse to work across versions, so the build is
+# reproducible only if the crate names the version the toolchain must have.
+wasm-bindgen = "=0.2.129"
+
+[dev-dependencies]
+wasm-bindgen-test = "=0.3.79"
+
+# wasm-pack's own `wasm-opt` step is off, and the build script runs `wasm-opt`
+# itself (`script/wasm/build.sh`). Two reasons, both found by trying it the
+# short way first: wasm-pack 0.15 ships binaryen 117, which still defaults to
+# the 2019 MVP feature set and so rejects the bulk-memory and sign-extension
+# instructions rustc now emits by default; and it reads this metadata by
+# built-in profile name only, so the flags that would fix that are ignored for
+# the custom size profile the build uses.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[package.metadata.wasm-pack.profile.profiling]
+wasm-opt = false

@@ -12,6 +12,7 @@ members = [
     "crates/gnosis-search",
     "crates/gnosis-store",
     "crates/gnosis-walk",
+    "crates/gnosis-wasm",
 ]
 resolver = "3"
 
@@ -41,3 +42,15 @@ pdf-extract = "0.12.1"
 pulldown-cmark = "0.13.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# The wasm query client's build profile. Size matters there and nowhere else —
+# a client is downloaded over someone's network every time the plugin updates —
+# so it is a separate profile rather than a change to `release`, which builds
+# the CLI's indexer and wants speed.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
