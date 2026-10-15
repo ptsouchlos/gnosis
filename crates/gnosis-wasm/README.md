@@ -81,17 +81,21 @@ Median per query in node, same 6,255-chunk artifact:
 
 | | median |
 |---|---|
-| `related` | 12 ms |
-| dense-only `search` (lexical off) | 12 ms |
-| `lexicalSearch` | 142 ms |
-| hybrid `search` | 155 ms |
-| `open` (21 shards, 13 MB f32) | 440 ms |
+| `lexicalSearch` | 2.8 ms |
+| dense-only `search` (lexical off) | 8.9 ms |
+| `related` | 8.9 ms |
+| hybrid `search` | 11 ms |
+| `open` (21 shards, 13 MB f32) | 330 ms |
 
-The dense path beats the CLI's amortized 35.7 ms; the lexical channel is where
-the time goes, and the cause is structural rather than a slow loop. The
-artifact ships no FTS index, so `ArtifactStore` scores its whole candidate pool
-at query time — tokenizing each pooled chunk — before truncating it, and the
-pool grows with the query: 33 ms for one term, 118 ms for three, 159 ms for
-ten. Storing per-term frequencies in the artifact's postings would move that
-work to export time. Not done here: it changes the format, and this crate is
-the thing that measured the need for it.
+Every query path is now well inside the CLI's amortized 35.7 ms, and query
+length no longer matters: 10.4 ms at one term against 11.0 ms at ten, where it
+used to run 33 ms to 159 ms. The lexical channel costs about 2 ms on top of the
+dense scan.
+
+It did not start there. The first measurement of this crate had hybrid search
+at 155 ms, almost all of it the lexical channel re-tokenizing its candidate
+pool on every query — the pool has to be scored before it is truncated, and it
+grows with the query. Keeping each term's frequency beside its posting fixed
+it, and that turned out to need no format change at all: the index is built at
+`open`, which already tokenizes every chunk to find out which terms it
+contains, so counting them in the same pass is free.
