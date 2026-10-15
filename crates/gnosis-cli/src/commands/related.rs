@@ -1,9 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
 use crate::commands::search::{HIT_INDENT, resolve_spaces, root_label};
-use crate::store::{SqliteStore, Store, TextQuery};
+use crate::store::{SqliteStore, TextQuery};
 use crate::workspace::{Workspace, expand_tilde};
 
 /// List notes related to a given file.
@@ -43,20 +43,7 @@ pub fn execute(ws: &Workspace, args: RelatedArgs) -> Result<()> {
     let path = canon.to_string_lossy().to_string();
 
     let store = SqliteStore::open(&ws.db_path)?;
-    if store.document_hash(&path)?.is_none() {
-        bail!("{} is not indexed — run `gnosis index`", canon.display());
-    }
-
     let spaces = resolve_spaces(ws, &args.r#in)?;
-
-    let mut exclude = vec![path.clone()];
-    if !args.include_linked {
-        let targets = store.linked_targets(&path)?;
-        if !targets.is_empty() {
-            let all_meta = store.all_document_meta()?;
-            exclude.extend(resolve_link_targets(&targets, &all_meta));
-        }
-    }
 
     let tags_ref = (!args.tag.is_empty()).then_some(args.tag.as_slice());
     let filter = TextQuery {
@@ -64,25 +51,15 @@ pub fn execute(ws: &Workspace, args: RelatedArgs) -> Result<()> {
         tags: tags_ref,
     };
 
-    let mut per_space: Vec<Vec<search::Hit>> = Vec::with_capacity(spaces.len());
-    for space in spaces.iter().copied() {
-        let queries = store.chunk_vectors(&path, space)?;
-        if queries.is_empty() {
-            // This file has no vectors in this space (e.g. an image queried
-            // with `--in text`) — contributes nothing to the merge, not an
-            // error, unless every requested space is empty (checked below).
-            continue;
-        }
-        per_space.push(store.related_space(space, &queries, &exclude, args.limit, &filter)?);
-    }
-    if per_space.is_empty() {
-        bail!(
-            "{} has no chunks in any of [{}] to compare",
-            canon.display(),
-            spaces.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
-        );
-    }
-    let hits = search::merge_normalized(per_space, args.limit);
+    let hits = query::run_related(
+        &store,
+        &path,
+        &spaces,
+        args.limit,
+        args.include_linked,
+        &filter,
+        parse::extract_aliases,
+    )?;
 
     if args.json {
         // Full data regardless of terminal formatting — see search.rs's
@@ -116,27 +93,4 @@ pub fn execute(ws: &Workspace, args: RelatedArgs) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Resolve raw wikilink target texts to indexed document paths by matching
-/// against each candidate's filename stem (Obsidian's own default
-/// link-resolution behavior — by filename, not any custom title) or its
-/// frontmatter `aliases:`, case-insensitively. Not full Obsidian-compatible
-/// resolution: no folder-path disambiguation.
-fn resolve_link_targets(targets: &[String], all_meta: &[(String, Option<String>)]) -> Vec<String> {
-    all_meta
-        .iter()
-        .filter(|(path, frontmatter)| {
-            let stem = Path::new(path).file_stem().and_then(|s| s.to_str());
-            let stem_matches =
-                stem.is_some_and(|stem| targets.iter().any(|t| t.eq_ignore_ascii_case(stem)));
-            let alias_matches = frontmatter.as_deref().is_some_and(|fm| {
-                parse::extract_aliases(fm)
-                    .iter()
-                    .any(|a| targets.iter().any(|t| t.eq_ignore_ascii_case(a)))
-            });
-            stem_matches || alias_matches
-        })
-        .map(|(path, _)| path.clone())
-        .collect()
 }
