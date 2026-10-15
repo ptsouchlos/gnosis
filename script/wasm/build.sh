@@ -6,7 +6,10 @@
 # crates/gnosis-wasm/Cargo.toml.
 set -euo pipefail
 
-root="$(git rev-parse --show-toplevel)"
+# Derived from this script's own location, not from `git rev-parse` or the
+# working directory: the plugin repo calls this script to vendor its copy of
+# the query client, and `--show-toplevel` would hand back *that* repo.
+root="$(cd "$(dirname "$0")/../.." && pwd)"
 out="${1:-$root/crates/gnosis-wasm/pkg}"
 
 wasm-pack build "$root/crates/gnosis-wasm" \
