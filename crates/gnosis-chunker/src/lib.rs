@@ -61,6 +61,40 @@ pub fn chunk_markdown(body: &str, max_tokens: usize, overlap: usize) -> Vec<Chun
     chunks
 }
 
+/// The chunks a markdown *document* gets, which is not quite the chunks its
+/// body gets.
+///
+/// A document whose body yields nothing — everything in frontmatter
+/// properties, which 43% of the notes in the public `kepano-obsidian` vault
+/// look like — still needs one chunk, or it cannot be retrieved by any query,
+/// including its own exact name. That chunk carries the document's identity:
+/// the title as the heading trail, the rendered properties as the text.
+///
+/// `frontmatter_text` arrives already rendered (by `parse::frontmatter_text`)
+/// rather than as raw YAML, so this crate needs no YAML parser and the
+/// decision of *which* properties are worth indexing stays in one place.
+///
+/// Shared rather than duplicated per frontend on purpose: a client that built
+/// an index without the fallback would produce an index missing the same 43%,
+/// and nothing about the resulting artifact would say so.
+pub fn chunk_document(
+    title: &str,
+    frontmatter_text: &str,
+    body: &str,
+    max_tokens: usize,
+    overlap: usize,
+) -> Vec<Chunk> {
+    let chunks = chunk_markdown(body, max_tokens, overlap);
+    if !chunks.is_empty() {
+        return chunks;
+    }
+    vec![Chunk {
+        ord: 0,
+        heading_path: title.to_string(),
+        text: frontmatter_text.to_string(),
+    }]
+}
+
 /// Walk markdown events, accumulating plain text per heading section.
 fn split_sections(body: &str) -> Vec<Section> {
     let mut sections = Vec::new();
@@ -323,5 +357,43 @@ Some text under heading 2 that is also long enough to be split into multiple chu
     #[test]
     fn chunk_pages_of_nothing_is_empty() {
         assert!(super::chunk_pages(&[], 100, 10).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod document_tests {
+    use super::*;
+
+    /// A note with a body chunks exactly as its body does: nothing synthetic
+    /// is added alongside it.
+    #[test]
+    fn a_document_with_a_body_chunks_as_its_body() {
+        let chunks = chunk_document("Sourdough", "author: someone", "# Sourdough\n\nA long proof.\n", 256, 43);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].heading_path, "Sourdough");
+        assert!(chunks[0].text.contains("A long proof"), "got {:?}", chunks[0].text);
+        assert!(
+            !chunks[0].text.contains("author"),
+            "frontmatter belongs to the fallback, not to a body chunk"
+        );
+    }
+
+    /// A property-only note gets its identity instead of nothing.
+    #[test]
+    fn a_document_with_no_body_carries_its_identity() {
+        let chunks = chunk_document("Blade Runner", "director: Ridley Scott", "", 256, 43);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].ord, 0);
+        assert_eq!(chunks[0].heading_path, "Blade Runner");
+        assert_eq!(chunks[0].text, "director: Ridley Scott");
+    }
+
+    /// A note with neither body nor properties is still findable by name.
+    #[test]
+    fn an_empty_document_is_still_one_chunk() {
+        let chunks = chunk_document("Stub", "", "", 256, 43);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].heading_path, "Stub");
+        assert_eq!(chunks[0].text, "");
     }
 }

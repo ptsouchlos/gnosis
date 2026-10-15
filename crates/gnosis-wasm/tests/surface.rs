@@ -344,3 +344,155 @@ fn staleness_reports_a_document_the_vault_no_longer_has() {
         "got {report}"
     );
 }
+
+// ---- Builder ---------------------------------------------------------------
+
+use gnosis_wasm::builder::Builder;
+
+fn spec() -> JsValue {
+    js_sys::JSON::parse(
+        r#"{"model":"bge-small-en-v1.5","pooling":"cls","dim":4,"root":"notes",
+            "quantization":"f32","compression":"deflate"}"#,
+    )
+    .expect("spec")
+}
+
+/// The two notes a build test needs: one with a body, one whose content is
+/// entirely frontmatter.
+const NOTES: [(&str, &str); 2] = [
+    (
+        "notes/hydration.md",
+        "# Hydration\n\nBaker's percentages: water as a share of flour weight.\n",
+    ),
+    (
+        "notes/blade-runner.md",
+        "---\ndirector:\n  - \"[[Ridley Scott]]\"\nyear: 1982\n---\n",
+    ),
+];
+
+/// Embed by handing back a fixed unit vector per chunk, which is all a test of
+/// the boundary needs: what is being checked is that the texts come out, the
+/// vectors go in, and the result opens.
+fn build(builder: &mut Builder) -> JsValue {
+    for (path, text) in NOTES {
+        let added = json(
+            builder
+                .add_document(path, text, 1_700_000_000_000.0)
+                .expect("addDocument"),
+        );
+        let texts = added["texts"].as_array().expect("texts").len();
+        assert!(texts > 0, "{path} produced no chunk to embed");
+        let flat: Vec<f32> = (0..texts).flat_map(|i| [1.0, i as f32, 0.0, 0.0]).collect();
+        builder
+            .set_vectors(path, &Float32Array::from(flat.as_slice()))
+            .expect("setVectors");
+    }
+    builder.finish(1_700_000_400.0).expect("finish")
+}
+
+/// The whole point of the builder: what it writes, `Index` can open and
+/// search. Both halves of the client's side of the boundary, meeting.
+#[wasm_bindgen_test]
+fn an_index_built_here_opens_and_answers() {
+    let mut builder = Builder::create(spec()).expect("create");
+    let built = build(&mut builder);
+    let report = json(built.clone());
+    assert_eq!(report["documents"], 2);
+    assert_eq!(
+        report["chunks"], 2,
+        "one chunk each, the property-only note's being its identity: {report}"
+    );
+
+    let shards = js_sys::Reflect::get(&built, &JsValue::from_str("shards")).expect("shards");
+    let shards = Map::from(shards);
+    assert_eq!(shards.size(), 1, "this vault fits in one shard");
+
+    let manifest = report["manifest"].as_str().expect("manifest").to_string();
+    let index = Index::open(&manifest, &shards).expect("the built artifact must open");
+
+    let info = json(index.info().expect("info"));
+    assert_eq!(info["documents"], 2);
+    assert_eq!(info["spaces"][0]["pooling"], "cls");
+    assert_eq!(info["spaces"][0]["model"], "bge-small-en-v1.5");
+
+    // The property-only note is findable by a property, which is the whole
+    // reason the identity chunk exists.
+    let hits = paths(
+        index
+            .lexical_search("Ridley Scott", 10, JsValue::UNDEFINED)
+            .expect("lexical search"),
+    );
+    assert_eq!(
+        hits.first().map(String::as_str),
+        Some("notes/blade-runner.md"),
+        "got {hits:?}"
+    );
+}
+
+/// A rebuild carries unchanged documents over with their vectors, which is
+/// what makes a second build cost a handful of chunks rather than a vault.
+#[wasm_bindgen_test]
+fn rebuilding_reuses_an_unchanged_document() {
+    let mut builder = Builder::create(spec()).expect("create");
+    let built = build(&mut builder);
+    let report = json(built.clone());
+    let manifest = report["manifest"].as_str().expect("manifest").to_string();
+    let shards = Map::from(js_sys::Reflect::get(&built, &JsValue::from_str("shards")).unwrap());
+
+    let mut again = Builder::from_artifact(spec(), &manifest, &shards).expect("fromArtifact");
+    let unchanged = json(
+        again
+            .add_document(NOTES[0].0, NOTES[0].1, 1_700_000_000_000.0)
+            .expect("addDocument"),
+    );
+    assert_eq!(unchanged["reused"], true, "got {unchanged}");
+    assert_eq!(
+        unchanged["texts"].as_array().unwrap().len(),
+        0,
+        "a reused document embeds nothing"
+    );
+
+    let edited = json(
+        again
+            .add_document(
+                NOTES[1].0,
+                "---\ndirector:\n  - \"[[Denis Villeneuve]]\"\n---\n",
+                1_700_000_000_000.0,
+            )
+            .expect("addDocument"),
+    );
+    assert_eq!(edited["reused"], false);
+    assert_eq!(edited["texts"].as_array().unwrap().len(), 1);
+}
+
+/// A wrong-sized vector is refused with both numbers, for the same reason a
+/// wrong-sized *query* vector is: it is not a worse index, it is a meaningless
+/// one.
+#[wasm_bindgen_test]
+fn a_wrong_sized_vector_is_refused() {
+    let mut builder = Builder::create(spec()).expect("create");
+    builder
+        .add_document(NOTES[0].0, NOTES[0].1, 0.0)
+        .expect("addDocument");
+    let Err(err) = builder.set_vectors(NOTES[0].0, &Float32Array::from([1.0f32, 0.0].as_slice()))
+    else {
+        panic!("a 2-float vector must not satisfy a 4-dimensional index");
+    };
+    let msg = message(err.into());
+    assert!(msg.contains("4 floats"), "got {msg}");
+}
+
+/// Finishing with a document still waiting for vectors is an error rather
+/// than an index with a hole in it.
+#[wasm_bindgen_test]
+fn finishing_before_the_vectors_arrive_is_refused() {
+    let mut builder = Builder::create(spec()).expect("create");
+    builder
+        .add_document(NOTES[0].0, NOTES[0].1, 0.0)
+        .expect("addDocument");
+    let Err(err) = builder.finish(1.0) else {
+        panic!("finish must refuse a document with no vectors");
+    };
+    let msg = message(err.into());
+    assert!(msg.contains("waiting for its vectors"), "got {msg}");
+}

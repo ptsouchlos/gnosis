@@ -22,6 +22,8 @@
 //! kilobytes at most, and it buys one conversion path rather than a
 //! hand-written one per type.
 
+pub mod builder;
+
 use std::collections::HashMap;
 
 use js_sys::{Float32Array, JSON, Map, Uint8Array};
@@ -133,26 +135,7 @@ impl Index {
     /// partially synced artifact fails to open rather than answering queries
     /// from a mixture of two indexes.
     pub fn open(manifest_json: &str, shards: &Map) -> Result<Index, JsError> {
-        let mut named: Vec<(String, Vec<u8>)> = Vec::with_capacity(shards.size() as usize);
-        let entries = shards.entries();
-        loop {
-            let next = entries.next().map_err(js_err)?;
-            if next.done() {
-                break;
-            }
-            let pair = js_sys::Array::from(&next.value());
-            let name = pair
-                .get(0)
-                .as_string()
-                .ok_or_else(|| JsError::new("every shard key must be a string"))?;
-            let bytes = pair.get(1);
-            let bytes = bytes
-                .dyn_ref::<Uint8Array>()
-                .ok_or_else(|| JsError::new(&format!("shard '{name}' must be a Uint8Array")))?;
-            named.push((name, bytes.to_vec()));
-        }
-
-        let artifact = Artifact::open(manifest_json, &named).map_err(anyhow_err)?;
+        let artifact = Artifact::open(manifest_json, &shard_bytes(shards)?).map_err(anyhow_err)?;
         Ok(Index {
             store: ArtifactStore::new(artifact),
             cfg: search::bm25::SearchConfig::default(),
@@ -453,22 +436,46 @@ impl query::QueryEmbedder for Supplied {
     }
 }
 
+/// Read a `Map` of shard name to bytes, as both `Index::open` and the builder
+/// take them.
+pub(crate) fn shard_bytes(shards: &Map) -> Result<Vec<(String, Vec<u8>)>, JsError> {
+    let mut named: Vec<(String, Vec<u8>)> = Vec::with_capacity(shards.size() as usize);
+    let entries = shards.entries();
+    loop {
+        let next = entries.next().map_err(js_err)?;
+        if next.done() {
+            break;
+        }
+        let pair = js_sys::Array::from(&next.value());
+        let name = pair
+            .get(0)
+            .as_string()
+            .ok_or_else(|| JsError::new("every shard key must be a string"))?;
+        let bytes = pair.get(1);
+        let bytes = bytes
+            .dyn_ref::<Uint8Array>()
+            .ok_or_else(|| JsError::new(&format!("shard '{name}' must be a Uint8Array")))?;
+        named.push((name, bytes.to_vec()));
+    }
+    Ok(named)
+}
+
 /// `anyhow`'s full context chain, not just the outermost message: these errors
 /// cross into a JS console where nobody can add the context back.
-fn anyhow_err(err: anyhow::Error) -> JsError {
+pub(crate) fn anyhow_err(err: anyhow::Error) -> JsError {
     JsError::new(&format!("{err:#}"))
 }
 
-fn js_err(err: JsValue) -> JsError {
+pub(crate) fn js_err(err: JsValue) -> JsError {
     JsError::new(&JSON::stringify(&err).map_or_else(|_| "unknown error".into(), String::from))
 }
 
-fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsError> {
+pub(crate) fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsError> {
     let json = serde_json::to_string(value).map_err(|e| JsError::new(&e.to_string()))?;
     JSON::parse(&json).map_err(js_err)
 }
 
-fn from_js<T: for<'de> Deserialize<'de>>(value: &JsValue) -> Result<T, JsError> {
+pub(crate) fn from_js<T: for<'de> Deserialize<'de>>(value: &JsValue) -> Result<T, JsError> {
     let json = JSON::stringify(value).map_err(js_err)?;
     serde_json::from_str(&String::from(json)).map_err(|e| JsError::new(&e.to_string()))
 }

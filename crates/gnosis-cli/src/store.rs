@@ -146,10 +146,21 @@ impl SqliteStore {
     /// them would grow the artifact to no purpose.
     pub fn export_chunks(&self, space: Space) -> Result<Vec<ExportChunk>> {
         let mut stmt = self.conn.prepare(
-            "SELECT doc_id, ord, modality, COALESCE(heading_path, ''), COALESCE(text, ''), vector
-             FROM chunks
-             WHERE space = ?1 AND vector IS NOT NULL
-             ORDER BY doc_id, ord",
+            // Ordered by the document's path, matching `export_documents`,
+            // rather than by `doc_id`. Insertion order is not a property of
+            // the vault: re-indexing the same notes in a different walk order,
+            // or after a `rebuild`, assigns different ids and would lay the
+            // same content out differently — rewriting every shard for a
+            // syncer to re-download. By path, an artifact is a pure function
+            // of its content, which is also what lets a client build a
+            // byte-identical one.
+            "SELECT c.doc_id, c.ord, c.modality, COALESCE(c.heading_path, ''),
+                    COALESCE(c.text, ''), c.vector
+             FROM chunks c
+             JOIN documents d ON d.id = c.doc_id
+             JOIN roots r ON r.id = d.root_id
+             WHERE c.space = ?1 AND c.vector IS NOT NULL
+             ORDER BY r.path, d.rel_path, c.ord",
         )?;
         let chunks = stmt
             .query_map([space.as_str()], |row| {

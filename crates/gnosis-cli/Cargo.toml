@@ -22,6 +22,7 @@ store = { workspace = true }
 walk = { workspace = true }
 
 anyhow = { workspace = true }
+blake3 = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

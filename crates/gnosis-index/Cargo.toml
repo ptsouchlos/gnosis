@@ -14,6 +14,7 @@ progress = { workspace = true }
 store = { workspace = true }
 walk = { workspace = true }
 blake3 = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 search = { workspace = true }

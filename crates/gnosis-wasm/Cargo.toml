@@ -10,6 +10,7 @@ description = "WebAssembly bindings for querying a portable gnosis artifact"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+index = { workspace = true }
 query = { workspace = true }
 search = { workspace = true }
 store = { workspace = true }
