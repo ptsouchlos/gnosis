@@ -88,23 +88,12 @@ impl Embedder for TextEmbedder {
         Some(self.max_input_tokens)
     }
 
-    fn embed_query(&mut self, query: &str) -> Result<Vec<f32>> {
-        let prefixed = format!("{}{query}", self.query_prefix);
-        self.embed(std::slice::from_ref(&prefixed))?
-            .into_iter()
-            .next()
-            .context("embedding produced no vector")
+    fn query_prefix(&self) -> &str {
+        self.query_prefix
     }
 
-    fn embed_document(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
-        if self.document_prefix.is_empty() {
-            return self.embed(inputs);
-        }
-        let prefixed: Vec<String> = inputs
-            .iter()
-            .map(|text| format!("{}{text}", self.document_prefix))
-            .collect();
-        self.embed(&prefixed)
+    fn document_prefix(&self) -> &str {
+        self.document_prefix
     }
 }
 

@@ -57,7 +57,8 @@ Building one:
 
 ```js
 const builder = Builder.create({ model: "bge-small-en-v1.5", pooling: "cls",
-                                 dim: 384, root: "notes" });
+                                 queryPrefix: "Represent this sentence for searching relevant passages: ",
+                                 documentPrefix: "", dim: 384, root: "notes" });
 // or Builder.fromArtifact(spec, manifestJson, shards) to reuse what has not changed
 
 const { reused, texts } = builder.addDocument(path, text, file.stat.mtime);
@@ -66,7 +67,14 @@ const { manifest, shards, unchanged } = builder.finish(Date.now() / 1000);
 ```
 
 `addDocument` parses and chunks in Rust and hands back the exact strings to
-embed, so the embedding input is what `gnosis index` embeds. A document whose
+embed — document prefix and heading trail included — so the embedding input is
+what `gnosis index` embeds. Both prefixes are required: `""` is a statement that
+the model wants none, and leaving one out is refused rather than defaulted,
+because an E5 build that forgot `"passage: "` would look healthy and rank badly.
+
+On the query side, `info()` reports each space's `queryPrefix` as the index
+recorded it. Prepend it before embedding a query; it is not derivable from the
+model id, since `query_instruction = false` turns it off per index. A document whose
 content hash matches the previous artifact's comes back `reused` with nothing
 to embed. `unchanged` names the shards whose bytes did not change, which are
 not returned — rewriting a file a syncer already has is the churn sharding

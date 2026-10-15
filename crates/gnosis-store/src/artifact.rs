@@ -29,6 +29,12 @@ use crate::Space;
 /// Bumped whenever the manifest or shard layout changes incompatibly. A reader
 /// refuses an unknown version rather than mis-parsing one.
 ///
+/// **v5** records each space's query and document prefixes in the manifest.
+/// A client embedding a query had to guess them from the model id, which is
+/// wrong for any index built with `query_instruction = false`, and wrong
+/// silently. Required rather than defaulted, so a v4 manifest is refused with
+/// the re-export message instead of read as "no prefixes".
+///
 /// **v4** gives a shard one section per vector space, each with its own
 /// dimensionality and its own fixed-stride vector block, so the image space
 /// (CLIP, 512d) can travel beside the text space (384d) in one artifact. v3 had
@@ -45,7 +51,7 @@ use crate::Space;
 /// — 5.4 MB at 20k documents — and rewrote in full on every export, so sharding
 /// the chunks alone would have saved nothing. The artifact is derived and
 /// regenerable, so the fix was a version bump rather than a migration.
-pub const ARTIFACT_FORMAT_VERSION: u32 = 4;
+pub const ARTIFACT_FORMAT_VERSION: u32 = 5;
 
 /// Shard file magic: "GNSA" (gnosis artifact).
 const SHARD_MAGIC: &[u8; 4] = b"GNSA";
@@ -167,6 +173,19 @@ pub struct ModelInfo {
     /// the same model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_id: Option<String>,
+    /// Prepended to a query before it is embedded, empty when the model wants
+    /// none or the index was built with `query_instruction = false`.
+    ///
+    /// Recorded for the same reason as `pooling`: it cannot be inferred from
+    /// the model id, because whether it applies is a per-index setting, and a
+    /// query embedded without the instruction its documents were matched
+    /// against still produces a healthy-looking vector.
+    pub query_prefix: String,
+    /// Prepended to indexed content before it was embedded — `"passage: "` for
+    /// E5, empty for BGE. A client building or extending this space has to
+    /// embed with exactly this, or its vectors land in a different convention
+    /// from the ones already stored.
+    pub document_prefix: String,
 }
 
 /// One vector space in the artifact, and what a client needs to query it.
@@ -917,6 +936,8 @@ mod tests {
                     pooling: "cls".to_string(),
                     dim: 2,
                     query_id: None,
+                    query_prefix: String::new(),
+                    document_prefix: String::new(),
                 },
             }],
             quantization,
@@ -1319,6 +1340,49 @@ mod tests {
         assert!(err.to_string().contains("re-export"), "{err}");
     }
 
+    /// A v4 manifest has no prefixes. Read as empty, it would have a client
+    /// embed BGE queries without the instruction the CLI uses — healthy
+    /// vectors, quietly worse rankings — so it must be refused instead.
+    #[test]
+    fn manifest_refuses_a_v4_manifest_that_predates_prefixes() {
+        let json = r#"{
+            "format_version": 4,
+            "created_unix": 0,
+            "spaces": [{"space": "text",
+                        "model": {"id": "bge-small-en-v1.5", "pooling": "cls", "dim": 384}}],
+            "quantization": "i8",
+            "compression": "deflate",
+            "roots": ["vault"],
+            "shard_docs": 256,
+            "shards": []
+        }"#;
+        let err = Manifest::from_json(json).expect_err("should refuse");
+        assert!(err.to_string().contains("re-export"), "{err}");
+    }
+
+    /// Both prefixes survive a round trip, including the empty one: "no
+    /// prefix" is a recorded fact, not a missing field.
+    #[test]
+    fn the_manifest_carries_each_spaces_prefixes() {
+        let mut m = manifest(Vec::new(), Quantization::F32);
+        m.spaces[0].model.id = "multilingual-e5-small".to_string();
+        m.spaces[0].model.query_prefix = "query: ".to_string();
+        m.spaces[0].model.document_prefix = "passage: ".to_string();
+        let json = m.to_json().unwrap();
+        let back = Manifest::from_json(&json).expect("round trip");
+        let text = back.space(Space::Text).expect("a text space");
+        assert_eq!(text.query_prefix, "query: ");
+        assert_eq!(text.document_prefix, "passage: ");
+
+        let mut bge = manifest(Vec::new(), Quantization::F32);
+        bge.spaces[0].model.query_prefix = "Represent: ".to_string();
+        let json = bge.to_json().unwrap();
+        assert!(
+            json.contains("\"document_prefix\": \"\"") || json.contains("\"document_prefix\":\"\""),
+            "an empty prefix must still be written: {json}"
+        );
+    }
+
     #[test]
     fn open_assembles_candidates_with_relative_paths() {
         let docs = vec![doc("a.md", "A"), doc("nested/b.md", "B")];
@@ -1394,6 +1458,8 @@ mod tests {
                 pooling: "mean".to_string(),
                 dim: 2,
                 query_id: Some("clip-vit-b-32".to_string()),
+                query_prefix: String::new(),
+                document_prefix: String::new(),
             },
         });
         let artifact = Artifact::open(&m.to_json().unwrap(), &[(shard_name(0), bytes)]).unwrap();
@@ -1424,6 +1490,8 @@ mod tests {
                 pooling: "mean".to_string(),
                 dim: 512,
                 query_id: Some("clip-vit-b-32-text".to_string()),
+                query_prefix: String::new(),
+                document_prefix: String::new(),
             },
         });
         let back = Manifest::from_json(&m.to_json().unwrap()).expect("round trip");

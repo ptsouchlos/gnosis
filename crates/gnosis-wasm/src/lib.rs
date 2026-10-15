@@ -75,6 +75,14 @@ struct SpaceReport {
     /// produces healthy-looking vectors with much of their usable range
     /// thrown away, so it is reported rather than assumed.
     pooling: String,
+    /// Prepended to a query before embedding it — BGE's instruction, E5's
+    /// `"query: "`, or nothing. Recorded by the indexer, because whether it
+    /// applies is a per-index setting no client could infer.
+    query_prefix: String,
+    /// Prepended to indexed content. A client only needs it to *build*, and
+    /// [`builder::Builder`] applies it itself; reported so a client can carry
+    /// an existing artifact's convention into a rebuild.
+    document_prefix: String,
     dim: usize,
     chunks: usize,
 }
@@ -256,7 +264,7 @@ impl Index {
         to_js(&hits)
     }
 
-    /// What this artifact is: its models and their pooling, its dimensions,
+    /// What this artifact is: its models, their pooling and prefixes, its dimensions,
     /// how much it holds and when it was built.
     pub fn info(&self) -> Result<JsValue, JsError> {
         let manifest = self.store.artifact().manifest();
@@ -280,6 +288,8 @@ impl Index {
                     .clone()
                     .unwrap_or_else(|| s.model.id.clone()),
                 pooling: s.model.pooling.clone(),
+                query_prefix: s.model.query_prefix.clone(),
+                document_prefix: s.model.document_prefix.clone(),
                 dim: s.model.dim,
                 chunks: chunks(s.space),
             })

@@ -24,9 +24,11 @@ pub trait Embedder {
     /// are unaffected, which is why `related` (document-to-document) keeps
     /// using `embed`.
     ///
-    /// Defaults to `embed`, so a symmetric model implements nothing.
+    /// Prepends [`Embedder::query_prefix`], so a model declares its
+    /// instruction rather than reimplementing this.
     fn embed_query(&mut self, query: &str) -> Result<Vec<f32>> {
-        self.embed(std::slice::from_ref(&query.to_string()))?
+        let prefixed = format!("{}{query}", self.query_prefix());
+        self.embed(std::slice::from_ref(&prefixed))?
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("embedding produced no vector"))
@@ -39,10 +41,31 @@ pub trait Embedder {
     /// uses `"query: "` and `"passage: "` — and omitting the document side is a
     /// material quality loss, not a nicety.
     ///
-    /// Defaults to `embed`, so a model that wants nothing on the document side
-    /// (`bge`, which instructs only queries) implements nothing.
+    /// Prepends [`Embedder::document_prefix`]; a model that wants nothing on
+    /// the document side (`bge`, which instructs only queries) is `embed`.
     fn embed_document(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
-        self.embed(inputs)
+        let prefix = self.document_prefix();
+        if prefix.is_empty() {
+            return self.embed(inputs);
+        }
+        let prefixed: Vec<String> = inputs.iter().map(|text| format!("{prefix}{text}")).collect();
+        self.embed(&prefixed)
+    }
+
+    /// Prepended to a search query; empty for a symmetric model.
+    ///
+    /// Exposed rather than only applied, because a portable artifact records
+    /// it: a client embedding a query outside Rust has to reproduce exactly
+    /// what [`Embedder::embed_query`] does here.
+    fn query_prefix(&self) -> &str {
+        ""
+    }
+
+    /// Prepended to indexed content; empty unless the model instructs
+    /// documents too. Recorded in the index for the same reason as
+    /// [`Embedder::query_prefix`].
+    fn document_prefix(&self) -> &str {
+        ""
     }
 
     /// Longest input the model accepts, in its own tokens. Anything past this
@@ -234,5 +257,45 @@ mod tests {
         let v = spy.embed_query("tent repair").expect("embed query");
         assert_eq!(v, vec![1.0]);
         assert_eq!(spy.seen, vec!["tent repair".to_string()]);
+    }
+
+    /// A model that declares its prefixes gets them applied on the matching
+    /// side only. The declaration is what a portable artifact records, so the
+    /// two must not be able to disagree.
+    #[test]
+    fn declared_prefixes_are_what_the_defaults_apply() {
+        struct E5Like {
+            seen: Vec<String>,
+        }
+        impl Embedder for E5Like {
+            fn space(&self) -> &str {
+                "text"
+            }
+            fn dim(&self) -> usize {
+                1
+            }
+            fn model_id(&self) -> &str {
+                "e5-like"
+            }
+            fn embed(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+                self.seen.extend_from_slice(inputs);
+                Ok(inputs.iter().map(|_| vec![1.0]).collect())
+            }
+            fn query_prefix(&self) -> &str {
+                "query: "
+            }
+            fn document_prefix(&self) -> &str {
+                "passage: "
+            }
+        }
+
+        let mut e5 = E5Like { seen: Vec::new() };
+        e5.embed_query("tent repair").expect("embed query");
+        e5.embed_document(&["patching a fly".to_string()])
+            .expect("embed document");
+        assert_eq!(
+            e5.seen,
+            vec!["query: tent repair".to_string(), "passage: patching a fly".to_string()]
+        );
     }
 }
