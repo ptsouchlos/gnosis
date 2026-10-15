@@ -462,6 +462,9 @@ mod tests {
     use std::path::PathBuf;
 
     use store::artifact::Artifact;
+    use store::artifact_store::ArtifactStore;
+
+    use crate::commands::search::QueryEmbedders;
     use store::{ChunkWrite, DocWrite, TextQuery};
 
     use super::*;
@@ -608,6 +611,16 @@ mod tests {
     /// The text space's model, which most tests are about.
     fn text_space(manifest: &Manifest) -> &ModelInfo {
         manifest.space(Space::Text).expect("a text space")
+    }
+
+    /// A query embedder that always answers the same vector, so a parity test
+    /// compares two stores rather than two model runs.
+    struct FixedVector(Vec<f32>);
+
+    impl query::QueryEmbedder for FixedVector {
+        fn embed_query(&mut self, _space: Space, _query: &str) -> Result<Vec<f32>> {
+            Ok(self.0.clone())
+        }
     }
 
     fn open_artifact(manifest: &Manifest, shards: Vec<ShardBody>) -> Artifact {
@@ -1158,6 +1171,420 @@ mod tests {
             "the image document still travels — its text-space neighbors link to it"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// **The acceptance gate for the plugin.** Both channels, fused, scored
+    /// through the same pipeline a frontend uses: an artifact must return what
+    /// its database returns, or every measurement in this project stops
+    /// describing the client.
+    ///
+    /// PR #35's gate compared the dense channel alone. Most of gnosis's
+    /// measured quality is BM25 — lexical-only scores 0.666 on scifact against
+    /// the hybrid's 0.722 — so a dense-only gate would have passed an artifact
+    /// whose lexical channel was missing or mis-normalized.
+    #[test]
+    fn the_hybrid_pipeline_agrees_between_the_artifact_and_the_database() {
+        let dir = temp_dir("hybrid-parity");
+        let mut store = seeded_store(&dir);
+        with_image_space(&mut store);
+        let (manifest, shards) = build_one(&store, Quantization::F32, Compression::Deflate);
+        let artifact = ArtifactStore::new(open_artifact(&manifest, shards));
+
+        let cfg = search::bm25::SearchConfig::default();
+        assert!(cfg.lexical, "this gate is pointless with the channel off");
+        for query in ["beta gamma", "alpha", "near", "delta"] {
+            let from_db = query::run_query(
+                &store,
+                &mut FixedVector(vec![1.0, 0.0, 0.0, 0.0]),
+                query,
+                &[Space::Text],
+                10,
+                &TextQuery::default(),
+                &cfg,
+            )
+            .unwrap();
+            let from_artifact = query::run_query(
+                &artifact,
+                &mut FixedVector(vec![1.0, 0.0, 0.0, 0.0]),
+                query,
+                &[Space::Text],
+                10,
+                &TextQuery::default(),
+                &cfg,
+            )
+            .unwrap();
+
+            assert!(!from_db.is_empty(), "'{query}' matched nothing at all");
+            assert_eq!(
+                from_db.len(),
+                from_artifact.len(),
+                "'{query}' returned {} from the database and {} from the artifact",
+                from_db.len(),
+                from_artifact.len()
+            );
+            for (db, art) in from_db.iter().zip(&from_artifact) {
+                assert_eq!(
+                    db.path.trim_start_matches("/vault/"),
+                    art.path,
+                    "'{query}' ranked differently"
+                );
+                assert_eq!(db.score, art.score, "'{query}' scored {} differently", art.path);
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `related` is the feature that needs no model at all, so it is the first
+    /// thing a plugin can ship — and it reads a different set of store methods
+    /// than search does.
+    #[test]
+    fn related_agrees_between_the_artifact_and_the_database() {
+        let dir = temp_dir("related-parity");
+        let mut store = seeded_store(&dir);
+        with_image_space(&mut store);
+        let (manifest, shards) = build_one(&store, Quantization::F32, Compression::Deflate);
+        let artifact = ArtifactStore::new(open_artifact(&manifest, shards));
+
+        let vectors = store.chunk_vectors("/vault/near.md", Space::Text).unwrap();
+        assert_eq!(
+            artifact.chunk_vectors("near.md", Space::Text).unwrap(),
+            vectors,
+            "the artifact must find the same document's vectors by relative path"
+        );
+
+        let exclude_db = vec!["/vault/near.md".to_string()];
+        let exclude_art = vec!["near.md".to_string()];
+        let from_db = store
+            .related_space(Space::Text, &vectors, &exclude_db, 10, &TextQuery::default())
+            .unwrap();
+        let from_artifact = artifact
+            .related_space(Space::Text, &vectors, &exclude_art, 10, &TextQuery::default())
+            .unwrap();
+        assert_eq!(from_db.len(), from_artifact.len());
+        for (db, art) in from_db.iter().zip(&from_artifact) {
+            assert_eq!(db.path.trim_start_matches("/vault/"), art.path);
+            assert_eq!(db.score, art.score);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An artifact is derived and query-only. A client that could half-write
+    /// one would produce an index nothing can regenerate, so the write methods
+    /// report rather than panic — and rather than silently succeed.
+    #[test]
+    fn an_artifact_store_refuses_every_write() {
+        let dir = temp_dir("readonly");
+        let store = seeded_store(&dir);
+        let (manifest, shards) = build_one(&store, Quantization::F32, Compression::Deflate);
+        let mut artifact = ArtifactStore::new(open_artifact(&manifest, shards));
+
+        let err = artifact.set_meta("model.text", "x").expect_err("read-only");
+        assert!(err.to_string().contains("read-only"), "{err}");
+        assert!(artifact.delete_document("near.md").is_err());
+        assert!(artifact.delete_by_root("vault").is_err());
+        assert!(
+            artifact
+                .replace_document(&DocWrite {
+                    path: "new.md",
+                    kind: "markdown",
+                    source_root: "/vault",
+                    content_hash: b"h",
+                    mtime: 0,
+                    title: "New",
+                    frontmatter: None,
+                    indexed_at: 0,
+                    chunks: &[],
+                    links: &[],
+                    tags: &[],
+                    width: None,
+                    height: None,
+                })
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The filter has to mean the same thing on both sides, and this is where
+    /// the artifact genuinely differs: it holds a root *label*, not a machine
+    /// path, so that is what `--from` matches against.
+    #[test]
+    fn an_artifact_filters_by_root_label_and_by_tag() {
+        let dir = temp_dir("filters");
+        let store = seeded_store(&dir);
+        let (manifest, shards) = build_one(&store, Quantization::F32, Compression::Deflate);
+        let artifact = ArtifactStore::new(open_artifact(&manifest, shards));
+        let query = [1.0, 0.0, 0.0, 0.0];
+
+        let roots = vec!["vault".to_string()];
+        let hits = artifact
+            .search_space(
+                Space::Text,
+                &query,
+                10,
+                &TextQuery {
+                    from: Some(&roots),
+                    tags: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 3, "the label matches every document");
+
+        let elsewhere = vec!["/vault".to_string()];
+        let none = artifact
+            .search_space(
+                Space::Text,
+                &query,
+                10,
+                &TextQuery {
+                    from: Some(&elsewhere),
+                    tags: None,
+                },
+            )
+            .unwrap();
+        assert!(none.is_empty(), "an absolute path is not a label");
+
+        let tags = vec!["note".to_string()];
+        let tagged = artifact
+            .search_space(
+                Space::Text,
+                &query,
+                10,
+                &TextQuery {
+                    from: None,
+                    tags: Some(&tags),
+                },
+            )
+            .unwrap();
+        assert_eq!(tagged.len(), 3);
+        let missing = vec!["absent".to_string()];
+        assert!(
+            artifact
+                .search_space(
+                    Space::Text,
+                    &query,
+                    10,
+                    &TextQuery {
+                        from: None,
+                        tags: Some(&missing),
+                    },
+                )
+                .unwrap()
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The one divergence that is inherent rather than fixable, pinned with
+    /// evidence instead of asserted in a comment.
+    ///
+    /// SQLite's FTS5 `unicode61` tokenizer folds diacritics; `bm25::tokenize`
+    /// does not, and says so. So on accented text the two backends disagree
+    /// about whether a chunk contains a term — and therefore about its
+    /// document frequency, which feeds IDF for every query. The artifact is
+    /// the conservative side: it misses the accented chunk rather than
+    /// inventing a match.
+    #[test]
+    fn the_artifacts_tokenizer_does_not_fold_diacritics_and_sqlite_does() {
+        let dir = temp_dir("diacritics");
+        let mut store = SqliteStore::open(&dir.join("gnosis.db")).unwrap();
+        store.set_meta("model.text", "bge-small-en-v1.5").unwrap();
+        store.set_meta("dim.text", "2").unwrap();
+        for (path, text) in [("accented.md", "une pause café"), ("plain.md", "a cafe stop")] {
+            store
+                .replace_document(&DocWrite {
+                    path: &format!("/vault/{path}"),
+                    kind: "markdown",
+                    source_root: "/vault",
+                    content_hash: b"hash",
+                    mtime: 0,
+                    title: path,
+                    frontmatter: None,
+                    indexed_at: 0,
+                    chunks: &[ChunkWrite {
+                        ord: 0,
+                        space: "text".to_string(),
+                        modality: "text".to_string(),
+                        text: Some(text.to_string()),
+                        heading_path: String::new(),
+                        vector: vec![1.0, 0.0],
+                    }],
+                    links: &[],
+                    tags: &[],
+                    width: None,
+                    height: None,
+                })
+                .unwrap();
+        }
+        let (manifest, shards) = build_one(&store, Quantization::F32, Compression::Deflate);
+        let artifact = ArtifactStore::new(open_artifact(&manifest, shards));
+
+        let terms = vec!["cafe".to_string()];
+        let from_db = store
+            .lexical_candidates(&terms, 50, &TextQuery::default())
+            .unwrap();
+        let from_artifact = artifact
+            .lexical_candidates(&terms, 50, &TextQuery::default())
+            .unwrap();
+
+        assert_eq!(
+            from_db.doc_freqs,
+            vec![2],
+            "FTS5 folds the accent, so both chunks contain the term"
+        );
+        assert_eq!(
+            from_artifact.doc_freqs,
+            vec![1],
+            "the artifact's tokenizer keeps the accent, so only the plain chunk matches"
+        );
+        assert_eq!(from_artifact.candidates.len(), 1);
+        assert_eq!(from_artifact.candidates[0].path, "plain.md");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The same gate on a real corpus, with a real model and real queries.
+    ///
+    /// Ignored by default: it needs an indexed vault and will download the
+    /// embedding model. Point it at one and run it:
+    ///
+    /// ```text
+    /// GNOSIS_PARITY_VAULT=/path/to/vault \
+    ///   cargo test --release -p gnosis-cli -- --ignored parity_on_a_real_corpus --nocapture
+    /// ```
+    ///
+    /// The three-document fixture above cannot show what a corpus does: IDF is
+    /// meaningless at that size, the over-fetch never binds, and no term is
+    /// ambiguous. This runs the queries through both stores at scale and
+    /// reports how far apart they land.
+    ///
+    /// **What this can and cannot assert.** When the lexical candidate pool is
+    /// not truncated the two agree *exactly*: measured on scifact with
+    /// `LEXICAL_OVERFETCH` raised so it never binds, 300/300 identical top-10s
+    /// and a largest score difference of 0.000e0. At the shipped over-fetch
+    /// they keep different pools — SQLite orders by FTS5's own `bm25()` before
+    /// its `LIMIT`, this orders by BM25+ itself — so near-ties at the
+    /// truncation boundary fall differently and agreement drops to 226/300.
+    ///
+    /// So the assertion is relative rather than absolute: the artifact must be
+    /// no further from the database's exact ranking than the database's *own*
+    /// ANN index is, which on the same corpus agrees on 137/300. An artifact
+    /// that ranked worse than the approximation the CLI already ships with
+    /// would not be fit to serve a client.
+    #[test]
+    #[ignore = "needs an indexed vault; downloads a model"]
+    fn parity_on_a_real_corpus() {
+        let Ok(vault) = std::env::var("GNOSIS_PARITY_VAULT") else {
+            panic!("set GNOSIS_PARITY_VAULT to an indexed vault");
+        };
+        let vault = PathBuf::from(vault);
+        let ws = crate::workspace::Workspace::resolve(false, Some(&vault.join("gnosis.toml")))
+            .expect("resolving the vault's workspace");
+
+        // Compare against the database's *exact* ranking. A database with an
+        // ANN index answers approximately — f16 HNSW, by default since PR #34
+        // — so comparing the artifact's brute force against it would measure
+        // that index's recall rather than the artifact's fidelity. Copying the
+        // `.db` alone into an empty directory leaves no `index/` beside it,
+        // which is how `SqliteStore` falls back to brute force.
+        let exact_dir = temp_dir("parity-exact");
+        std::fs::copy(&ws.db_path, exact_dir.join("gnosis.db")).expect("copying the index");
+        let store = SqliteStore::open(&exact_dir.join("gnosis.db")).expect("opening the copy");
+        let approximate = SqliteStore::open(&ws.db_path).expect("opening the index");
+
+        let (manifest, shards) = build_artifact(
+            &store,
+            &ws.config.embed.text.model,
+            Quantization::F32,
+            Compression::Deflate,
+            Space::ALL,
+            256,
+        )
+        .expect("building the artifact");
+        let artifact = ArtifactStore::new(open_artifact(&manifest, shards));
+
+        let queries: Vec<String> = std::env::var("GNOSIS_PARITY_QUERIES")
+            .map(|path| {
+                std::fs::read_to_string(path)
+                    .expect("reading the query file")
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_else(|_| {
+                vec![
+                    "what is the effect of the treatment".to_string(),
+                    "cell migration".to_string(),
+                    "bone mineral density".to_string(),
+                ]
+            });
+
+        let mut embedders = QueryEmbedders::new(&ws);
+        let cfg = embedders.config().clone();
+        let mut ask = |store: &dyn Store, q: &str| -> Vec<search::Hit> {
+            query::run_query(
+                store,
+                &mut embedders,
+                q,
+                &[Space::Text],
+                10,
+                &TextQuery::default(),
+                &cfg,
+            )
+            .expect("query")
+        };
+
+        let strip = |hits: &[search::Hit]| -> Vec<String> {
+            let prefix = format!("{}/", vault.display());
+            hits.iter()
+                .map(|h| h.path.trim_start_matches(&prefix).to_string())
+                .collect()
+        };
+
+        let mut agreed = 0usize;
+        let mut ann_agreed = 0usize;
+        let mut ann_overlap = 0usize;
+        let mut worst_score_gap = 0f32;
+        let mut disagreements: Vec<String> = Vec::new();
+        for q in &queries {
+            let exact = ask(&store, q);
+            let from_artifact = ask(&artifact, q);
+            let from_ann = ask(&approximate, q);
+
+            let exact_paths = strip(&exact);
+            let art_paths: Vec<String> = from_artifact.iter().map(|h| h.path.clone()).collect();
+            let ann_paths = strip(&from_ann);
+            for (a, b) in exact.iter().zip(&from_artifact) {
+                worst_score_gap = worst_score_gap.max((a.score - b.score).abs());
+            }
+            if exact_paths == art_paths {
+                agreed += 1;
+            } else if disagreements.len() < 3 {
+                disagreements.push(format!(
+                    "  '{q}'\n    exact:    {exact_paths:?}\n    artifact: {art_paths:?}"
+                ));
+            }
+            ann_agreed += usize::from(ann_paths == exact_paths);
+            ann_overlap += ann_paths.iter().filter(|p| exact_paths.contains(p)).count();
+        }
+        let n = queries.len();
+        println!(
+            "artifact vs the database's exact ranking: identical top-10 {agreed}/{n}, \
+             largest score gap {worst_score_gap:.3e}"
+        );
+        println!(
+            "for reference, the database's own ANN index vs the same exact ranking: \
+             identical top-10 {ann_agreed}/{n}, recall@10 {:.4}",
+            ann_overlap as f64 / (10 * n) as f64
+        );
+        for d in &disagreements {
+            println!("{d}");
+        }
+        let _ = std::fs::remove_dir_all(exact_dir);
+        assert!(
+            agreed >= ann_agreed,
+            "the artifact agreed with the exact ranking on {agreed}/{n} queries, worse than the \
+             database's own ANN index at {ann_agreed}/{n}"
+        );
     }
 
     /// An index with image embedding switched off must not grow an empty image
