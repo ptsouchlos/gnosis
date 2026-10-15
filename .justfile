@@ -37,3 +37,14 @@ test-all config="debug":
 [group('dev')]
 bench file_count="2000" image_count="200":
     infra/bench/run.sh {{ file_count }} {{ image_count }}
+
+[doc('Build the wasm query client (wasm-pack + wasm-opt) and report its size')]
+[group('wasm')]
+wasm-build out="":
+    script/wasm/build.sh {{ out }}
+
+[doc('Run the wasm bindings tests in node')]
+[group('wasm')]
+wasm-test:
+    CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+        cargo test -p gnosis-wasm --target wasm32-unknown-unknown

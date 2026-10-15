@@ -5,3 +5,6 @@
 
 # fastembed model cache, in case it ever falls back to the cwd default
 .fastembed_cache/
+
+# wasm-pack output for the query client (built by script/wasm/build.sh)
+crates/gnosis-wasm/pkg/
