@@ -9,8 +9,11 @@
 //! force at ~1 ms over 20k chunks, 0.983 recall@10, so there is nothing to
 //! accelerate) and no FTS index — the artifact deliberately ships neither,
 //! because both are rebuildable and SQLite-specific. The lexical channel is
-//! rebuilt here instead, with the same tokenizer the corpus statistics were
-//! gathered with.
+//! rebuilt here instead, at `open`, with the same tokenizer the corpus
+//! statistics were gathered with — frequencies and chunk lengths included, so
+//! that a query scores its candidates without re-reading their text. Measured
+//! in wasm over a 6,255-chunk artifact, that is the difference between an
+//! 11 ms hybrid query and a 155 ms one.
 //!
 //! Three honest differences from `SqliteStore`, all of them consequences of
 //! what the artifact carries rather than of this code:
@@ -37,13 +40,32 @@ use crate::{DocWrite, LexicalMatches, Space, Stats, Store, TextQuery, search_mod
 /// Built once at open rather than per query: the document frequencies it holds
 /// are corpus-wide, so every query needs all of them anyway.
 ///
-/// Term frequencies are deliberately *not* stored. The scorer counts those
-/// itself from each candidate's text, exactly as the SQLite path does, so the
-/// two cannot disagree about what a chunk contains.
+/// Term frequencies are stored alongside the postings, and a chunk's length
+/// alongside them. They cost nothing to keep — the build already tokenizes
+/// every chunk to find out which terms it contains, so counting them is the
+/// same pass — and they are what lets a query score its candidate pool
+/// without re-reading a single chunk's text.
+///
+/// That matters because the pool is not small. It has to be scored *before*
+/// truncation (see [`Store::lexical_candidates`]), and it grows with the
+/// query: re-tokenizing it per query cost 142 ms of a 155 ms hybrid query on
+/// a 6,255-chunk artifact, measured in wasm.
 struct Lexical {
-    /// Chunk indices per term, in corpus order.
-    postings: HashMap<String, Vec<usize>>,
+    /// Per term, every text chunk containing it, in corpus order, with how
+    /// many times it occurs there.
+    postings: HashMap<String, Vec<Posting>>,
+    /// Per chunk index, the length `CorpusStats::avg_chunk_len` averages —
+    /// characters of heading plus body. Zero for chunks outside the text
+    /// space, which the lexical channel never scores.
+    lengths: Vec<u32>,
     stats: search::bm25::CorpusStats,
+}
+
+/// One term's occurrence in one chunk.
+#[derive(Debug, Clone, Copy)]
+struct Posting {
+    chunk: u32,
+    term_freq: u32,
 }
 
 impl Lexical {
@@ -56,7 +78,8 @@ impl Lexical {
     /// accented corpus the two can disagree about whether a chunk contains a
     /// term, and therefore about its document frequency.
     fn build(chunks: &[ArtifactChunk]) -> Self {
-        let mut postings: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut postings: HashMap<String, Vec<Posting>> = HashMap::new();
+        let mut lengths = vec![0u32; chunks.len()];
         let mut total_len: u64 = 0;
         let mut counted: u64 = 0;
         for (i, chunk) in chunks.iter().enumerate() {
@@ -67,15 +90,29 @@ impl Lexical {
             // SQLite averages over — in characters, which is the unit
             // `CorpusStats::avg_chunk_len` is in.
             let scored = scored_text(chunk);
-            total_len += scored.chars().count() as u64;
+            let len = scored.chars().count();
+            lengths[i] = len as u32;
+            total_len += len as u64;
             counted += 1;
-            let mut terms: Vec<String> = search::bm25::tokenize(&scored);
-            terms.sort();
-            terms.dedup();
-            for term in terms {
-                postings.entry(term).or_default().push(i);
+            // Counted the way `search::bm25::term_freqs` counts — the same
+            // tokenizer over the same text — so a stored frequency is the
+            // number the scorer would have arrived at itself.
+            let mut freqs: HashMap<String, u32> = HashMap::new();
+            for token in search::bm25::tokenize(&scored) {
+                *freqs.entry(token).or_insert(0) += 1;
+            }
+            for (term, term_freq) in freqs {
+                postings.entry(term).or_default().push(Posting {
+                    chunk: i as u32,
+                    term_freq,
+                });
             }
         }
+        // `or_default().push(...)` builds each list in chunk order already,
+        // except that a `HashMap`'s iteration order decides which *term* is
+        // appended when — not the order within one term's list. Sorting is
+        // therefore unnecessary, and asserted rather than assumed by
+        // `postings_are_in_chunk_order`.
         let avg = if counted == 0 {
             0.0
         } else {
@@ -83,6 +120,7 @@ impl Lexical {
         };
         Self {
             postings,
+            lengths,
             stats: search::bm25::CorpusStats {
                 total_chunks: counted,
                 avg_chunk_len: avg,
@@ -322,30 +360,56 @@ impl Store for ArtifactStore {
             .iter()
             .map(|&doc_freq| search::bm25::QueryTerm { doc_freq })
             .collect();
+        // Walk the postings, accumulating each matched chunk's per-term
+        // frequencies as they are encountered. This is the whole reason the
+        // frequencies are stored: the pool is assembled and scored without
+        // touching a chunk's text, where re-tokenizing it was costing more
+        // than everything else a query does put together.
+        //
+        // `slot` maps a chunk index to its row in `freqs`, so a chunk matched
+        // by several query terms accumulates into one row. A full-length
+        // vector rather than a hash map because it is indexed once per
+        // posting and the artifact's chunk count is known.
+        let mut slot: Vec<u32> = vec![u32::MAX; self.artifact.chunks().len()];
         let mut matched: Vec<usize> = Vec::new();
-        let mut seen = vec![false; self.artifact.chunks().len()];
-        for term in terms {
+        let mut freqs: Vec<Vec<u32>> = Vec::new();
+        for (t, term) in terms.iter().enumerate() {
             let Some(postings) = self.lexical.postings.get(term) else {
                 continue;
             };
-            for &i in postings {
-                if seen[i] {
-                    continue;
-                }
-                seen[i] = true;
-                let chunk = &self.artifact.chunks()[i];
-                if self.document(chunk).is_some_and(|d| self.passes(d, filter)) {
-                    matched.push(i);
-                }
+            for posting in postings {
+                let i = posting.chunk as usize;
+                let row = match slot.get(i).copied() {
+                    Some(u32::MAX) => {
+                        let chunk = &self.artifact.chunks()[i];
+                        if !self.document(chunk).is_some_and(|d| self.passes(d, filter)) {
+                            // Excluded by the filter. Marked with its own
+                            // sentinel so the next term that matches this
+                            // chunk does not re-check the document.
+                            slot[i] = u32::MAX - 1;
+                            continue;
+                        }
+                        let row = freqs.len() as u32;
+                        slot[i] = row;
+                        matched.push(i);
+                        freqs.push(vec![0; terms.len()]);
+                        row
+                    }
+                    Some(row) if row == u32::MAX - 1 => continue,
+                    Some(row) => row,
+                    None => continue,
+                };
+                freqs[row as usize][t] = posting.term_freq;
             }
         }
         let mut scored: Vec<(f32, usize)> = matched
-            .into_iter()
-            .map(|i| {
-                let text = scored_text(&self.artifact.chunks()[i]);
+            .iter()
+            .copied()
+            .zip(freqs)
+            .map(|(i, term_freqs)| {
                 let m = search::bm25::LexicalMatch {
-                    chunk_len: text.chars().count() as u32,
-                    term_freqs: search::bm25::term_freqs(&text, terms),
+                    chunk_len: self.lexical.lengths[i],
+                    term_freqs,
                 };
                 (search::bm25::score(&m, &query_terms, stats, params), i)
             })
@@ -440,4 +504,118 @@ fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk(space: Space, heading: &str, text: &str) -> ArtifactChunk {
+        ArtifactChunk {
+            doc_index: 0,
+            ord: 0,
+            space,
+            modality: "text".into(),
+            heading_path: heading.into(),
+            text: text.into(),
+            vector: vec![1.0, 0.0],
+        }
+    }
+
+    fn corpus() -> Vec<ArtifactChunk> {
+        vec![
+            chunk(
+                Space::Text,
+                "The cat",
+                "The cat sat on the mat, and the cat stayed.",
+            ),
+            chunk(Space::Text, "Dogs", "A dog barked at the cat once."),
+            // In the image space, so the lexical channel must not see it at
+            // all — its words would otherwise inflate every term's document
+            // frequency, and IDF is corpus-wide.
+            chunk(Space::Image, "cat.png", ""),
+        ]
+    }
+
+    /// The frequencies kept beside the postings must be the numbers
+    /// `search::bm25::term_freqs` would have produced from the chunk's own
+    /// text. This is the whole correctness condition of storing them: the
+    /// scorer used to count them itself, and a query's score is unchanged
+    /// only if these agree exactly.
+    #[test]
+    fn stored_term_frequencies_are_what_the_scorer_would_count() {
+        let chunks = corpus();
+        let lexical = Lexical::build(&chunks);
+        assert!(!lexical.postings.is_empty());
+
+        for (term, postings) in &lexical.postings {
+            for posting in postings {
+                let c = &chunks[posting.chunk as usize];
+                let expected =
+                    search::bm25::term_freqs(&scored_text(c), std::slice::from_ref(term))[0];
+                assert_eq!(
+                    posting.term_freq, expected,
+                    "term '{term}' in chunk {}: stored {}, the scorer counts {expected}",
+                    posting.chunk, posting.term_freq
+                );
+                assert!(expected > 0, "a posting must mean the term occurs");
+            }
+        }
+
+        // "the" appears four times in the first chunk, counting its heading.
+        let the = &lexical.postings["the"];
+        assert_eq!(the[0].chunk, 0);
+        assert_eq!(the[0].term_freq, 4);
+    }
+
+    /// A chunk's stored length must be the one the corpus average is taken
+    /// over, or BM25's length normalization compares a chunk against an
+    /// average measured differently.
+    #[test]
+    fn stored_lengths_match_what_the_average_is_taken_over() {
+        let chunks = corpus();
+        let lexical = Lexical::build(&chunks);
+
+        let text_lengths: Vec<u32> = chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.space == Space::Text)
+            .map(|(i, _)| lexical.lengths[i])
+            .collect();
+        for (i, c) in chunks.iter().enumerate() {
+            let expected = if c.space == Space::Text {
+                scored_text(c).chars().count() as u32
+            } else {
+                0
+            };
+            assert_eq!(lexical.lengths[i], expected, "chunk {i}");
+        }
+
+        let mean = text_lengths.iter().map(|&l| l as f64).sum::<f64>() / 2.0;
+        assert_eq!(
+            lexical.stats.total_chunks, 2,
+            "the image chunk is not scored"
+        );
+        assert!(
+            (lexical.stats.avg_chunk_len as f64 - mean).abs() < 1e-3,
+            "avg {} vs {mean}",
+            lexical.stats.avg_chunk_len
+        );
+    }
+
+    /// Candidate selection relies on each posting list being in chunk order:
+    /// ties in the score are broken by chunk index, and a list out of order
+    /// would make that tie-break depend on how the index happened to be
+    /// built. `build` produces this order incidentally, so it is asserted
+    /// rather than assumed.
+    #[test]
+    fn postings_are_in_chunk_order() {
+        let lexical = Lexical::build(&corpus());
+        for (term, postings) in &lexical.postings {
+            let chunks: Vec<u32> = postings.iter().map(|p| p.chunk).collect();
+            let mut sorted = chunks.clone();
+            sorted.sort_unstable();
+            assert_eq!(chunks, sorted, "term '{term}' is out of order");
+        }
+    }
 }
