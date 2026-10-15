@@ -5,9 +5,15 @@ a portable artifact. It is what lets a host without SQLite — the Obsidian
 plugin — run the ranking code this project measures instead of reimplementing
 it in JavaScript.
 
-The embedder stays outside. `search` takes a query *vector*, which is what
-keeps ONNX Runtime out of the build; the client embeds with transformers.js,
-using the model id and the pooling that `info()` reports.
+Two halves: [`Index`] answers queries over an artifact, and [`Builder`] writes
+one. Both draw the same line — the client walks the vault, reads files and runs
+the model, because only it can; everything that decides what the index contains
+or how it ranks stays in Rust, in the code the CLI runs.
+
+The embedder stays outside. `search` takes a query *vector* and `Builder` hands
+back the strings to embed, which is what keeps ONNX Runtime out of the build;
+the client embeds with transformers.js, using the model id and the pooling that
+`info()` reports.
 
 ## Building
 
@@ -23,10 +29,17 @@ Measured on this crate as it stands:
 
 | | bytes |
 |---|---|
-| `.wasm`, linked | 364,361 |
-| `.wasm`, after `wasm-opt -Oz` | 326,098 |
-| `.wasm`, gzipped | 141,054 |
-| JS glue | 21,588 |
+| `.wasm`, linked | 733,773 |
+| `.wasm`, after `wasm-opt -Oz` | 663,582 |
+| `.wasm`, gzipped | 296,444 |
+| JS glue | 29,904 |
+
+Building an index roughly doubled that (it was 326,098 after `wasm-opt` when
+this crate only queried), and the weight is the markdown parser and the YAML
+parser — not, as expected, the PDF extractor, which the linker drops because
+nothing here calls it. Measured by removing it: 1,005 bytes. A query-only build
+for readers who never index would be a `Cargo` feature away if the size ever
+matters more than the simplicity of one bundle.
 
 ## API
 
@@ -40,6 +53,25 @@ index.info();                                            // models, pooling, dim
 index.staleness(entries);                                // what the vault disagrees with
 ```
 
+Building one:
+
+```js
+const builder = Builder.create({ model: "bge-small-en-v1.5", pooling: "cls",
+                                 dim: 384, root: "notes" });
+// or Builder.fromArtifact(spec, manifestJson, shards) to reuse what has not changed
+
+const { reused, texts } = builder.addDocument(path, text, file.stat.mtime);
+builder.setVectors(path, flatFloat32Array);   // chunks * dim, in chunk order
+const { manifest, shards, unchanged } = builder.finish(Date.now() / 1000);
+```
+
+`addDocument` parses and chunks in Rust and hands back the exact strings to
+embed, so the embedding input is what `gnosis index` embeds. A document whose
+content hash matches the previous artifact's comes back `reused` with nothing
+to embed. `unchanged` names the shards whose bytes did not change, which are
+not returned — rewriting a file a syncer already has is the churn sharding
+exists to avoid.
+
 Every call takes an optional last argument, a filter: `{from: ["notes"], tags:
 ["baking"]}`. `from` matches a root *label*, not a path — an artifact records
 what a vault was called, not where it lived on the machine that built it.
@@ -52,6 +84,12 @@ The surface tests run in node, against real JS values:
 CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
   cargo test -p gnosis-wasm --target wasm32-unknown-unknown
 ```
+
+`Builder` has a second, stronger check, in the CLI's own tests: an artifact it
+builds from a vault's text is **byte-identical** to the one `gnosis index` and
+`gnosis export` produce from the same vault, with a deterministic stand-in for
+the model so that any difference in chunk boundaries or embedding inputs turns
+into a byte comparison rather than hiding behind inference noise.
 
 The acceptance harness answers the question those cannot: does a ranking
 computed in wasm match the ranking gnosis computes? `tests/fixture.rs` writes

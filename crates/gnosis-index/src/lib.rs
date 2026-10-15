@@ -2,6 +2,8 @@
 //! Generic over [`Store`]/[`Walker`]/[`FileReader`]/[`Embedder`] so it carries
 //! no native dependencies of its own — native-ness comes only from whichever
 //! concrete implementations the caller supplies.
+pub mod builder;
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -314,29 +316,26 @@ fn embed_markdown_chunks(
 ) -> Result<(parse::ParsedDoc, Vec<ChunkWrite>)> {
     let content = String::from_utf8_lossy(bytes);
     let parsed = parse::parse_markdown(Path::new(path_str), &content);
-    let chunks = chunker::chunk_markdown(&parsed.body, chunk_cfg.max_tokens, chunk_cfg.overlap);
-
-    if chunks.is_empty() {
-        let text = parsed
+    // `chunk_document`, not `chunk_markdown`: a document whose body yields no
+    // chunks still gets one carrying its identity, and that decision is shared
+    // with every other frontend that builds an index rather than made here.
+    let chunks = chunker::chunk_document(
+        &parsed.title,
+        &parsed
             .frontmatter
             .as_deref()
             .map(parse::frontmatter_text)
-            .unwrap_or_default();
-        let chunk = identity_chunk(args, &parsed.title, text)?;
-        return Ok((parsed, vec![chunk]));
-    }
+            .unwrap_or_default(),
+        &parsed.body,
+        chunk_cfg.max_tokens,
+        chunk_cfg.overlap,
+    );
 
     // Prepend the heading trail so chunks carry their structural context.
-    let texts: Vec<String> = chunks
-        .iter()
-        .map(|c| {
-            if c.heading_path.is_empty() {
-                c.text.clone()
-            } else {
-                format!("{}\n{}", c.heading_path, c.text)
-            }
-        })
-        .collect();
+    // Joined only where both halves exist: an identity chunk for a note with
+    // no properties is its title alone, and a trailing newline would make its
+    // vector differ from the same title embedded anywhere else.
+    let texts: Vec<String> = chunks.iter().map(|c| join_lines(&c.heading_path, &c.text)).collect();
 
     let vectors = args.embedders.text.embed_document(&texts)?;
 
@@ -356,33 +355,29 @@ fn embed_markdown_chunks(
     Ok((parsed, chunk_writes))
 }
 
+/// Heading trail and body, joined by a newline, skipping either if it is empty.
+pub(crate) fn join_lines(heading_path: &str, text: &str) -> String {
+    match (heading_path.is_empty(), text.is_empty()) {
+        (true, _) => text.to_string(),
+        (_, true) => heading_path.to_string(),
+        _ => format!("{heading_path}\n{text}"),
+    }
+}
+
 /// One chunk standing for a document that produced none of its own.
 ///
-/// A note whose content lives entirely in frontmatter properties — 44 of the
-/// 103 notes in the public `kepano-obsidian` vault — yields no body sections,
-/// so it used to be indexed with zero chunks: present in `status`, absent
-/// from every result, unfindable even by its own exact name. Templates, MOCs,
-/// stubs and anything whose value *is* its properties all have this shape, and
-/// in Obsidian the properties workflow encourages it.
+/// Used for a PDF whose pages chunk to nothing; markdown reaches the same
+/// outcome through [`chunker::chunk_document`], where the decision is shared
+/// with every other frontend that builds an index. Either way the point is
+/// that a document with no chunks cannot be retrieved by any query, including
+/// its own exact name.
 ///
-/// The gap it closes is that a document's own identity was not itself
-/// indexable content. A title reached the index only incidentally, as the
-/// `heading_path` of a body chunk, so a note with no body had no vehicle for
-/// one.
-///
-/// Laid out exactly like a body chunk — the title as `heading_path`, the
-/// rendered properties as `text`, embedded as `"{heading}\n{text}"` — so
-/// nothing downstream has to know this chunk is synthetic, and the lexical
-/// channel scores it over heading plus body the way it scores everything else.
-/// It is a normal `text`/`text` chunk for the same reason: a distinct modality
-/// would exclude it from text search, which is the one thing it exists for.
+/// Laid out exactly like a body chunk — the title as `heading_path` — so
+/// nothing downstream has to know this chunk is synthetic. It is a normal
+/// `text`/`text` chunk for the same reason: a distinct modality would exclude
+/// it from text search, which is the one thing it exists for.
 fn identity_chunk(args: &mut IndexerArgs, title: &str, text: String) -> Result<ChunkWrite> {
-    let embed_input = if text.is_empty() {
-        title.to_string()
-    } else {
-        format!("{title}\n{text}")
-    };
-    let mut vectors = args.embedders.text.embed_document(&[embed_input])?;
+    let mut vectors = args.embedders.text.embed_document(&[join_lines(title, &text)])?;
     Ok(ChunkWrite {
         ord: 0,
         space: "text".to_string(),

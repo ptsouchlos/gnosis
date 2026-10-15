@@ -1229,6 +1229,7 @@ name = "gnosis-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "chunker",
  "clap",
  "dirs",
@@ -1258,6 +1259,7 @@ name = "gnosis-wasm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "index",
  "js-sys",
  "query",
  "search",
@@ -1661,6 +1663,7 @@ dependencies = [
  "parse",
  "progress",
  "search",
+ "serde",
  "store",
  "walk",
 ]

@@ -1441,6 +1441,312 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A deterministic stand-in for an embedding model: the same text always
+    /// gives the same vector, and different text almost never does.
+    ///
+    /// Deterministic is the whole point. Both paths embed whatever strings
+    /// they decide to embed, so if their chunk boundaries or their
+    /// heading-trail joining differ by one character, the vectors differ and
+    /// the shards stop matching. A real model would hide that behind noise;
+    /// this turns it into a byte comparison.
+    struct HashEmbedder;
+
+    impl embed::Embedder for HashEmbedder {
+        fn space(&self) -> &str {
+            "text"
+        }
+        fn dim(&self) -> usize {
+            4
+        }
+        fn model_id(&self) -> &str {
+            "bge-small-en-v1.5"
+        }
+        fn embed(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+            Ok(inputs.iter().map(|t| hash_vector(t)).collect())
+        }
+    }
+
+    /// A unit vector derived from the text's blake3 hash.
+    fn hash_vector(text: &str) -> Vec<f32> {
+        let hash = blake3::hash(text.as_bytes());
+        let bytes = hash.as_bytes();
+        let raw: Vec<f32> = (0..4)
+            .map(|i| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()) as f32)
+            .collect();
+        let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+        raw.into_iter().map(|x| x / norm).collect()
+    }
+
+    /// A small vault on disk, covering the shapes that make the two paths
+    /// disagree if anything about them differs: several chunks from one note,
+    /// a property-only note (whose only chunk is synthetic), frontmatter with
+    /// links and tags, and a note with no body at all.
+    fn parity_vault(dir: &std::path::Path) -> PathBuf {
+        let vault = dir.join("vault");
+        std::fs::create_dir_all(vault.join("notes")).unwrap();
+
+        std::fs::write(
+            vault.join("notes/sourdough.md"),
+            format!(
+                "---\ntags: [baking, bread]\n---\n\n# Sourdough\n\n{}\n\n## Feeding\n\nRefresh \
+                 at one to two to two and wait for peak. See [[Hydration]].\n",
+                "A wild yeast starter and a long overnight proof. ".repeat(40)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            vault.join("notes/hydration.md"),
+            "# Hydration\n\nBaker's percentages: water as a share of flour weight.\n",
+        )
+        .unwrap();
+        // Everything in properties: its only chunk is the identity chunk.
+        std::fs::write(
+            vault.join("notes/blade-runner.md"),
+            "---\ncategories:\n  - \"[[Movies]]\"\ndirector:\n  - \"[[Ridley Scott]]\"\nyear: 1982\n---\n",
+        )
+        .unwrap();
+        // Nothing at all: still has to be findable by name.
+        std::fs::write(vault.join("notes/stub.md"), "").unwrap();
+        vault
+    }
+
+    /// The claim that makes plugin-side indexing worth having: an artifact
+    /// built through [`index::builder`] from a vault's text is **the same
+    /// artifact** `gnosis index` + `gnosis export` produce from the same
+    /// vault, byte for byte.
+    ///
+    /// Not "equivalent" and not "close": identical shard bytes. That covers
+    /// every decision the two paths could have made differently — chunk
+    /// boundaries, the identity chunk, what gets embedded, title derivation,
+    /// links and tags, content hashes, mtimes, document order, shard
+    /// assignment, quantization and compression. Only the manifest's
+    /// `created_unix` is allowed to differ, and the test pins that too by
+    /// passing the CLI's own timestamp.
+    #[test]
+    fn the_builder_and_the_cli_produce_the_same_artifact() {
+        let dir = temp_dir("builder-parity");
+        let vault = parity_vault(&dir);
+
+        // The CLI's path: walk, parse, chunk, embed, store, export.
+        let mut store = SqliteStore::open(&dir.join("gnosis.db")).unwrap();
+        let mut text = HashEmbedder;
+        let progress = progress::NoopProgress;
+        let chunk_cfg = chunker::ChunkConfig::default();
+        let mut args = index::IndexerArgs {
+            store: &mut store,
+            walker: &crate::walk::FsWalker::new(false),
+            fs_reader: &crate::fs::StdFs,
+            embedders: index::EmbedderSet {
+                text: &mut text,
+                image: None,
+                image_text: None,
+            },
+            progress: &progress,
+        };
+        let report = index::run(
+            &mut args,
+            std::slice::from_ref(&vault),
+            &[],
+            &chunk_cfg,
+            false,
+            true,
+            32,
+        )
+        .expect("indexing the parity vault");
+        assert_eq!(report.indexed, 4, "every note must index");
+
+        let (cli_manifest, cli_shards) = build_artifact(
+            &store,
+            "bge-small-en-v1.5",
+            Quantization::I8,
+            Compression::Deflate,
+            &[Space::Text],
+            256,
+        )
+        .expect("exporting");
+
+        // The client's path: the same text, chunked and packed by the builder.
+        let spec = index::builder::BuildSpec {
+            model: "bge-small-en-v1.5".to_string(),
+            pooling: "cls".to_string(),
+            dim: 4,
+            root: vault.file_name().unwrap().to_string_lossy().to_string(),
+            quantization: Quantization::I8,
+            compression: Compression::Deflate,
+            shard_docs: 256,
+            max_tokens: chunk_cfg.max_tokens,
+            overlap: chunk_cfg.overlap,
+        };
+        let mut builder = index::builder::ArtifactBuilder::new(spec);
+        let mut files: Vec<PathBuf> = std::fs::read_dir(vault.join("notes"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        // Deliberately not sorted the way `finish` sorts: the builder must not
+        // depend on the order documents arrive in.
+        files.sort_by_key(|p| std::cmp::Reverse(p.to_string_lossy().to_string()));
+        for path in &files {
+            let rel = format!("notes/{}", path.file_name().unwrap().to_string_lossy());
+            let text = std::fs::read_to_string(path).unwrap();
+            let mtime = fs::FileReader::mtime(&crate::fs::StdFs, path);
+            let added = builder.add_document(&rel, &text, mtime);
+            assert!(!added.reused, "a fresh build reuses nothing");
+            let vectors: Vec<f32> = added
+                .texts
+                .iter()
+                .flat_map(|t| hash_vector(t))
+                .collect();
+            builder.set_vectors(&rel, &vectors).expect("setting vectors");
+        }
+        let built = builder
+            .finish(cli_manifest.created_unix)
+            .expect("building the artifact");
+
+        assert_eq!(built.documents, 4);
+        assert_eq!(
+            built.chunks,
+            cli_manifest.shards.iter().map(|s| s.chunks).sum::<usize>(),
+            "the two paths must chunk the vault the same way"
+        );
+        assert_eq!(built.shards.len(), cli_shards.len(), "same shard count");
+        for ((cli_name, cli_body), (name, body)) in cli_shards.iter().zip(&built.shards) {
+            assert_eq!(cli_name, name);
+            assert_eq!(
+                body, cli_body,
+                "shard '{name}' differs: the builder and the CLI disagree about this vault"
+            );
+        }
+        assert_eq!(
+            built.manifest, cli_manifest,
+            "the manifests must match, timestamp included"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An incremental rebuild re-embeds only what changed, and leaves the
+    /// shards it did not have to touch byte-identical — which is what keeps a
+    /// file-level syncer quiet.
+    #[test]
+    fn rebuilding_reuses_every_unchanged_document() {
+        let dir = temp_dir("builder-reuse");
+        let vault = parity_vault(&dir);
+
+        let spec = || index::builder::BuildSpec {
+            model: "bge-small-en-v1.5".to_string(),
+            pooling: "cls".to_string(),
+            dim: 4,
+            root: "vault".to_string(),
+            quantization: Quantization::F32,
+            compression: Compression::Deflate,
+            shard_docs: 256,
+            max_tokens: 256,
+            overlap: 43,
+        };
+        let read = |name: &str| std::fs::read_to_string(vault.join("notes").join(name)).unwrap();
+        let names = ["sourdough.md", "hydration.md", "blade-runner.md", "stub.md"];
+
+        let mut builder = index::builder::ArtifactBuilder::new(spec());
+        for name in names {
+            let rel = format!("notes/{name}");
+            let added = builder.add_document(&rel, &read(name), 1_700_000_000);
+            let vectors: Vec<f32> = added.texts.iter().flat_map(|t| hash_vector(t)).collect();
+            builder.set_vectors(&rel, &vectors).unwrap();
+        }
+        let first = builder.finish(1_700_000_000).unwrap();
+        let artifact = open_artifact(&first.manifest, first.shards.clone());
+
+        // One note edited, the rest untouched.
+        std::fs::write(
+            vault.join("notes/hydration.md"),
+            "# Hydration\n\nRewritten: water as a share of flour weight, by mass.\n",
+        )
+        .unwrap();
+
+        let mut builder =
+            index::builder::ArtifactBuilder::reusing(spec(), artifact).expect("reusing");
+        let mut reused = 0;
+        for name in names {
+            let rel = format!("notes/{name}");
+            let added = builder.add_document(&rel, &read(name), 1_700_000_000);
+            if added.reused {
+                reused += 1;
+                assert!(added.texts.is_empty(), "a reused document embeds nothing");
+                continue;
+            }
+            let vectors: Vec<f32> = added.texts.iter().flat_map(|t| hash_vector(t)).collect();
+            builder.set_vectors(&rel, &vectors).unwrap();
+        }
+        assert_eq!(reused, 3, "only the edited note needs re-embedding");
+
+        let second = builder.finish(1_700_000_001).unwrap();
+        assert_eq!(
+            second.manifest.shards.len(),
+            1,
+            "this vault fits in one shard, so that shard must be rewritten"
+        );
+        assert!(
+            second.unchanged.is_empty(),
+            "the only shard holds the edited note, so nothing is unchanged"
+        );
+        assert_ne!(
+            second.manifest.shards[0].hash, first.manifest.shards[0].hash,
+            "the edit must change the shard"
+        );
+
+        // And a rebuild with nothing edited rewrites nothing at all.
+        let artifact = open_artifact(&second.manifest, second.shards.clone());
+        let mut builder =
+            index::builder::ArtifactBuilder::reusing(spec(), artifact).expect("reusing");
+        for name in names {
+            let rel = format!("notes/{name}");
+            let added = builder.add_document(&rel, &read(name), 1_700_000_000);
+            assert!(added.reused, "{name} is unchanged and must be reused");
+        }
+        let third = builder.finish(1_700_000_002).unwrap();
+        assert_eq!(
+            third.unchanged,
+            vec!["shard-0000.bin".to_string()],
+            "an unchanged vault must produce no shard writes"
+        );
+        assert!(third.shards.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A previous artifact from a different model cannot be reused: its
+    /// vectors are in another space, and a mixture would rank confidently and
+    /// wrongly, which is the one failure mode with no symptom.
+    #[test]
+    fn reusing_an_artifact_from_another_model_is_refused() {
+        let dir = temp_dir("builder-model");
+        let store = seeded_store(&dir);
+        let (manifest, shards) = build_one(&store, Quantization::F32, Compression::Deflate);
+        let artifact = open_artifact(&manifest, shards);
+
+        let outcome = index::builder::ArtifactBuilder::reusing(
+            index::builder::BuildSpec {
+                model: "multilingual-e5-small".to_string(),
+                pooling: "mean".to_string(),
+                dim: 4,
+                root: "vault".to_string(),
+                quantization: Quantization::F32,
+                compression: Compression::Deflate,
+                shard_docs: 256,
+                max_tokens: 256,
+                overlap: 43,
+            },
+            artifact,
+        );
+        let Err(err) = outcome else {
+            panic!("an artifact from another model must not be reusable");
+        };
+        let message = format!("{err:#}");
+        assert!(message.contains("bge-small-en-v1.5"), "got {message}");
+        assert!(message.contains("multilingual-e5-small"), "got {message}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// The same gate on a real corpus, with a real model and real queries.
     ///
     /// Ignored by default: it needs an indexed vault and will download the
