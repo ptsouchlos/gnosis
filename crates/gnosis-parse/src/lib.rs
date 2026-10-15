@@ -187,6 +187,117 @@ fn extract_frontmatter_list(frontmatter: &str, key: &str) -> Vec<String> {
     Vec::new()
 }
 
+/// Render a note's frontmatter as indexable prose.
+///
+/// Exists because of what a notes vault actually looks like: on the public
+/// 103-note `kepano-obsidian` vault, 44 notes have an empty body and keep
+/// everything in properties, so they produce no chunk and cannot be
+/// retrieved by any query — including their own exact name. A movie note's
+/// `director: Ridley Scott` is exactly what someone would search for, and
+/// until now it was invisible.
+///
+/// Keys are kept alongside their values rather than stripped. They are
+/// cheap, they are what the author chose to call the field, and they let a
+/// query like "director Ridley Scott" match on both halves.
+///
+/// Three things are deliberately left out:
+///
+/// - **`title`**, because the title is indexed as the chunk's heading and
+///   repeating it would double its term frequency.
+/// - **URLs**, because a 200-character image URL is a machine identifier
+///   rather than prose; it would dominate the chunk's length (which BM25
+///   normalizes against) while matching nothing a person would type.
+/// - **Anything past a character budget**, so that one note with a large
+///   property block cannot skew the corpus statistics every other note's
+///   score is normalized against.
+pub fn frontmatter_text(frontmatter: &str) -> String {
+    let Ok(serde_norway::Value::Mapping(map)) =
+        serde_norway::from_str::<serde_norway::Value>(frontmatter)
+    else {
+        return String::new();
+    };
+
+    let mut out = String::new();
+    for (key, value) in &map {
+        let Some(key) = key.as_str() else { continue };
+        if key.eq_ignore_ascii_case("title") {
+            continue;
+        }
+        let rendered = render_value(value);
+        if rendered.is_empty() {
+            continue;
+        }
+        if out.len() + key.len() + rendered.len() + 3 > FRONTMATTER_TEXT_BUDGET {
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(key);
+        out.push_str(": ");
+        out.push_str(&rendered);
+    }
+    out
+}
+
+/// Character budget for [`frontmatter_text`]. Chosen to sit above anything a
+/// hand-written property block reaches (the largest on `kepano-obsidian` is
+/// under 200 characters once URLs are dropped) and well under the embedding
+/// model's own window, so the budget never silently truncates a real note.
+const FRONTMATTER_TEXT_BUDGET: usize = 1024;
+
+/// One frontmatter value as text: scalars as written, sequences joined, and
+/// nested mappings flattened to their values.
+fn render_value(value: &serde_norway::Value) -> String {
+    match value {
+        serde_norway::Value::String(s) => {
+            let s = clean_scalar(s);
+            if is_url(&s) { String::new() } else { s }
+        }
+        serde_norway::Value::Number(n) => n.to_string(),
+        serde_norway::Value::Bool(b) => b.to_string(),
+        serde_norway::Value::Sequence(items) => items
+            .iter()
+            .map(render_value)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(", "),
+        // A nested mapping's keys are structure rather than content at this
+        // depth, so only the values are kept.
+        serde_norway::Value::Mapping(map) => map
+            .iter()
+            .map(|(_, v)| render_value(v))
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(", "),
+        serde_norway::Value::Null | serde_norway::Value::Tagged(_) => String::new(),
+    }
+}
+
+/// Strip the `[[...]]` wrapper (and any `|alias` or `#heading`) that
+/// Obsidian's property fields are full of, so a link-valued property indexes
+/// as the note name it points at.
+fn clean_scalar(s: &str) -> String {
+    let s = s.trim();
+    let inner = s
+        .strip_prefix("[[")
+        .and_then(|rest| rest.strip_suffix("]]"))
+        .unwrap_or(s);
+    inner
+        .split('|')
+        .next()
+        .unwrap_or(inner)
+        .split('#')
+        .next()
+        .unwrap_or(inner)
+        .trim()
+        .to_string()
+}
+
+fn is_url(s: &str) -> bool {
+    s.starts_with("http://") || s.starts_with("https://") || s.contains("://")
+}
+
 /// A note's frontmatter `aliases:` — see `extract_frontmatter_list` for the
 /// forms handled.
 pub fn extract_aliases(frontmatter: &str) -> Vec<String> {
@@ -306,6 +417,73 @@ mod obsidian_tests {
         let body = "# Heading\n\n```\n#include <stdio.h>\n```\n\nReal #tag here, not C#.";
         let tags = extract_tags(None, body);
         assert_eq!(tags, vec!["tag"]);
+    }
+
+    /// A property-only note, in the shape `kepano-obsidian` actually uses:
+    /// link-valued fields, a number, a date, an id, and a cover image URL.
+    #[test]
+    fn frontmatter_text_renders_a_property_only_note() {
+        let fm = concat!(
+            "categories:\n  - \"[[Movies]]\"\n",
+            "cover: https://m.media-amazon.com/images/M/MV5BNzQzMzJhZTEt._V1_SX300.jpg\n",
+            "genre:\n  - \"[[Sci-fi]]\"\n",
+            "director:\n  - \"[[Ridley Scott]]\"\n",
+            "cast:\n  - \"[[Harrison Ford]]\"\n  - \"[[Rutger Hauer]]\"\n",
+            "rating: 7\nyear: 1982\nimdbId: tt0083658\n",
+        );
+        let text = frontmatter_text(fm);
+        assert_eq!(
+            text,
+            "categories: Movies\n\
+             genre: Sci-fi\n\
+             director: Ridley Scott\n\
+             cast: Harrison Ford, Rutger Hauer\n\
+             rating: 7\n\
+             year: 1982\n\
+             imdbId: tt0083658"
+        );
+    }
+
+    /// The URL is the one value a person would never type and that would
+    /// otherwise dominate the chunk's length, which BM25 normalizes against.
+    #[test]
+    fn frontmatter_text_drops_urls_and_keeps_the_rest() {
+        let text = frontmatter_text("url: https://obsidian.md/\ntype: Apps\n");
+        assert_eq!(text, "type: Apps");
+    }
+
+    /// The title is the chunk's heading, so repeating it here would double
+    /// its term frequency against every other note's.
+    #[test]
+    fn frontmatter_text_omits_the_title() {
+        let text = frontmatter_text("title: Real Title\nauthor: Someone\n");
+        assert_eq!(text, "author: Someone");
+    }
+
+    /// One note with a large property block must not skew the corpus
+    /// statistics every other note is scored against.
+    #[test]
+    fn frontmatter_text_stops_at_its_budget() {
+        let mut fm = String::new();
+        for i in 0..500 {
+            fm.push_str(&format!("field{i}: value{i}\n"));
+        }
+        let text = frontmatter_text(&fm);
+        assert!(
+            text.len() <= FRONTMATTER_TEXT_BUDGET,
+            "got {} chars",
+            text.len()
+        );
+        assert!(text.starts_with("field0: value0"), "got {text}");
+    }
+
+    /// Frontmatter that is not a mapping at all (or is malformed) yields
+    /// nothing rather than a panic or a stringified parse tree.
+    #[test]
+    fn frontmatter_text_of_nothing_is_empty() {
+        assert_eq!(frontmatter_text(""), "");
+        assert_eq!(frontmatter_text("- just\n- a list\n"), "");
+        assert_eq!(frontmatter_text("key: [unterminated\n"), "");
     }
 
     #[test]
