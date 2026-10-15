@@ -316,6 +316,16 @@ fn embed_markdown_chunks(
     let parsed = parse::parse_markdown(Path::new(path_str), &content);
     let chunks = chunker::chunk_markdown(&parsed.body, chunk_cfg.max_tokens, chunk_cfg.overlap);
 
+    if chunks.is_empty() {
+        let text = parsed
+            .frontmatter
+            .as_deref()
+            .map(parse::frontmatter_text)
+            .unwrap_or_default();
+        let chunk = identity_chunk(args, &parsed.title, text)?;
+        return Ok((parsed, vec![chunk]));
+    }
+
     // Prepend the heading trail so chunks carry their structural context.
     let texts: Vec<String> = chunks
         .iter()
@@ -344,6 +354,43 @@ fn embed_markdown_chunks(
         .collect();
 
     Ok((parsed, chunk_writes))
+}
+
+/// One chunk standing for a document that produced none of its own.
+///
+/// A note whose content lives entirely in frontmatter properties — 44 of the
+/// 103 notes in the public `kepano-obsidian` vault — yields no body sections,
+/// so it used to be indexed with zero chunks: present in `status`, absent
+/// from every result, unfindable even by its own exact name. Templates, MOCs,
+/// stubs and anything whose value *is* its properties all have this shape, and
+/// in Obsidian the properties workflow encourages it.
+///
+/// The gap it closes is that a document's own identity was not itself
+/// indexable content. A title reached the index only incidentally, as the
+/// `heading_path` of a body chunk, so a note with no body had no vehicle for
+/// one.
+///
+/// Laid out exactly like a body chunk — the title as `heading_path`, the
+/// rendered properties as `text`, embedded as `"{heading}\n{text}"` — so
+/// nothing downstream has to know this chunk is synthetic, and the lexical
+/// channel scores it over heading plus body the way it scores everything else.
+/// It is a normal `text`/`text` chunk for the same reason: a distinct modality
+/// would exclude it from text search, which is the one thing it exists for.
+fn identity_chunk(args: &mut IndexerArgs, title: &str, text: String) -> Result<ChunkWrite> {
+    let embed_input = if text.is_empty() {
+        title.to_string()
+    } else {
+        format!("{title}\n{text}")
+    };
+    let mut vectors = args.embedders.text.embed_document(&[embed_input])?;
+    Ok(ChunkWrite {
+        ord: 0,
+        space: "text".to_string(),
+        modality: "text".to_string(),
+        text: Some(text),
+        heading_path: title.to_string(),
+        vector: vectors.pop().unwrap_or_default(),
+    })
 }
 
 /// Persist a text-bearing document (markdown or PDF) from its
@@ -476,6 +523,24 @@ fn embed_pdf_chunks(
     let parsed = parse::parse_pdf(bytes)?;
     let chunks = chunker::chunk_pages(&parsed.pages, chunk_cfg.max_tokens, chunk_cfg.overlap);
 
+    // PDF metadata often has no Title; the file stem is the only other signal.
+    let title = if parsed.title.is_empty() {
+        Path::new(path_str)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| path_str.to_string())
+    } else {
+        parsed.title
+    };
+
+    // A PDF whose pages hold no text at all is rejected by `parse_pdf` and
+    // never reaches here, but one whose pages hold only whitespace chunks to
+    // nothing — and would then be as unfindable as a property-only note.
+    if chunks.is_empty() {
+        let chunk = identity_chunk(args, &title, String::new())?;
+        return Ok((title, vec![chunk]));
+    }
+
     // Prefix the page label, mirroring how markdown prefixes its heading
     // trail, so a chunk's embedding carries its own locator.
     let texts: Vec<String> = chunks
@@ -496,16 +561,6 @@ fn embed_pdf_chunks(
             vector,
         })
         .collect();
-
-    // PDF metadata often has no Title; the file stem is the only other signal.
-    let title = if parsed.title.is_empty() {
-        Path::new(path_str)
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| path_str.to_string())
-    } else {
-        parsed.title
-    };
 
     Ok((title, chunk_writes))
 }
@@ -1014,6 +1069,8 @@ mod tests {
         kinds: Vec<(String, String)>,
         /// (path, heading_path) per persisted chunk.
         chunk_headings: Vec<(String, String)>,
+        /// (path, text) per persisted chunk.
+        chunk_texts: Vec<(String, String)>,
     }
 
     impl Store for FakeStore {
@@ -1052,6 +1109,8 @@ mod tests {
             for chunk in doc.chunks {
                 self.chunk_headings
                     .push((doc.path.to_string(), chunk.heading_path.clone()));
+                self.chunk_texts
+                    .push((doc.path.to_string(), chunk.text.clone().unwrap_or_default()));
             }
             Ok(())
         }
@@ -1131,6 +1190,20 @@ mod tests {
             }
             if name.ends_with(".pdf") {
                 return Ok(SAMPLE_PDF.to_vec());
+            }
+            if name.ends_with("Blade Runner.md") {
+                // A property-only note, in the shape a real vault uses: no
+                // body at all, everything in frontmatter.
+                return Ok(concat!(
+                    "---\n",
+                    "categories:\n  - \"[[Movies]]\"\n",
+                    "cover: https://example.invalid/a/very/long/cover/image/url.jpg\n",
+                    "director:\n  - \"[[Ridley Scott]]\"\n",
+                    "year: 1982\n",
+                    "---\n",
+                )
+                .as_bytes()
+                .to_vec());
             }
             Ok(b"# Heading\n\nbody text".to_vec())
         }
@@ -1532,6 +1605,60 @@ mod tests {
             fail_fast,
             8,
         )
+    }
+
+    /// A note whose content is entirely frontmatter used to be indexed with
+    /// zero chunks, which made it unretrievable by any query — including its
+    /// own exact name. It must get one chunk carrying its identity.
+    #[test]
+    fn a_property_only_note_is_indexed_with_a_chunk() {
+        let mut store = FakeStore::default();
+        let walker = FakeWalker {
+            files: vec![(PathBuf::from("/vault/Blade Runner.md"), DocKind::Markdown)],
+        };
+        let report = run_with(&walker, &mut store, false).unwrap();
+
+        assert_eq!(report.indexed, 1);
+        assert_eq!(
+            store.chunk_headings,
+            vec![(
+                "/vault/Blade Runner.md".to_string(),
+                "Blade Runner".to_string()
+            )],
+            "the title must reach the index as the chunk's heading"
+        );
+        let text = &store.chunk_texts[0].1;
+        assert!(
+            text.contains("director: Ridley Scott"),
+            "a property someone would search for must be indexed, got {text:?}"
+        );
+        assert!(
+            text.contains("year: 1982"),
+            "got {text:?}"
+        );
+        assert!(
+            !text.contains("http"),
+            "a cover image URL is not prose and would dominate the chunk's length, got {text:?}"
+        );
+    }
+
+    /// A note with a body is untouched: it keeps exactly its body chunks, and
+    /// its frontmatter is not appended as an extra one. Making titles
+    /// first-class for *every* document is a separate, measurable change —
+    /// it shifts the corpus statistics every score is normalized against —
+    /// and this fix deliberately does not make it.
+    #[test]
+    fn a_note_with_a_body_gains_no_extra_chunk() {
+        let mut store = FakeStore::default();
+        let walker = FakeWalker {
+            files: vec![(PathBuf::from("/vault/a.md"), DocKind::Markdown)],
+        };
+        run_with(&walker, &mut store, false).unwrap();
+        assert_eq!(
+            store.chunk_headings,
+            vec![("/vault/a.md".to_string(), "Heading".to_string())],
+            "one body chunk, and nothing synthetic alongside it"
+        );
     }
 
     /// Chunk parameters have to be recorded, or a later run cannot tell that
