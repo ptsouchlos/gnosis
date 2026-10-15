@@ -167,11 +167,16 @@ pub fn chunks() -> Vec<ArtifactChunk> {
     ]
 }
 
+/// What the CLI prepends to a bge query, as an index records it.
+pub const BGE_QUERY_INSTRUCTION: &str =
+    "Represent this sentence for searching relevant passages: ";
+
 fn space_info(
     space: Space,
     id: &str,
     query_id: Option<&str>,
     pooling: &str,
+    query_prefix: &str,
     dim: usize,
 ) -> SpaceInfo {
     SpaceInfo {
@@ -181,6 +186,8 @@ fn space_info(
             pooling: pooling.into(),
             dim,
             query_id: query_id.map(str::to_string),
+            query_prefix: query_prefix.into(),
+            document_prefix: String::new(),
         },
     }
 }
@@ -212,12 +219,20 @@ pub fn artifact() -> (String, Vec<(String, Vec<u8>)>) {
         format_version: store::artifact::ARTIFACT_FORMAT_VERSION,
         created_unix: 1_700_000_400,
         spaces: vec![
-            space_info(Space::Text, "bge-small-en-v1.5", None, "cls", TEXT_DIM),
+            space_info(
+                Space::Text,
+                "bge-small-en-v1.5",
+                None,
+                "cls",
+                BGE_QUERY_INSTRUCTION,
+                TEXT_DIM,
+            ),
             space_info(
                 Space::Image,
                 "clip-vit-b-32-vision",
                 Some("clip-vit-b-32-text"),
                 "mean",
+                "",
                 IMAGE_DIM,
             ),
         ],

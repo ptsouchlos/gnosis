@@ -96,6 +96,12 @@ fn info_reports_each_space_s_query_model_and_pooling() {
     assert_eq!(spaces[0]["space"], "text");
     assert_eq!(spaces[0]["queryModel"], "bge-small-en-v1.5");
     assert_eq!(spaces[0]["pooling"], "cls");
+    assert_eq!(
+        spaces[0]["queryPrefix"],
+        support::BGE_QUERY_INSTRUCTION,
+        "a bge query is embedded with the instruction the index recorded"
+    );
+    assert_eq!(spaces[0]["documentPrefix"], "");
     assert_eq!(spaces[0]["dim"], 4);
     assert_eq!(spaces[1]["space"], "image");
     assert_eq!(
@@ -352,7 +358,8 @@ use gnosis_wasm::builder::Builder;
 fn spec() -> JsValue {
     js_sys::JSON::parse(
         r#"{"model":"bge-small-en-v1.5","pooling":"cls","dim":4,"root":"notes",
-            "quantization":"f32","compression":"deflate"}"#,
+            "queryPrefix":"Represent this sentence for searching relevant passages: ",
+            "documentPrefix":"","quantization":"f32","compression":"deflate"}"#,
     )
     .expect("spec")
 }
@@ -414,6 +421,11 @@ fn an_index_built_here_opens_and_answers() {
     assert_eq!(info["documents"], 2);
     assert_eq!(info["spaces"][0]["pooling"], "cls");
     assert_eq!(info["spaces"][0]["model"], "bge-small-en-v1.5");
+    assert_eq!(
+        info["spaces"][0]["queryPrefix"],
+        support::BGE_QUERY_INSTRUCTION,
+        "the spec's query prefix travels into the manifest"
+    );
 
     // The property-only note is findable by a property, which is the whole
     // reason the identity chunk exists.
@@ -495,4 +507,20 @@ fn finishing_before_the_vectors_arrive_is_refused() {
     };
     let msg = message(err.into());
     assert!(msg.contains("waiting for its vectors"), "got {msg}");
+}
+
+/// A spec that leaves the prefixes out is refused rather than read as "none":
+/// an E5 build that forgot `"passage: "` would produce an index whose every
+/// vector is in the wrong convention, and nothing about it would look wrong.
+#[wasm_bindgen_test]
+fn a_spec_without_prefixes_is_refused() {
+    let spec = js_sys::JSON::parse(
+        r#"{"model":"multilingual-e5-small","pooling":"mean","dim":4,"root":"notes"}"#,
+    )
+    .expect("spec");
+    let Err(err) = Builder::create(spec) else {
+        panic!("a spec without prefixes must not build");
+    };
+    let message = format!("{:?}", JsValue::from(err));
+    assert!(message.contains("Prefix"), "got {message}");
 }

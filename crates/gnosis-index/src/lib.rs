@@ -101,6 +101,13 @@ pub fn run(
         .set_meta("chunk.overlap", &chunk_cfg.overlap.to_string())?;
     args.store
         .set_meta("dim.text", &args.embedders.text.dim().to_string())?;
+    // What the stored vectors were embedded with, for `gnosis export` to
+    // record: a client embedding outside Rust cannot reproduce a prefix it
+    // was never told about.
+    args.store
+        .set_meta("prefix.text.query", args.embedders.text.query_prefix())?;
+    args.store
+        .set_meta("prefix.text.document", args.embedders.text.document_prefix())?;
     if let Some(image) = &args.embedders.image {
         args.store.set_meta("model.image_vision", image.model_id())?;
         args.store.set_meta("dim.image", &image.dim().to_string())?;
@@ -1016,6 +1023,10 @@ fn guard_model(store: &dyn Store, embedders: &EmbedderSet, force: bool) -> Resul
         return Ok(());
     }
     guard_one(store, "model.text", embedders.text.model_id())?;
+    // A changed document prefix puts new vectors in a different convention
+    // from the stored ones, exactly as a changed model does. The query prefix
+    // is not guarded: it touches no stored vector.
+    guard_prefix(store, embedders.text.document_prefix())?;
     if let Some(image) = &embedders.image {
         guard_one(store, "model.image_vision", image.model_id())?;
     }
@@ -1032,6 +1043,18 @@ fn guard_one(store: &dyn Store, key: &str, model_id: &str) -> Result<()> {
         bail!(
             "index was built with model '{existing}' ({key}) but config now specifies \
              '{model_id}'; run `gnosis rebuild` to re-embed"
+        );
+    }
+    Ok(())
+}
+
+fn guard_prefix(store: &dyn Store, prefix: &str) -> Result<()> {
+    if let Some(existing) = store.get_meta("prefix.text.document")?
+        && existing != prefix
+    {
+        bail!(
+            "index was built with document prefix {existing:?} but the configured model now \
+             uses {prefix:?} (did `query_instruction` change?); run `gnosis rebuild` to re-embed"
         );
     }
     Ok(())
@@ -1692,6 +1715,32 @@ mod tests {
             Some(chunker::ChunkConfig::default().max_tokens.to_string()),
             "the new size replaces the stored one"
         );
+    }
+
+    /// The prefixes the stored vectors were embedded with have to be recorded,
+    /// empty ones included, or an export cannot tell a client what to embed a
+    /// query with.
+    #[test]
+    fn run_pins_the_prefixes_it_embedded_with() {
+        let mut store = FakeStore::default();
+        let walker = mixed_kind_walker();
+        run_with(&walker, &mut store, false).expect("index");
+        assert_eq!(store.get_meta("prefix.text.query").unwrap(), Some(String::new()));
+        assert_eq!(store.get_meta("prefix.text.document").unwrap(), Some(String::new()));
+    }
+
+    /// Turning `query_instruction` off under an E5 index drops `"passage: "`
+    /// from new documents only, leaving the index in two conventions — the
+    /// same silent damage a model change does, so it is refused the same way.
+    #[test]
+    fn run_refuses_a_changed_document_prefix() {
+        let mut store = FakeStore::default();
+        store.set_meta("prefix.text.document", "passage: ").expect("seed");
+        let walker = mixed_kind_walker();
+        let err = run_with(&walker, &mut store, false).expect_err("must refuse");
+        let message = format!("{err:#}");
+        assert!(message.contains("passage: "), "got {message}");
+        assert!(message.contains("gnosis rebuild"), "got {message}");
     }
 
     #[test]

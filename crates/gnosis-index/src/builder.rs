@@ -49,6 +49,14 @@ pub struct BuildSpec {
     /// How token vectors are pooled into one — `cls` or `mean`.
     pub pooling: String,
     pub dim: usize,
+    /// Prepended to a query, recorded so a client querying this artifact
+    /// later embeds the way the CLI would. Required, like `pooling`: an empty
+    /// string is a statement that the model wants none, not a default.
+    pub query_prefix: String,
+    /// Prepended to every text `add_document` hands back for embedding —
+    /// `"passage: "` for E5. Applied here rather than by the caller so the
+    /// strings returned are exactly what `gnosis index` embeds.
+    pub document_prefix: String,
     /// The vault root's label. One root: an artifact spanning several vaults
     /// is the CLI's business, and a client indexes the vault it runs in.
     pub root: String,
@@ -92,8 +100,9 @@ pub struct Added {
     /// True when the document was carried over from the previous artifact
     /// unchanged, so `texts` is empty and nothing needs embedding.
     pub reused: bool,
-    /// The exact strings to embed, in chunk order, heading trail included —
-    /// because that is what the native indexer embeds. A caller that embedded
+    /// The exact strings to embed, in chunk order, document prefix and
+    /// heading trail included — because that is what the native indexer
+    /// embeds. A caller that embedded
     /// the body alone would produce vectors from different inputs.
     pub texts: Vec<String>,
 }
@@ -157,7 +166,16 @@ impl ArtifactBuilder {
     /// wrongly, which is the one failure mode with no symptom.
     pub fn reusing(spec: BuildSpec, previous: Artifact) -> Result<Self> {
         match previous.manifest().space(Space::Text) {
-            Some(model) if model.id == spec.model && model.dim == spec.dim => {}
+            Some(model)
+                if model.id == spec.model
+                    && model.dim == spec.dim
+                    && model.document_prefix == spec.document_prefix => {}
+            Some(model) if model.id == spec.model && model.dim == spec.dim => bail!(
+                "the existing index embedded documents with prefix {:?} and this build uses \
+                 {:?} — rebuild from scratch instead of reusing it",
+                model.document_prefix,
+                spec.document_prefix
+            ),
             Some(model) => bail!(
                 "the existing index was built by '{}' at {}d and this build uses '{}' at {}d — \
                  rebuild from scratch instead of reusing it",
@@ -204,7 +222,13 @@ impl ArtifactBuilder {
         );
         let texts: Vec<String> = chunks
             .iter()
-            .map(|c| crate::join_lines(&c.heading_path, &c.text))
+            .map(|c| {
+                format!(
+                    "{}{}",
+                    self.spec.document_prefix,
+                    crate::join_lines(&c.heading_path, &c.text)
+                )
+            })
             .collect();
 
         self.documents.insert(
@@ -376,6 +400,8 @@ impl ArtifactBuilder {
                         pooling: self.spec.pooling.clone(),
                         dim: self.spec.dim,
                         query_id: None,
+                        query_prefix: self.spec.query_prefix.clone(),
+                        document_prefix: self.spec.document_prefix.clone(),
                     },
                 }],
                 quantization: self.spec.quantization,

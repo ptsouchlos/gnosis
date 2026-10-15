@@ -383,11 +383,24 @@ fn text_model_info(store: &SqliteStore, configured: &str) -> Result<ModelInfo> {
     let pooling = resolve_pooling(&id).with_context(|| {
         format!("the index was built with model '{id}', which this build does not know")
     })?;
+    // Read from what indexing recorded, never re-derived from config:
+    // `query_instruction` can be flipped after indexing, and what a client must
+    // reproduce is what produced the stored vectors.
+    let recorded = |key: &str| -> Result<String> {
+        store.get_meta(key)?.with_context(|| {
+            format!(
+                "the index does not record which prefixes it embedded with ({key}) — \
+                 run `gnosis index` once to record them, then export again"
+            )
+        })
+    };
     Ok(ModelInfo {
         id,
         pooling: pooling.to_string(),
         dim,
         query_id: None,
+        query_prefix: recorded("prefix.text.query")?,
+        document_prefix: recorded("prefix.text.document")?,
     })
 }
 
@@ -419,6 +432,8 @@ fn image_model_info(store: &SqliteStore) -> Result<Option<ModelInfo>> {
         pooling: CLIP_TEXT_POOLING.to_string(),
         dim,
         query_id: Some(query_id),
+        query_prefix: String::new(),
+        document_prefix: String::new(),
     }))
 }
 
@@ -481,12 +496,20 @@ mod tests {
         dir
     }
 
+    /// What `TextEmbedder` prepends to a bge query. Spelled out rather than
+    /// imported so a change to it shows up as a failing test here.
+    const BGE_QUERY_INSTRUCTION: &str = "Represent this sentence for searching relevant passages: ";
+
     /// A store with three documents whose vectors are known, so the expected
     /// ranking is obvious rather than whatever the model happens to produce.
     fn seeded_store(dir: &std::path::Path) -> SqliteStore {
         let mut store = SqliteStore::open(&dir.join("gnosis.db")).unwrap();
         store.set_meta("model.text", "bge-small-en-v1.5").unwrap();
         store.set_meta("dim.text", "4").unwrap();
+        store
+            .set_meta("prefix.text.query", BGE_QUERY_INSTRUCTION)
+            .unwrap();
+        store.set_meta("prefix.text.document", "").unwrap();
 
         let docs: [(&str, &str, Vec<f32>, &str); 3] = [
             ("/vault/near.md", "Near", vec![1.0, 0.0, 0.0, 0.0], "alpha beta"),
@@ -771,6 +794,23 @@ mod tests {
         let model = text_model_info(&store, "all-MiniLM-L6-v2").unwrap();
         assert_eq!(model.id, "bge-small-en-v1.5");
         assert_eq!(model.pooling, "cls");
+        assert_eq!(model.query_prefix, BGE_QUERY_INSTRUCTION);
+        assert_eq!(model.document_prefix, "");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An index from before prefixes were recorded cannot say what its
+    /// vectors were embedded with, and guessing from the model id is wrong for
+    /// any vault indexed with `query_instruction = false`. One `gnosis index`
+    /// records them, so that is what the error says.
+    #[test]
+    fn export_asks_for_an_index_run_when_prefixes_were_never_recorded() {
+        let dir = temp_dir("no-prefix");
+        let store = SqliteStore::open(&dir.join("gnosis.db")).unwrap();
+        store.set_meta("model.text", "bge-small-en-v1.5").unwrap();
+        store.set_meta("dim.text", "4").unwrap();
+        let err = text_model_info(&store, "bge-small-en-v1.5").expect_err("should refuse");
+        assert!(format!("{err:#}").contains("gnosis index"), "{err:#}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1389,6 +1429,8 @@ mod tests {
         let mut store = SqliteStore::open(&dir.join("gnosis.db")).unwrap();
         store.set_meta("model.text", "bge-small-en-v1.5").unwrap();
         store.set_meta("dim.text", "2").unwrap();
+        store.set_meta("prefix.text.query", BGE_QUERY_INSTRUCTION).unwrap();
+        store.set_meta("prefix.text.document", "").unwrap();
         for (path, text) in [("accented.md", "une pause café"), ("plain.md", "a cafe stop")] {
             store
                 .replace_document(&DocWrite {
@@ -1449,7 +1491,21 @@ mod tests {
     /// heading-trail joining differ by one character, the vectors differ and
     /// the shards stop matching. A real model would hide that behind noise;
     /// this turns it into a byte comparison.
-    struct HashEmbedder;
+    ///
+    /// It declares a model's prefixes the way `TextEmbedder` does, so the
+    /// trait's own `embed_document` applies them on the CLI's side and the
+    /// builder has to apply the same ones on its side.
+    struct HashEmbedder {
+        model: &'static str,
+        query_prefix: &'static str,
+        document_prefix: &'static str,
+    }
+
+    const HASH_BGE: HashEmbedder = HashEmbedder {
+        model: "bge-small-en-v1.5",
+        query_prefix: BGE_QUERY_INSTRUCTION,
+        document_prefix: "",
+    };
 
     impl embed::Embedder for HashEmbedder {
         fn space(&self) -> &str {
@@ -1459,10 +1515,34 @@ mod tests {
             4
         }
         fn model_id(&self) -> &str {
-            "bge-small-en-v1.5"
+            self.model
         }
         fn embed(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
             Ok(inputs.iter().map(|t| hash_vector(t)).collect())
+        }
+        fn query_prefix(&self) -> &str {
+            self.query_prefix
+        }
+        fn document_prefix(&self) -> &str {
+            self.document_prefix
+        }
+    }
+
+    /// A builder spec matching `embedder`, at the CLI's defaults otherwise.
+    fn spec_for(embedder: &HashEmbedder, pooling: &str, root: &str) -> index::builder::BuildSpec {
+        let chunk_cfg = chunker::ChunkConfig::default();
+        index::builder::BuildSpec {
+            model: embedder.model.to_string(),
+            pooling: pooling.to_string(),
+            dim: 4,
+            query_prefix: embedder.query_prefix.to_string(),
+            document_prefix: embedder.document_prefix.to_string(),
+            root: root.to_string(),
+            quantization: Quantization::I8,
+            compression: Compression::Deflate,
+            shard_docs: 256,
+            max_tokens: chunk_cfg.max_tokens,
+            overlap: chunk_cfg.overlap,
         }
     }
 
@@ -1524,12 +1604,30 @@ mod tests {
     /// passing the CLI's own timestamp.
     #[test]
     fn the_builder_and_the_cli_produce_the_same_artifact() {
+        assert_builder_matches_cli(HASH_BGE, "cls");
+    }
+
+    /// The same claim for E5, the one supported model that prefixes
+    /// *documents*. bge's empty document prefix cannot tell a builder that
+    /// applies it from one that ignores it; this can.
+    #[test]
+    fn the_builder_and_the_cli_agree_for_a_model_that_prefixes_documents() {
+        assert_builder_matches_cli(
+            HashEmbedder {
+                model: "multilingual-e5-small",
+                query_prefix: "query: ",
+                document_prefix: "passage: ",
+            },
+            "mean",
+        );
+    }
+
+    fn assert_builder_matches_cli(mut text: HashEmbedder, pooling: &str) {
         let dir = temp_dir("builder-parity");
         let vault = parity_vault(&dir);
 
         // The CLI's path: walk, parse, chunk, embed, store, export.
         let mut store = SqliteStore::open(&dir.join("gnosis.db")).unwrap();
-        let mut text = HashEmbedder;
         let progress = progress::NoopProgress;
         let chunk_cfg = chunker::ChunkConfig::default();
         let mut args = index::IndexerArgs {
@@ -1557,7 +1655,7 @@ mod tests {
 
         let (cli_manifest, cli_shards) = build_artifact(
             &store,
-            "bge-small-en-v1.5",
+            text.model,
             Quantization::I8,
             Compression::Deflate,
             &[Space::Text],
@@ -1566,17 +1664,11 @@ mod tests {
         .expect("exporting");
 
         // The client's path: the same text, chunked and packed by the builder.
-        let spec = index::builder::BuildSpec {
-            model: "bge-small-en-v1.5".to_string(),
-            pooling: "cls".to_string(),
-            dim: 4,
-            root: vault.file_name().unwrap().to_string_lossy().to_string(),
-            quantization: Quantization::I8,
-            compression: Compression::Deflate,
-            shard_docs: 256,
-            max_tokens: chunk_cfg.max_tokens,
-            overlap: chunk_cfg.overlap,
-        };
+        let spec = spec_for(
+            &text,
+            pooling,
+            &vault.file_name().unwrap().to_string_lossy(),
+        );
         let mut builder = index::builder::ArtifactBuilder::new(spec);
         let mut files: Vec<PathBuf> = std::fs::read_dir(vault.join("notes"))
             .unwrap()
@@ -1636,6 +1728,8 @@ mod tests {
             model: "bge-small-en-v1.5".to_string(),
             pooling: "cls".to_string(),
             dim: 4,
+            query_prefix: BGE_QUERY_INSTRUCTION.to_string(),
+            document_prefix: String::new(),
             root: "vault".to_string(),
             quantization: Quantization::F32,
             compression: Compression::Deflate,
@@ -1729,6 +1823,8 @@ mod tests {
                 model: "multilingual-e5-small".to_string(),
                 pooling: "mean".to_string(),
                 dim: 4,
+                query_prefix: "query: ".to_string(),
+                document_prefix: "passage: ".to_string(),
                 root: "vault".to_string(),
                 quantization: Quantization::F32,
                 compression: Compression::Deflate,
@@ -1744,6 +1840,45 @@ mod tests {
         let message = format!("{err:#}");
         assert!(message.contains("bge-small-en-v1.5"), "got {message}");
         assert!(message.contains("multilingual-e5-small"), "got {message}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The same model with a different document prefix is a different vector
+    /// convention — what `query_instruction = false` does to an E5 index — so
+    /// reusing across it is refused just as across models.
+    #[test]
+    fn reusing_an_artifact_with_another_document_prefix_is_refused() {
+        let dir = temp_dir("builder-prefix");
+        let vault = parity_vault(&dir);
+        let e5 = HashEmbedder {
+            model: "multilingual-e5-small",
+            query_prefix: "query: ",
+            document_prefix: "passage: ",
+        };
+        let mut builder = index::builder::ArtifactBuilder::new(spec_for(&e5, "mean", "vault"));
+        let text = std::fs::read_to_string(vault.join("notes/hydration.md")).unwrap();
+        let added = builder.add_document("notes/hydration.md", &text, 1_700_000_000);
+        assert!(
+            added.texts.iter().all(|t| t.starts_with("passage: ")),
+            "every embedding input carries the document prefix: {:?}",
+            added.texts
+        );
+        let vectors: Vec<f32> = added.texts.iter().flat_map(|t| hash_vector(t)).collect();
+        builder.set_vectors("notes/hydration.md", &vectors).unwrap();
+        let built = builder.finish(1_700_000_000).unwrap();
+        let artifact = open_artifact(&built.manifest, built.shards);
+
+        let unprefixed = HashEmbedder {
+            document_prefix: "",
+            query_prefix: "",
+            ..e5
+        };
+        let Err(err) =
+            index::builder::ArtifactBuilder::reusing(spec_for(&unprefixed, "mean", "vault"), artifact)
+        else {
+            panic!("an artifact embedded with another document prefix must not be reusable");
+        };
+        assert!(format!("{err:#}").contains("passage: "), "got {err:#}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
