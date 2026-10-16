@@ -444,14 +444,15 @@ impl Store for ArtifactStore {
     }
 
     fn chunk_vectors(&self, path: &str, space: Space) -> Result<Vec<Vec<f32>>> {
-        Ok(self
+        let chunks = self
             .artifact
             .chunks()
             .iter()
             .filter(|c| c.space == space)
             .filter(|c| self.document(c).is_some_and(|d| d.path == path))
-            .map(|c| c.vector.clone())
-            .collect())
+            .map(|c| (c.vector.clone(), c.text.clone()))
+            .collect();
+        Ok(search::related_sources(chunks, space == Space::Text))
     }
 
     fn linked_targets(&self, path: &str) -> Result<Vec<String>> {
@@ -487,11 +488,12 @@ impl Store for ArtifactStore {
         // Every modality, unlike `search_space`: an image's title proxy is how
         // `related` reaches the notes that mention it.
         let candidates = self.candidates(space, None, filter);
-        Ok(search::rank_multi(
+        Ok(search::rank_related(
             query_vectors,
             candidates,
             exclude_paths,
             limit,
+            space == Space::Text,
         ))
     }
 }

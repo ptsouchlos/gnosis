@@ -1039,16 +1039,18 @@ impl Store for SqliteStore {
 
     fn chunk_vectors(&self, path: &str, space: Space) -> Result<Vec<Vec<f32>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT c.vector FROM chunks c JOIN documents_abs d ON d.id = c.doc_id
+            "SELECT c.vector, c.text FROM chunks c JOIN documents_abs d ON d.id = c.doc_id
              WHERE c.space = ?1 AND c.vector IS NOT NULL AND d.path = ?2",
         )?;
-        let vectors = stmt
-            .query_map(rusqlite::params![space.as_str(), path], |r| r.get::<_, Vec<u8>>(0))?
+        let chunks = stmt
+            .query_map(rusqlite::params![space.as_str(), path], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Option<String>>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()
-            .map(|b| search::blob_to_vec(&b))
+            .map(|(b, text)| (search::blob_to_vec(&b), text.unwrap_or_default()))
             .collect();
-        Ok(vectors)
+        Ok(search::related_sources(chunks, space == Space::Text))
     }
 
     fn linked_targets(&self, path: &str) -> Result<Vec<String>> {
@@ -1108,11 +1110,12 @@ impl Store for SqliteStore {
         } else {
             self.space_candidates(space, None, filter)?
         };
-        Ok(search::rank_multi(
+        Ok(search::rank_related(
             query_vectors,
             candidates,
             exclude_paths,
             limit,
+            space == Space::Text,
         ))
     }
 }
