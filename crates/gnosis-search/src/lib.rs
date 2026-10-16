@@ -138,7 +138,7 @@ pub fn rank_related(
     text_space: bool,
 ) -> Vec<Hit> {
     // Per document: its hit (best chunk), and its best pair scores so far.
-    let mut docs: HashMap<String, (Hit, Vec<f32>)> = HashMap::new();
+    let mut docs: HashMap<String, (Hit, BestMatches)> = HashMap::new();
     for c in candidates {
         if exclude_paths.iter().any(|p| p == &c.path) || (text_space && carries_no_content(&c.text))
         {
@@ -156,20 +156,10 @@ pub fn rank_related(
                     width: None,
                     height: None,
                 },
-                Vec::with_capacity(RELATED_TOP_K + 1),
+                BestMatches::default(),
             )
         });
-        let mut chunk_best = f32::NEG_INFINITY;
-        for q in queries {
-            let score = dot(q, &c.vector);
-            chunk_best = chunk_best.max(score);
-            // Keep the top K, descending; K is tiny, so insertion is cheapest.
-            let at = best.partition_point(|&b| b >= score);
-            if at < RELATED_TOP_K {
-                best.insert(at, score);
-                best.truncate(RELATED_TOP_K);
-            }
-        }
+        let chunk_best = best.add_chunk(queries, &c.vector);
         if chunk_best > hit.score {
             hit.score = chunk_best;
             hit.heading_path = c.heading_path;
@@ -182,13 +172,68 @@ pub fn rank_related(
     let mut hits: Vec<Hit> = docs
         .into_values()
         .map(|(mut hit, best)| {
-            hit.score = best.iter().sum::<f32>() / best.len() as f32;
+            hit.score = best.score();
             hit
         })
         .collect();
     hits.sort_by(|a, b| b.score.total_cmp(&a.score));
     hits.truncate(limit);
     hits
+}
+
+/// One document pair's score, exactly as [`rank_related`] would give the
+/// candidate document when asked from the document `queries` came from.
+///
+/// `candidate` is that document's chunks, as `(vector, text)`. `None` when
+/// none of them would be considered (in the text space, a document of only
+/// embeds and links), so it would never appear in `related` from here at all.
+///
+/// This is what lets a client place related notes relative to *each other*
+/// without re-deriving the aggregation: a pair scored here and the same pair
+/// in a `related` list are the same number.
+pub fn related_pair_score<'a>(
+    queries: &[Vec<f32>],
+    candidate: impl IntoIterator<Item = (&'a [f32], &'a str)>,
+    text_space: bool,
+) -> Option<f32> {
+    let mut best = BestMatches::default();
+    for (vector, text) in candidate {
+        if text_space && carries_no_content(text) {
+            continue;
+        }
+        best.add_chunk(queries, vector);
+    }
+    (!best.0.is_empty()).then(|| best.score())
+}
+
+/// A document pair's [`RELATED_TOP_K`] best chunk-to-chunk similarities,
+/// descending, which [`rank_related`] and [`related_pair_score`] both score.
+#[derive(Default)]
+struct BestMatches(Vec<f32>);
+
+impl BestMatches {
+    /// Score one candidate chunk against every query chunk, returning that
+    /// chunk's own best similarity.
+    fn add_chunk(&mut self, queries: &[Vec<f32>], vector: &[f32]) -> f32 {
+        let mut chunk_best = f32::NEG_INFINITY;
+        for q in queries {
+            let score = dot(q, vector);
+            chunk_best = chunk_best.max(score);
+            // Keep the top K, descending; K is tiny, so insertion is cheapest.
+            let at = self.0.partition_point(|&b| b >= score);
+            if at < RELATED_TOP_K {
+                self.0.insert(at, score);
+                self.0.truncate(RELATED_TOP_K);
+            }
+        }
+        chunk_best
+    }
+
+    /// The mean of the best matches kept, fewer than K when the pair has
+    /// fewer chunk pairs than that.
+    fn score(&self) -> f32 {
+        self.0.iter().sum::<f32>() / self.0.len() as f32
+    }
 }
 
 /// Shared aggregation for [`rank`]: score each candidate with
@@ -500,6 +545,61 @@ mod tests {
         assert_eq!(hits[0].path, "broad.md", "{hits:?}");
         // Today's single best pair would have put `one.md` first (1.0 vs 0.99).
         assert!(hits[0].score > hits[1].score);
+    }
+
+    /// A pair scored on its own is the number `related` lists for it, so a
+    /// client placing related notes by pair scores shows what `related` says.
+    #[test]
+    fn a_pair_scores_what_related_lists_for_it() {
+        let queries = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let docs = [
+            candidate(
+                "a.md",
+                "",
+                "A passage close to the first source chunk.",
+                vec![0.9, 0.1],
+            ),
+            candidate(
+                "a.md",
+                "",
+                "A passage close to the second source chunk.",
+                vec![0.2, 0.9],
+            ),
+            candidate("a.md", "Mind Map", "![[a.pdf]]", vec![1.0, 0.0]),
+            candidate(
+                "b.md",
+                "",
+                "A single passage between the two of them.",
+                vec![0.6, 0.8],
+            ),
+        ];
+        let listed = rank_related(&queries, docs.iter().cloned(), &[], 10, true);
+        for hit in &listed {
+            let chunks = docs
+                .iter()
+                .filter(|c| c.path == hit.path)
+                .map(|c| (c.vector.as_slice(), c.text.as_str()));
+            assert_eq!(
+                related_pair_score(&queries, chunks, true),
+                Some(hit.score),
+                "{}",
+                hit.path
+            );
+        }
+        assert_eq!(listed.len(), 2);
+    }
+
+    #[test]
+    fn a_pair_with_only_boilerplate_on_the_candidate_side_has_no_score() {
+        let queries = vec![vec![1.0, 0.0]];
+        let template = [(vec![1.0, 0.0], "![[template.pdf]]".to_string())];
+        let chunks = || template.iter().map(|(v, t)| (v.as_slice(), t.as_str()));
+        assert_eq!(related_pair_score(&queries, chunks(), true), None);
+        assert_eq!(
+            related_pair_score(&queries, chunks(), false),
+            Some(1.0),
+            "image chunks are all kept"
+        );
     }
 
     #[test]

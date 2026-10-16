@@ -49,6 +49,7 @@ const index = Index.open(manifestJson, shards);   // shards: Map<name, Uint8Arra
 index.search(query, new Map([["text", vector]]), 10);   // hybrid: vector + text
 index.lexicalSearch(query, 10);                          // no model at all
 index.related("notes/sourdough.md", 10, false);          // no model, full quality
+index.similarities(paths);                               // pair scores among `paths`
 index.info();                                            // models, pooling, dims, counts
 index.staleness(entries);                                // what the vault disagrees with
 ```
@@ -80,7 +81,15 @@ to embed. `unchanged` names the shards whose bytes did not change, which are
 not returned — rewriting a file a syncer already has is the churn sharding
 exists to avoid.
 
-Every call takes an optional last argument, a filter: `{from: ["notes"], tags:
+`similarities` returns a square array: row `i`, column `j` is the text-space
+score `related(paths[i])` ranks `paths[j]` by, `null` on the diagonal and for a
+pair `related` would never list. It is for placing related notes relative to
+each other. Over 20 notes of a 4,199-chunk vault it takes 7.3 ms, against
+~550 ms for one `related` call per note, which still misses most pairs. On an
+artifact with more than one space `related` normalizes each space before
+merging, so its numbers are not these raw ones.
+
+Every call but `similarities` takes an optional last argument, a filter: `{from: ["notes"], tags:
 ["baking"]}`. `from` matches a root *label*, not a path — an artifact records
 what a vault was called, not where it lived on the machine that built it.
 

@@ -278,6 +278,32 @@ fn related_excludes_the_source_and_its_links() {
     );
 }
 
+/// Pair scores cross as a square array, numbers off the diagonal and `null`
+/// on it. That they equal `related`'s own text-space scores is checked on the
+/// host (`tests/similarities.rs`): through JS, this fixture's `related`
+/// merges two spaces and normalizes, so its numbers are not raw scores.
+#[wasm_bindgen_test]
+fn similarities_cross_as_a_square_array() {
+    let index = open();
+    let paths = vec![
+        "notes/sourdough.md".to_string(),
+        "notes/hydration.md".to_string(),
+    ];
+    let matrix = json(index.similarities(paths).expect("similarities"));
+    assert_eq!(matrix.as_array().unwrap().len(), 2);
+    assert_eq!(matrix[0][0], serde_json::Value::Null);
+    assert_eq!(matrix[1][1], serde_json::Value::Null);
+    assert!(
+        matrix[0][1].is_number() && matrix[1][0].is_number(),
+        "{matrix}"
+    );
+
+    let err = index
+        .similarities(vec!["notes/nowhere.md".into()])
+        .expect_err("an unknown path");
+    assert!(message(err.into()).contains("notes/nowhere.md"));
+}
+
 /// Filters cross the boundary as a plain object, and `from` matches a root
 /// *label* — an artifact records what a vault was called, not where it lived.
 #[wasm_bindgen_test]
