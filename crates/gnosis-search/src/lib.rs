@@ -186,7 +186,7 @@ pub fn rank_related(
             hit
         })
         .collect();
-    hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+    hits.sort_by(best_first);
     hits.truncate(limit);
     hits
 }
@@ -226,7 +226,7 @@ fn rank_by(
     }
 
     let mut hits: Vec<Hit> = best.into_values().collect();
-    hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+    hits.sort_by(best_first);
     hits.truncate(limit);
     hits
 }
@@ -310,14 +310,7 @@ pub fn boost_and_rank(
             hit.score += title_boost * bm25::title_match(query_terms, &hit.title);
         }
     }
-    // Ties broken by path so a given index always ranks the same way; an
-    // arbitrary order would make evaluation runs irreproducible.
-    hits.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.path.cmp(&b.path))
-    });
+    hits.sort_by(best_first);
     hits.truncate(limit);
     hits
 }
@@ -350,9 +343,18 @@ pub fn merge_normalized(per_space: Vec<Vec<Hit>>, limit: usize) -> Vec<Hit> {
         }
     }
     let mut merged: Vec<Hit> = best.into_values().collect();
-    merged.sort_by(|a, b| b.score.total_cmp(&a.score));
+    merged.sort_by(best_first);
     merged.truncate(limit);
     merged
+}
+
+/// Highest score first, ties broken by path, so a given index always ranks
+/// the same way. Every ranking here collects from a `HashMap`, whose order is
+/// random per process, and a vault with duplicate notes ties exactly: without
+/// the path, the same query could rank them differently on each run, which
+/// makes evaluation irreproducible and parity checks flaky.
+fn best_first(a: &Hit, b: &Hit) -> std::cmp::Ordering {
+    b.score.total_cmp(&a.score).then_with(|| a.path.cmp(&b.path))
 }
 
 /// Dot product of two equal-length vectors (0.0 on length mismatch).
@@ -597,6 +599,28 @@ mod tests {
         let query = vec![1.0];
         let candidates = (0..5).map(|i| candidate(&format!("{i}.md"), "", "x", vec![i as f32]));
         assert_eq!(rank(&query, candidates, 2).len(), 2);
+    }
+
+    /// Duplicate notes tie exactly. They must rank the same way on every run,
+    /// whatever order the `HashMap` they were collected in hands them back:
+    /// with ten tied documents, an order left to chance is almost never this.
+    #[test]
+    fn exact_ties_rank_by_path_every_time() {
+        let paths: Vec<String> = (0..10).map(|i| format!("{i}.md")).collect();
+        let tied = || {
+            paths
+                .iter()
+                .rev()
+                .map(|p| candidate(p, "", "A passage every one of these notes shares.", vec![1.0]))
+        };
+        let ranked = |hits: Vec<Hit>| hits.into_iter().map(|h| h.path).collect::<Vec<_>>();
+
+        assert_eq!(ranked(rank(&[1.0], tied(), 10)), paths);
+        assert_eq!(ranked(rank_related(&[vec![1.0]], tied(), &[], 10, true)), paths);
+        let text = rank(&[1.0], tied(), 10);
+        let image = vec![Hit { path: "x.png".into(), score: 0.5, ..text[0].clone() }];
+        let merged = ranked(merge_normalized(vec![text, image], 11));
+        assert_eq!(merged[..10], paths[..]);
     }
 
     #[test]
