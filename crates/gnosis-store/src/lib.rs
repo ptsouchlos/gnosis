@@ -204,8 +204,10 @@ pub trait Store {
     fn search_space(&self, space: Space, query: &[f32], limit: usize, filter: &TextQuery) -> Result<Vec<Hit>>;
 
     /// A document's own chunk vectors within one space — the query set for
-    /// `related`. Empty when the document has no chunks in that space (e.g.
-    /// an image file has none in `Space::Text`).
+    /// `related`, as [`search::related_sources`] selects them: in the text
+    /// space, only chunks that carry content of their own, unless the
+    /// document has none. Empty when the document has no chunks in that
+    /// space (e.g. an image file has none in `Space::Text`).
     fn chunk_vectors(&self, path: &str, space: Space) -> Result<Vec<Vec<f32>>>;
 
     /// Raw wikilink target texts this document links out to (unresolved —

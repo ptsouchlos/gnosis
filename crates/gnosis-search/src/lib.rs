@@ -42,31 +42,156 @@ pub fn rank(query: &[f32], candidates: impl IntoIterator<Item = Candidate>, limi
     rank_by(|v| dot(query, v), candidates, &[], limit)
 }
 
-/// Like [`rank`], but scores each candidate against the best (max) cosine
-/// similarity across several query vectors instead of one — e.g. a
-/// document's own chunks, for `related`. `exclude_paths` is filtered before
-/// truncation to `limit`, not after, so an excluded document (e.g. the
-/// source itself) never displaces a genuinely eligible one.
-pub fn rank_multi(
+/// How many of a document pair's best chunk matches [`rank_related`] averages.
+///
+/// The best single match alone lets one coincidence decide a pair: on a
+/// templated vault, two notes' identical boilerplate sections. Averaging the
+/// best three asks that the pair agree in more than one place. Measured by
+/// link prediction on Obsidian's help vault (178 notes, 875 links): 3 beat
+/// 1, 2 and 5 (MRR 0.760 → 0.788 with boilerplate kept; see
+/// docs/gnosis/plugin-settings-redesign.md in the workspace).
+pub const RELATED_TOP_K: usize = 3;
+
+/// Characters of its own a chunk needs, once embeds, links and headings are
+/// stripped, to count as content for [`rank_related`].
+const MIN_CONTENT_CHARS: usize = 20;
+
+/// Whether a chunk carries nothing of its own: only embeds (`![[a.pdf]]`),
+/// wikilinks, markdown links and headings, with fewer than
+/// [`MIN_CONTENT_CHARS`] word characters left over.
+///
+/// Such a chunk is nearly the same in every note that has one — a template's
+/// `## Mind Map` / `![[<title>.pdf]]` section, say — so for `related` it is
+/// evidence of a shared template, not of a shared subject. On a vault of 221
+/// templated book notes it decided 98% of every note's related results.
+pub fn carries_no_content(text: &str) -> bool {
+    let mut own = 0usize;
+    for line in text.lines() {
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        let mut rest = line;
+        while !rest.is_empty() {
+            // `[[...]]` and `![[...]]`, then `[...](...)` and `![...](...)`.
+            let skip = if let Some(r) = rest.strip_prefix("![[").or_else(|| rest.strip_prefix("[["))
+            {
+                r.find("]]").map(|end| rest.len() - r.len() + end + 2)
+            } else if let Some(r) = rest.strip_prefix("![").or_else(|| rest.strip_prefix('[')) {
+                r.find("](").and_then(|mid| {
+                    r[mid..]
+                        .find(')')
+                        .map(|end| rest.len() - r.len() + mid + end + 1)
+                })
+            } else {
+                None
+            };
+            match skip {
+                Some(n) => rest = &rest[n..],
+                None => {
+                    let c = rest.chars().next().expect("rest is not empty");
+                    if c.is_alphanumeric() || c == '_' {
+                        own += 1;
+                        if own >= MIN_CONTENT_CHARS {
+                            return false;
+                        }
+                    }
+                    rest = &rest[c.len_utf8()..];
+                }
+            }
+        }
+    }
+    true
+}
+
+/// The chunks of a source document `related` compares from: its content
+/// chunks, or every chunk when it has nothing but embeds and links — such a
+/// note still deserves an answer, even if a weaker one.
+///
+/// `text_space` is false for the image space, whose chunks have no text by
+/// design and are all kept.
+pub fn related_sources(chunks: Vec<(Vec<f32>, String)>, text_space: bool) -> Vec<Vec<f32>> {
+    if text_space && chunks.iter().any(|(_, text)| !carries_no_content(text)) {
+        chunks
+            .into_iter()
+            .filter(|(_, text)| !carries_no_content(text))
+            .map(|(v, _)| v)
+            .collect()
+    } else {
+        chunks.into_iter().map(|(v, _)| v).collect()
+    }
+}
+
+/// Rank documents by how alike they are to a source document's chunks
+/// (`queries`), for `related`.
+///
+/// A pair of documents scores the mean of its [`RELATED_TOP_K`] best
+/// chunk-to-chunk similarities. In the text space (`text_space`), candidate
+/// chunks that carry no content of their own are skipped, so a document
+/// that is nothing but embeds is never offered as related. Each hit shows
+/// its best-matching chunk. `exclude_paths` is filtered before truncation to
+/// `limit`, so an excluded document never displaces an eligible one.
+pub fn rank_related(
     queries: &[Vec<f32>],
     candidates: impl IntoIterator<Item = Candidate>,
     exclude_paths: &[String],
     limit: usize,
+    text_space: bool,
 ) -> Vec<Hit> {
-    rank_by(
-        |v| {
-            queries
-                .iter()
-                .map(|q| dot(q, v))
-                .fold(f32::NEG_INFINITY, f32::max)
-        },
-        candidates,
-        exclude_paths,
-        limit,
-    )
+    // Per document: its hit (best chunk), and its best pair scores so far.
+    let mut docs: HashMap<String, (Hit, Vec<f32>)> = HashMap::new();
+    for c in candidates {
+        if exclude_paths.iter().any(|p| p == &c.path) || (text_space && carries_no_content(&c.text))
+        {
+            continue;
+        }
+        let (hit, best) = docs.entry(c.path.clone()).or_insert_with(|| {
+            (
+                Hit {
+                    path: c.path.clone(),
+                    title: c.title.clone(),
+                    source_root: c.source_root.clone(),
+                    heading_path: String::new(),
+                    text: String::new(),
+                    score: f32::NEG_INFINITY,
+                    width: None,
+                    height: None,
+                },
+                Vec::with_capacity(RELATED_TOP_K + 1),
+            )
+        });
+        let mut chunk_best = f32::NEG_INFINITY;
+        for q in queries {
+            let score = dot(q, &c.vector);
+            chunk_best = chunk_best.max(score);
+            // Keep the top K, descending; K is tiny, so insertion is cheapest.
+            let at = best.partition_point(|&b| b >= score);
+            if at < RELATED_TOP_K {
+                best.insert(at, score);
+                best.truncate(RELATED_TOP_K);
+            }
+        }
+        if chunk_best > hit.score {
+            hit.score = chunk_best;
+            hit.heading_path = c.heading_path;
+            hit.text = c.text;
+            hit.width = c.width;
+            hit.height = c.height;
+        }
+    }
+
+    let mut hits: Vec<Hit> = docs
+        .into_values()
+        .map(|(mut hit, best)| {
+            hit.score = best.iter().sum::<f32>() / best.len() as f32;
+            hit
+        })
+        .collect();
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+    hits.truncate(limit);
+    hits
 }
 
-/// Shared aggregation for [`rank`]/[`rank_multi`]: score each candidate with
+/// Shared aggregation for [`rank`]: score each candidate with
 /// `score_fn`, keep the best-scoring chunk per document path (excluding
 /// `exclude_paths`), and return the top `limit` sorted descending by score.
 fn rank_by(
@@ -276,6 +401,173 @@ mod tests {
             height: None,
             modality: "text".to_string(),
         }
+    }
+
+    #[test]
+    fn embeds_links_and_headings_carry_no_content() {
+        assert!(carries_no_content("![[Tiny Habits.pdf]]"));
+        assert!(carries_no_content("## Mind Map\n![[Tiny Habits.pdf]]"));
+        assert!(carries_no_content(
+            "- [[Atomic Habits]]\n- [[The Power of Habit|Power]]"
+        ));
+        assert!(carries_no_content(
+            "![cover](Media/cover.jpg) [site](https://example.com/a)"
+        ));
+        assert!(carries_no_content(""));
+        assert!(!carries_no_content(
+            "Habits are formed through a loop of cue, routine and reward."
+        ));
+        // Word characters in any script count, not just ASCII.
+        assert!(!carries_no_content(
+            "Ο Σωκράτης έλεγε ότι η γνώση είναι αρετή"
+        ));
+        // An embed beside a sentence of its own is content.
+        assert!(!carries_no_content(
+            "![[diagram.png]] The loop closes when the reward is felt."
+        ));
+    }
+
+    #[test]
+    fn a_source_with_nothing_but_embeds_still_compares_from_them() {
+        let content = (
+            vec![1.0],
+            "A paragraph about the habit loop and its reward.".to_string(),
+        );
+        let embed = (vec![0.5], "![[x.pdf]]".to_string());
+        assert_eq!(
+            related_sources(vec![content.clone(), embed.clone()], true),
+            vec![vec![1.0]]
+        );
+        assert_eq!(
+            related_sources(vec![embed.clone()], true),
+            vec![vec![0.5]],
+            "falls back to all"
+        );
+        assert_eq!(
+            related_sources(vec![content, embed], false).len(),
+            2,
+            "the image space keeps all"
+        );
+    }
+
+    /// The case `related` was changed for: one coincidental match used to
+    /// decide a pair; now it takes agreement in several places.
+    #[test]
+    fn related_prefers_agreement_in_several_places_over_one_perfect_match() {
+        let queries = vec![
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![
+                std::f32::consts::FRAC_1_SQRT_2,
+                std::f32::consts::FRAC_1_SQRT_2,
+            ],
+        ];
+        let one_perfect = vec![
+            candidate(
+                "one.md",
+                "",
+                "A chunk that matches one source chunk exactly.",
+                vec![1.0, 0.0],
+            ),
+            candidate(
+                "one.md",
+                "",
+                "A chunk that matches nothing in the source.",
+                vec![-1.0, 0.0],
+            ),
+        ];
+        let broadly_alike = vec![
+            candidate(
+                "broad.md",
+                "",
+                "A chunk that is close to all of the source.",
+                vec![0.8, 0.6],
+            ),
+            candidate(
+                "broad.md",
+                "",
+                "Another chunk close to all of the source.",
+                vec![0.6, 0.8],
+            ),
+        ];
+        let hits = rank_related(
+            &queries,
+            one_perfect.into_iter().chain(broadly_alike),
+            &[],
+            10,
+            true,
+        );
+        assert_eq!(hits[0].path, "broad.md", "{hits:?}");
+        // Today's single best pair would have put `one.md` first (1.0 vs 0.99).
+        assert!(hits[0].score > hits[1].score);
+    }
+
+    #[test]
+    fn related_skips_boilerplate_candidates_in_the_text_space_only() {
+        let queries = vec![vec![1.0, 0.0]];
+        let make = || {
+            vec![
+                candidate(
+                    "template.md",
+                    "Mind Map",
+                    "![[template.pdf]]",
+                    vec![1.0, 0.0],
+                ),
+                candidate(
+                    "real.md",
+                    "",
+                    "A passage about the same subject as the source.",
+                    vec![0.6, 0.8],
+                ),
+            ]
+        };
+        let text = rank_related(&queries, make(), &[], 10, true);
+        assert_eq!(
+            text.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+            ["real.md"]
+        );
+        let image = rank_related(&queries, make(), &[], 10, false);
+        assert_eq!(
+            image[0].path, "template.md",
+            "image chunks have no text by design"
+        );
+    }
+
+    #[test]
+    fn related_excludes_before_truncating_and_shows_the_best_chunk() {
+        let queries = vec![vec![1.0, 0.0]];
+        let candidates = vec![
+            candidate(
+                "source.md",
+                "",
+                "The source note itself, which is never related.",
+                vec![1.0, 0.0],
+            ),
+            candidate(
+                "a.md",
+                "Weak",
+                "A weaker passage of the related note here.",
+                vec![0.6, 0.8],
+            ),
+            candidate(
+                "a.md",
+                "Strong",
+                "The strongest passage of the related note here.",
+                vec![0.9, 0.436],
+            ),
+            candidate(
+                "b.md",
+                "",
+                "Some other note that is barely related at all.",
+                vec![0.1, 0.995],
+            ),
+        ];
+        let hits = rank_related(&queries, candidates, &["source.md".to_string()], 1, true);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "a.md");
+        assert_eq!(hits[0].heading_path, "Strong");
+        // The mean of a.md's two pairs, not its best one.
+        assert!((hits[0].score - 0.75).abs() < 1e-6, "{}", hits[0].score);
     }
 
     #[test]
