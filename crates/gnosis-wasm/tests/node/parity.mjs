@@ -66,6 +66,13 @@ const run = (c) => {
       return index.lexicalSearch(c.query, c.limit, undefined);
     case "related":
       return index.related(c.path, c.limit, c.includeLinked, undefined);
+    case "similarities":
+      // Flattened to hits, in row order, so the comparison below applies.
+      return index.similarities(c.paths).flatMap((row, i) =>
+        row.flatMap((score, j) =>
+          score === null ? [] : [{ path: `${c.paths[i]} -> ${c.paths[j]}`, score }],
+        ),
+      );
     default:
       throw new Error(`unknown case kind '${c.kind}'`);
   }

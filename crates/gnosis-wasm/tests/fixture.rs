@@ -51,6 +51,11 @@ enum Case {
         include_linked: bool,
         expected: Vec<Ranked>,
     },
+    /// Every scored pair among `paths`, as `"<from> -> <to>"`, in row order.
+    Similarities {
+        paths: Vec<String>,
+        expected: Vec<Ranked>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -76,6 +81,22 @@ fn ranked(hits: Vec<search::Hit>) -> Vec<Ranked> {
             score: h.score,
         })
         .collect()
+}
+
+/// A pair-score matrix flattened the way `parity.mjs` flattens it.
+fn pairs(paths: &[String], matrix: &[Vec<Option<f32>>]) -> Vec<Ranked> {
+    let mut out = Vec::new();
+    for (i, row) in matrix.iter().enumerate() {
+        for (j, score) in row.iter().enumerate() {
+            if let Some(score) = score {
+                out.push(Ranked {
+                    path: format!("{} -> {}", paths[i], paths[j]),
+                    score: *score,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// A single supplied vector, standing in for an embedder.
@@ -234,6 +255,19 @@ fn write_the_parity_fixture() {
             limit: 10,
             include_linked: false,
             expected: ranked(hits),
+        });
+    }
+
+    // Pair scores among a spread of documents, the shape a related-notes map
+    // asks for. Pairs `related` would never list are left out on both sides.
+    if spaces.contains(&Space::Text) {
+        let sample: Vec<String> = paths.iter().step_by(doc_stride).take(20).cloned().collect();
+        let matrix = store
+            .related_similarities(&sample, Space::Text)
+            .expect("similarities");
+        cases.push(Case::Similarities {
+            expected: pairs(&sample, &matrix),
+            paths: sample,
         });
     }
 

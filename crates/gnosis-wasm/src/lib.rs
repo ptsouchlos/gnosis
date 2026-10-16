@@ -264,6 +264,41 @@ impl Index {
         to_js(&hits)
     }
 
+    /// How related each of `paths` is to each other: a square array where row
+    /// `i`, column `j` is the text-space score `related(paths[i])` ranks
+    /// `paths[j]` by, or `null` on the diagonal and for a pair `related` would
+    /// never list.
+    ///
+    /// For placing related notes relative to each other, which one `related`
+    /// list cannot say. Calling `related` once per note instead costs a scan
+    /// of every chunk per note — measured at ~0.5 s for 20 notes over 4,199
+    /// chunks — and still misses most pairs past its limit. This reads only
+    /// the listed notes' own chunks.
+    ///
+    /// Text space only, and raw: on an artifact with more than one space,
+    /// `related` normalizes each space against its own result list before
+    /// merging, so its numbers are not these. A pair scored on its own has no
+    /// list to normalize against. On a text-only artifact they are the same
+    /// numbers.
+    pub fn similarities(&self, paths: Vec<String>) -> Result<JsValue, JsError> {
+        if self
+            .store
+            .artifact()
+            .manifest()
+            .space(Space::Text)
+            .is_none()
+        {
+            return Err(JsError::new(
+                "this index has no text space to compare notes in",
+            ));
+        }
+        let matrix = self
+            .store
+            .related_similarities(&paths, Space::Text)
+            .map_err(anyhow_err)?;
+        to_js(&matrix)
+    }
+
     /// What this artifact is: its models, their pooling and prefixes, its dimensions,
     /// how much it holds and when it was built.
     pub fn info(&self) -> Result<JsValue, JsError> {

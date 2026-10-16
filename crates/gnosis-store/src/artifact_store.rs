@@ -198,6 +198,74 @@ impl ArtifactStore {
         })
     }
 
+    /// How related each of `paths` is to each other, in `space`: row `i`,
+    /// column `j` is the score `related(paths[i])` ranks `paths[j]` by in that
+    /// space, from [`search::related_pair_score`] (before `related` merges
+    /// spaces, which normalizes).
+    ///
+    /// For a client placing related notes relative to each other. `related`
+    /// alone cannot say that without one call per note, each over every chunk
+    /// in the artifact; this reads only the listed documents' chunks. The
+    /// diagonal is `None` (a note is never related to itself), and so is a
+    /// pair `related` would never list (a document of only embeds and links,
+    /// or one with no chunks in `space`). Rows need not equal columns: a
+    /// source of only embeds still compares from them.
+    pub fn related_similarities(
+        &self,
+        paths: &[String],
+        space: Space,
+    ) -> Result<Vec<Vec<Option<f32>>>> {
+        let mut chunks: Vec<Vec<&ArtifactChunk>> = vec![Vec::new(); paths.len()];
+        let mut found = vec![false; paths.len()];
+        for (doc_index, doc) in self.artifact.documents().iter().enumerate() {
+            for (i, path) in paths.iter().enumerate() {
+                if &doc.path == path {
+                    found[i] = true;
+                    chunks[i].extend(
+                        self.artifact
+                            .chunks()
+                            .iter()
+                            .filter(|c| c.doc_index == doc_index && c.space == space),
+                    );
+                }
+            }
+        }
+        if let Some(missing) = found.iter().position(|f| !f) {
+            bail!("{} is not indexed — run `gnosis index`", paths[missing]);
+        }
+
+        let text_space = space == Space::Text;
+        let sources: Vec<Vec<Vec<f32>>> = chunks
+            .iter()
+            .map(|doc| {
+                search::related_sources(
+                    doc.iter()
+                        .map(|c| (c.vector.clone(), c.text.clone()))
+                        .collect(),
+                    text_space,
+                )
+            })
+            .collect();
+        Ok((0..paths.len())
+            .map(|i| {
+                (0..paths.len())
+                    .map(|j| {
+                        if i == j || sources[i].is_empty() {
+                            return None;
+                        }
+                        search::related_pair_score(
+                            &sources[i],
+                            chunks[j]
+                                .iter()
+                                .map(|c| (c.vector.as_slice(), c.text.as_str())),
+                            text_space,
+                        )
+                    })
+                    .collect()
+            })
+            .collect())
+    }
+
     fn candidates(
         &self,
         space: Space,
