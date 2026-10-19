@@ -125,6 +125,7 @@ pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
     let filter = TextQuery {
         from: from_ref,
         tags: tags_ref,
+        paths: None,
     };
 
     let mut embedders = QueryEmbedders::new(ws);

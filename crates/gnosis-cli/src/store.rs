@@ -552,6 +552,12 @@ impl SqliteStore {
                 in_placeholders(tags.len())
             ));
         }
+        if let Some(paths) = filter.paths {
+            if paths.is_empty() {
+                return Ok(Vec::new());
+            }
+            sql.push_str(&format!(" AND d.path IN ({})", in_placeholders(paths.len())));
+        }
 
         let mut stmt = self.conn.prepare(&sql)?;
         let map_row = space_candidate_row_mapper();
@@ -559,6 +565,7 @@ impl SqliteStore {
         params.extend(modality.map(str::to_string));
         params.extend(roots.into_iter().flatten().cloned());
         params.extend(tags.into_iter().flatten().cloned());
+        params.extend(filter.paths.into_iter().flatten().cloned());
         let candidates: Vec<Candidate> = stmt
             .query_map(rusqlite::params_from_iter(params), map_row)?
             .collect::<rusqlite::Result<_>>()?;
@@ -594,6 +601,7 @@ impl SqliteStore {
             let allowed = self.paths_with_any_tag(tags)?;
             candidates.retain(|c| allowed.contains(&c.path));
         }
+        candidates.retain(|c| filter.allows_path(&c.path));
         Ok(candidates)
     }
 
@@ -993,6 +1001,16 @@ impl Store for SqliteStore {
                 in_placeholders(tags.len())
             ));
         }
+        if let Some(paths) = filter.paths {
+            if paths.is_empty() {
+                return Ok(store::LexicalMatches {
+                    stats,
+                    doc_freqs,
+                    candidates: Vec::new(),
+                });
+            }
+            sql.push_str(&format!(" AND d.path IN ({})", in_placeholders(paths.len())));
+        }
         // FTS5's own bm25() only orders the candidate set here; BM25+ does the
         // real scoring. Ordering by it means a truncated set keeps the most
         // promising rows rather than an arbitrary slice.
@@ -1001,6 +1019,7 @@ impl Store for SqliteStore {
         let mut params: Vec<String> = vec![match_expr];
         params.extend(roots.into_iter().flatten().cloned());
         params.extend(tags.into_iter().flatten().cloned());
+        params.extend(filter.paths.into_iter().flatten().cloned());
         params.push(limit.to_string());
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -1026,6 +1045,12 @@ impl Store for SqliteStore {
             limit
         };
         let modality = search_modality(space);
+        // A search over named documents scores exactly those: the ANN index
+        // could rank them all past `k`, and there are few enough to read.
+        if filter.paths.is_some() {
+            let candidates = self.space_candidates(space, Some(modality), filter)?;
+            return Ok(search::rank(query, candidates, limit));
+        }
         let queries = [query.to_vec()];
         let candidates = match self.ann_ids(space, modality, &queries, k)? {
             Some(ids) => {
@@ -1490,6 +1515,38 @@ mod tests {
         assert_eq!(hits[0].width, Some(800));
         assert_eq!(hits[0].height, Some(600));
 
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Named documents are scored whatever the ANN index would rank: the
+    /// one named here is the worst match, and is the only one returned.
+    #[test]
+    fn search_space_scores_exactly_the_named_documents() {
+        let (mut store, path) = temp_store();
+        for (name, vector) in [("near", vec![1.0, 0.0]), ("far", vec![0.0, 1.0])] {
+            write_full_doc(
+                &mut store,
+                &format!("/vault/{name}.md"),
+                "markdown",
+                &[chunk("text", "text", Some(name), vector)],
+                None,
+                None,
+            );
+        }
+        let far = vec!["/vault/far.md".to_string()];
+        let named = TextQuery {
+            paths: Some(&far),
+            ..TextQuery::default()
+        };
+        let hits = store.search_space(Space::Text, &[1.0, 0.0], 1, &named).unwrap();
+        assert_eq!(hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(), vec!["/vault/far.md"]);
+
+        let none: Vec<String> = Vec::new();
+        let nothing = TextQuery {
+            paths: Some(&none),
+            ..TextQuery::default()
+        };
+        assert!(store.search_space(Space::Text, &[1.0, 0.0], 10, &nothing).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&path);
     }
 
@@ -2165,6 +2222,7 @@ mod tests {
                 &TextQuery {
                     from: Some(&roots),
                     tags: None,
+                    paths: None,
                 },
             )
             .unwrap();

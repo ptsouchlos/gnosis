@@ -122,6 +122,7 @@ pub fn execute(ws: &Workspace, args: EvalArgs) -> Result<()> {
     let filter = TextQuery {
         from: None,
         tags: None,
+        paths: None,
     };
 
     let mut per_query: Vec<QueryScore> = Vec::with_capacity(qrels.queries.len());

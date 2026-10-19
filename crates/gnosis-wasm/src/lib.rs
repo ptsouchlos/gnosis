@@ -56,6 +56,7 @@ impl Filter {
         TextQuery {
             from: (!self.from.is_empty()).then_some(self.from.as_slice()),
             tags: (!self.tags.is_empty()).then_some(self.tags.as_slice()),
+            paths: None,
         }
     }
 }

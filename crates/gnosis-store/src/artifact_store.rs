@@ -178,7 +178,7 @@ impl ArtifactStore {
         {
             return false;
         }
-        true
+        filter.allows_path(&doc.path)
     }
 
     fn candidate(&self, chunk: &ArtifactChunk) -> Option<search::Candidate> {

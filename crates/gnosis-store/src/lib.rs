@@ -132,6 +132,17 @@ pub struct TextQuery<'a> {
     /// Restrict to documents having any of these tags. Empty/absent = no
     /// restriction.
     pub tags: Option<&'a [String]>,
+    /// Restrict to exactly these document paths, as hits report them. Unlike
+    /// the other fields, an empty list matches nothing: it names documents
+    /// rather than narrowing a corpus, and none named means none wanted.
+    pub paths: Option<&'a [String]>,
+}
+
+impl TextQuery<'_> {
+    /// Whether `path` survives the `paths` restriction.
+    pub fn allows_path(&self, path: &str) -> bool {
+        self.paths.is_none_or(|paths| paths.iter().any(|p| p == path))
+    }
 }
 
 /// Everything the lexical channel needs to score one query.
