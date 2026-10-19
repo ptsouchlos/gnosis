@@ -423,6 +423,62 @@ fn build(builder: &mut Builder) -> JsValue {
     builder.finish(1_700_000_400.0).expect("finish")
 }
 
+/// `contentHash` is the hash `addDocument` recorded, so a client that sends
+/// it gets an exact answer. An mtime alone calls a touched-but-unedited note
+/// changed, which is why the hash is worth sending.
+#[wasm_bindgen_test]
+fn content_hash_matches_what_the_builder_recorded() {
+    let mut builder = Builder::create(spec()).expect("create");
+    let built = build(&mut builder);
+    let manifest = json(built.clone())["manifest"]
+        .as_str()
+        .expect("manifest")
+        .to_string();
+    let shards =
+        Map::from(js_sys::Reflect::get(&built, &JsValue::from_str("shards")).expect("shards"));
+    let index = Index::open(&manifest, &shards).expect("open");
+
+    // Both notes touched a day after the build, one of them also edited.
+    let touched = 1_700_086_400_i64;
+    let (edited_path, edited_text) = NOTES[0];
+    let (untouched_path, untouched_text) = NOTES[1];
+    let entries = serde_json::json!([
+        { "path": edited_path, "mtime": touched,
+          "hash": gnosis_wasm::builder::content_hash(&format!("{edited_text}More.\n")) },
+        { "path": untouched_path, "mtime": touched,
+          "hash": gnosis_wasm::builder::content_hash(untouched_text) },
+    ]);
+    let report = json(
+        index
+            .staleness(js_sys::JSON::parse(&entries.to_string()).expect("entries"))
+            .expect("staleness"),
+    );
+    assert_eq!(
+        report["changed"],
+        serde_json::json!([edited_path]),
+        "{report}"
+    );
+    assert_eq!(
+        report["unchanged"], 1,
+        "the touched note's content is the same: {report}"
+    );
+
+    let by_mtime = serde_json::json!([
+        { "path": edited_path, "mtime": touched },
+        { "path": untouched_path, "mtime": touched },
+    ]);
+    let report = json(
+        index
+            .staleness(js_sys::JSON::parse(&by_mtime.to_string()).expect("entries"))
+            .expect("staleness"),
+    );
+    assert_eq!(
+        report["changed"].as_array().map(Vec::len),
+        Some(2),
+        "by mtime alone, touching is indistinguishable from editing: {report}"
+    );
+}
+
 /// The whole point of the builder: what it writes, `Index` can open and
 /// search. Both halves of the client's side of the boundary, meeting.
 #[wasm_bindgen_test]
