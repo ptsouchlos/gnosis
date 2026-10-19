@@ -32,6 +32,22 @@ pub struct Hit {
     pub score: f32,
     pub width: Option<i64>,
     pub height: Option<i64>,
+    /// What `score` is made of, within this hit's own space.
+    pub parts: ScoreParts,
+}
+
+/// A hit's score, by where it came from: the three add up to `score`.
+///
+/// Contributions, not raw channel scores: `meaning` is the dense score times
+/// its fusion weight, `keywords` the lexical score times its own, and `title`
+/// the bonus as added. So a reader can see why a note ranks where it does, in
+/// the same units as the score. A merge across spaces (`merge_normalized`)
+/// rescales `score` and leaves these as they were in their space.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
+pub struct ScoreParts {
+    pub meaning: f32,
+    pub keywords: f32,
+    pub title: f32,
 }
 
 /// Score `candidates` against `query` by cosine similarity (vectors are
@@ -155,6 +171,7 @@ pub fn rank_related(
                     score: f32::NEG_INFINITY,
                     width: None,
                     height: None,
+                    parts: Default::default(),
                 },
                 BestMatches::default(),
             )
@@ -260,9 +277,15 @@ fn rank_by(
             score: f32::NEG_INFINITY,
             width: None,
             height: None,
+            parts: Default::default(),
         });
         if score > entry.score {
             entry.score = score;
+            // All of it is meaning until fusion, if any, divides it.
+            entry.parts = ScoreParts {
+                meaning: score,
+                ..ScoreParts::default()
+            };
             entry.heading_path = c.heading_path;
             entry.text = c.text;
             entry.width = c.width;
@@ -327,6 +350,12 @@ pub fn fuse_hits(
         .into_values()
         .map(|(mut hit, dense_score, lexical_score)| {
             hit.score = bm25::fuse(dense_score, lexical_score, cfg.dense_weight);
+            let alpha = cfg.dense_weight.clamp(0.0, 1.0);
+            hit.parts = ScoreParts {
+                meaning: alpha * dense_score,
+                keywords: (1.0 - alpha) * lexical_score,
+                title: 0.0,
+            };
             hit
         })
         .collect();
@@ -361,6 +390,7 @@ pub fn boost_and_rank(
             let matched = bm25::title_match(query_terms, &hit.title)
                 .max(bm25::title_match(query_terms, file_name_title(&hit.path)));
             hit.score += title_boost * matched;
+            hit.parts.title = title_boost * matched;
         }
     }
     hits.sort_by(best_first);
@@ -756,10 +786,10 @@ mod tests {
         let hits = vec![
             Hit { path: "a.md".into(), title: "a".into(), source_root: "/r".into(),
                   heading_path: String::new(), text: String::new(), score: 0.42,
-                  width: None, height: None },
+                  width: None, height: None, parts: Default::default() },
             Hit { path: "b.md".into(), title: "b".into(), source_root: "/r".into(),
                   heading_path: String::new(), text: String::new(), score: 0.10,
-                  width: None, height: None },
+                  width: None, height: None, parts: Default::default() },
         ];
         let merged = merge_normalized(vec![hits], 10);
         assert_eq!(merged[0].score, 0.42);
@@ -771,18 +801,18 @@ mod tests {
         let text_hits = vec![
             Hit { path: "a.md".into(), title: "a".into(), source_root: "/r".into(),
                   heading_path: String::new(), text: String::new(), score: 0.80,
-                  width: None, height: None },
+                  width: None, height: None, parts: Default::default() },
             Hit { path: "b.md".into(), title: "b".into(), source_root: "/r".into(),
                   heading_path: String::new(), text: String::new(), score: 0.40,
-                  width: None, height: None },
+                  width: None, height: None, parts: Default::default() },
         ];
         let image_hits = vec![
             Hit { path: "c.png".into(), title: "c".into(), source_root: "/r".into(),
                   heading_path: String::new(), text: String::new(), score: 0.30,
-                  width: Some(10), height: Some(10) },
+                  width: Some(10), height: Some(10), parts: Default::default() },
             Hit { path: "d.png".into(), title: "d".into(), source_root: "/r".into(),
                   heading_path: String::new(), text: String::new(), score: 0.10,
-                  width: Some(20), height: Some(20) },
+                  width: Some(20), height: Some(20), parts: Default::default() },
         ];
         let merged = merge_normalized(vec![text_hits, image_hits], 10);
         // Each space's best hit normalizes to 1.0, worst to 0.0 — so the top
@@ -799,11 +829,11 @@ mod tests {
         let hits = (0..5)
             .map(|i| Hit { path: format!("{i}.md"), title: "t".into(), source_root: "/r".into(),
                            heading_path: String::new(), text: String::new(), score: i as f32,
-                           width: None, height: None })
+                           width: None, height: None, parts: Default::default() })
             .collect();
         let other = vec![Hit { path: "x.png".into(), title: "x".into(), source_root: "/r".into(),
                                 heading_path: String::new(), text: String::new(), score: 1.0,
-                                width: None, height: None }];
+                                width: None, height: None, parts: Default::default() }];
         assert_eq!(merge_normalized(vec![hits, other], 2).len(), 2);
     }
 
@@ -816,18 +846,18 @@ mod tests {
         let text_hits = vec![
             Hit { path: "note.md".into(), title: "note".into(), source_root: "/r".into(),
                   heading_path: String::new(), text: String::new(), score: 0.90,
-                  width: None, height: None },
+                  width: None, height: None, parts: Default::default() },
             Hit { path: "other.md".into(), title: "other".into(), source_root: "/r".into(),
                   heading_path: String::new(), text: String::new(), score: 0.10,
-                  width: None, height: None },
+                  width: None, height: None, parts: Default::default() },
         ];
         let image_hits = vec![
             Hit { path: "note.md".into(), title: "note".into(), source_root: "/r".into(),
                   heading_path: String::new(), text: String::new(), score: 0.20,
-                  width: None, height: None },
+                  width: None, height: None, parts: Default::default() },
             Hit { path: "img.png".into(), title: "img".into(), source_root: "/r".into(),
                   heading_path: String::new(), text: String::new(), score: 0.05,
-                  width: Some(1), height: Some(1) },
+                  width: Some(1), height: Some(1), parts: Default::default() },
         ];
         let merged = merge_normalized(vec![text_hits, image_hits], 10);
         let note_hits: Vec<&Hit> = merged.iter().filter(|h| h.path == "note.md").collect();
@@ -858,6 +888,7 @@ mod tests {
             score,
             width: None,
             height: None,
+            parts: Default::default(),
         }
     }
 
@@ -1035,6 +1066,46 @@ mod tests {
     fn an_empty_query_gets_no_title_boost() {
         let got = fuse_hits(vec![titled("a.md", "HNSW", 0.5)], vec![], &[], &tcfg(1.0, 0.5), 10);
         assert!((got[0].score - 0.5).abs() < 1e-6);
+    }
+
+    /// The parts say why a hit scored what it did, in the score's own units,
+    /// so they must add up to it.
+    #[test]
+    fn a_fused_hit_s_parts_add_up_to_its_score() {
+        let got = fuse_hits(
+            vec![titled("a.md", "HNSW", 0.8)],
+            vec![titled("a.md", "HNSW", 0.5)],
+            &bm25::tokenize("hnsw"),
+            &tcfg(0.9, 0.1),
+            10,
+        );
+        let parts = got[0].parts;
+        assert!((parts.meaning - 0.72).abs() < 1e-6, "{parts:?}");
+        assert!((parts.keywords - 0.05).abs() < 1e-6, "{parts:?}");
+        assert!((parts.title - 0.1).abs() < 1e-6, "{parts:?}");
+        assert!((parts.meaning + parts.keywords + parts.title - got[0].score).abs() < 1e-6);
+    }
+
+    /// With no lexical channel, the whole score before the bonus is meaning.
+    #[test]
+    fn a_dense_only_hit_s_score_is_all_meaning() {
+        let candidates = vec![Candidate {
+            path: "a.md".into(),
+            title: "a".into(),
+            source_root: "/r".into(),
+            heading_path: String::new(),
+            text: String::new(),
+            vector: vec![0.6, 0.8],
+            width: None,
+            height: None,
+            modality: "text".into(),
+        }];
+        let ranked = rank(&[1.0, 0.0], candidates, 10);
+        let got = boost_and_rank(ranked, &bm25::tokenize("a"), 0.1, 10);
+        assert!((got[0].parts.meaning - 0.6).abs() < 1e-6, "{:?}", got[0].parts);
+        assert_eq!(got[0].parts.keywords, 0.0);
+        assert!((got[0].parts.title - 0.1).abs() < 1e-6, "the file name a.md matches");
+        assert!((got[0].parts.meaning + got[0].parts.title - got[0].score).abs() < 1e-6);
     }
 
     /// A vault made from a template: every note opens with the same H1, so
