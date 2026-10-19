@@ -16,6 +16,15 @@ use wasm_bindgen::prelude::*;
 
 use crate::{anyhow_err, from_js, js_err, to_js};
 
+/// The content hash `addDocument` records for `text`, for `Index.staleness`.
+///
+/// A client that sends a hash gets an exact answer, where an mtime moves
+/// whenever a syncer or another plugin rewrites a file unchanged.
+#[wasm_bindgen(js_name = contentHash)]
+pub fn content_hash(text: &str) -> String {
+    index::builder::content_hash(text)
+}
+
 /// What `addDocument` tells the client to do next.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

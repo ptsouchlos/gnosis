@@ -120,6 +120,14 @@ pub struct Built {
     pub chunks: usize,
 }
 
+/// The content hash a document's entry records: blake3 of its text, hex.
+///
+/// Public so a client checking staleness compares against exactly what the
+/// builder stored, rather than a second implementation of it.
+pub fn content_hash(text: &str) -> String {
+    blake3::hash(text.as_bytes()).to_hex().to_string()
+}
+
 /// One document on its way into the artifact.
 struct Pending {
     entry: DocumentEntry,
@@ -197,7 +205,7 @@ impl ArtifactBuilder {
     ///
     /// `mtime` is in seconds, as the artifact records it.
     pub fn add_document(&mut self, path: &str, text: &str, mtime: i64) -> Added {
-        let hash = blake3::hash(text.as_bytes()).to_hex().to_string();
+        let hash = content_hash(text);
 
         if let Some(pending) = self.reuse(path, &hash) {
             self.documents.insert(path.to_string(), pending);
