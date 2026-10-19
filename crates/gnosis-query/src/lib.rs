@@ -58,11 +58,14 @@ pub fn run_query(
     let mut per_space: Vec<Vec<search::Hit>> = Vec::with_capacity(spaces.len());
     for space in spaces.iter().copied() {
         let query_vec = embedder.embed_query(space, query)?;
-        let dense = store.search_space(space, &query_vec, limit, filter)?;
+        let mut dense = store.search_space(space, &query_vec, limit, filter)?;
 
         // Lexical matching applies to the text space only: image chunks carry
         // no text, and title proxies exist for `related` to traverse.
         if space == Space::Text {
+            if cfg.title_boost != 0.0 {
+                dense = with_named(store, &query_vec, query, dense, limit, filter)?;
+            }
             // The title bonus is independent of the lexical channel, so it is
             // applied either way — `fuse_text_space` does it as part of fusing,
             // and the dense-only path does it here.
@@ -78,6 +81,55 @@ pub fn run_query(
         }
     }
     Ok(search::merge_normalized(per_space, limit))
+}
+
+/// Add the notes whose file name carries every query term to the dense
+/// candidates, scored by their own best chunk, so the title bonus can reach
+/// them.
+///
+/// The bonus only re-ranks what a channel retrieved, and a note can be named
+/// by a query without either channel finding it: "Who Not How" is all
+/// stopword-like terms, and a book note's chunks rarely repeat its name.
+/// Every term rather than some, because one shared word names half a vault;
+/// half the terms was measured too and was never better.
+fn with_named(
+    store: &dyn Store,
+    query_vec: &[f32],
+    query: &str,
+    mut dense: Vec<search::Hit>,
+    limit: usize,
+    filter: &TextQuery,
+) -> Result<Vec<search::Hit>> {
+    let terms = search::bm25::tokenize(query);
+    if terms.is_empty() {
+        return Ok(dense);
+    }
+    let mut paths: Vec<String> = store
+        .all_document_meta()?
+        .into_iter()
+        .map(|(path, _)| path)
+        .filter(|path| search::bm25::title_match(&terms, search::file_name_title(path)) >= 1.0)
+        .collect();
+    if paths.is_empty() {
+        return Ok(dense);
+    }
+    // In path order, so which ones survive the cap does not depend on how the
+    // store happened to list them.
+    paths.sort();
+    paths.truncate(limit);
+    let scoped = TextQuery {
+        from: filter.from,
+        tags: filter.tags,
+        paths: Some(&paths),
+    };
+    for hit in store.search_space(Space::Text, query_vec, limit, &scoped)? {
+        match dense.iter_mut().find(|d| d.path == hit.path) {
+            Some(existing) if existing.score >= hit.score => {}
+            Some(existing) => *existing = hit,
+            None => dense.push(hit),
+        }
+    }
+    Ok(dense)
 }
 
 /// Score the lexical channel for `query` and fuse it with the dense ranking.
@@ -306,14 +358,22 @@ mod tests {
     }
 
     impl Store for FakeStore {
+        /// `dense` is the whole corpus in rank order; `limit` cuts it, as an
+        /// ANN search would, unless the filter names documents.
         fn search_space(
             &self,
             _space: Space,
             _query: &[f32],
             limit: usize,
-            _filter: &TextQuery,
+            filter: &TextQuery,
         ) -> anyhow::Result<Vec<search::Hit>> {
-            Ok(self.dense.iter().take(limit).cloned().collect())
+            Ok(self
+                .dense
+                .iter()
+                .filter(|h| filter.allows_path(&h.path))
+                .take(limit)
+                .cloned()
+                .collect())
         }
 
         fn lexical_candidates(
@@ -365,7 +425,10 @@ mod tests {
             Ok(self.related().links.clone())
         }
         fn all_document_meta(&self) -> anyhow::Result<Vec<(String, Option<String>)>> {
-            Ok(self.related().meta.clone())
+            Ok(match &self.related {
+                Some(related) => related.meta.clone(),
+                None => self.dense.iter().map(|h| (h.path.clone(), None)).collect(),
+            })
         }
         fn related_space(
             &self,
@@ -462,6 +525,63 @@ mod tests {
             hits[0].path, "beta.md",
             "the title match must outrank an equal-scoring non-match"
         );
+    }
+
+    /// Four notes, the one named by the query ranked last by meaning, and a
+    /// result set of three: the dense cut alone would drop it.
+    fn named_store() -> FakeStore {
+        store(
+            vec![
+                hit("Notes/Deep Work.md", 0.9),
+                hit("Notes/Atomic Habits.md", 0.85),
+                hit("Notes/Make Time.md", 0.8),
+                hit("Notes/Who Not How.md", 0.75),
+            ],
+            Vec::new(),
+        )
+    }
+
+    fn search_named(s: &FakeStore, query: &str, cfg: &SearchConfig) -> Vec<String> {
+        run_query(
+            s,
+            &mut FixedVector(vec![1.0, 0.0]),
+            query,
+            &[Space::Text],
+            3,
+            &TextQuery::default(),
+            cfg,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|h| h.path)
+        .collect()
+    }
+
+    /// A note whose file name carries the whole query is a candidate on that
+    /// alone, scored by its own chunks, so the title bonus can reach it.
+    #[test]
+    fn a_note_named_by_the_query_is_a_candidate_past_the_dense_cut() {
+        let paths = search_named(&named_store(), "who not how", &config(false));
+        assert!(paths.contains(&"Notes/Who Not How.md".to_string()), "got {paths:?}");
+    }
+
+    /// With the title bonus off, a name means nothing, here as in ranking.
+    #[test]
+    fn no_title_bonus_adds_no_named_candidates() {
+        let cfg = SearchConfig {
+            title_boost: 0.0,
+            ..config(false)
+        };
+        let paths = search_named(&named_store(), "who not how", &cfg);
+        assert!(!paths.contains(&"Notes/Who Not How.md".to_string()), "got {paths:?}");
+    }
+
+    /// Only a file name carrying every query term: one shared word is how
+    /// half the vault gets named by a two-word query.
+    #[test]
+    fn a_partly_matching_file_name_adds_no_candidate() {
+        let paths = search_named(&named_store(), "who else", &config(false));
+        assert!(!paths.contains(&"Notes/Who Not How.md".to_string()), "got {paths:?}");
     }
 
     /// The image space has no lexical channel: image chunks carry no text and

@@ -370,7 +370,7 @@ pub fn boost_and_rank(
 
 /// A document's file name without its folders or extension: `Book Notes/Atomic Habits.md`
 /// is "Atomic Habits".
-fn file_name_title(path: &str) -> &str {
+pub fn file_name_title(path: &str) -> &str {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     name.rsplit_once('.').map_or(name, |(stem, _)| stem)
 }

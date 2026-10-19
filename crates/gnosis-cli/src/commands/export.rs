@@ -1344,6 +1344,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Named paths restrict an artifact the way they restrict the database:
+    /// exactly those documents, and none for an empty list.
+    #[test]
+    fn an_artifact_filters_by_named_paths() {
+        let dir = temp_dir("paths");
+        let store = seeded_store(&dir);
+        let (manifest, shards) = build_one(&store, Quantization::F32, Compression::Deflate);
+        let artifact = ArtifactStore::new(open_artifact(&manifest, shards));
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let all = artifact.search_space(Space::Text, &query, 10, &TextQuery::default()).unwrap();
+        let last = vec![all.last().expect("a seeded document").path.clone()];
+
+        let named = TextQuery {
+            paths: Some(&last),
+            ..TextQuery::default()
+        };
+        let hits = artifact.search_space(Space::Text, &query, 1, &named).unwrap();
+        assert_eq!(hits.iter().map(|h| h.path.clone()).collect::<Vec<_>>(), last);
+
+        let none: Vec<String> = Vec::new();
+        let nothing = TextQuery {
+            paths: Some(&none),
+            ..TextQuery::default()
+        };
+        assert!(artifact.search_space(Space::Text, &query, 10, &nothing).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// The filter has to mean the same thing on both sides, and this is where
     /// the artifact genuinely differs: it holds a root *label*, not a machine
     /// path, so that is what `--from` matches against.
@@ -1364,6 +1392,7 @@ mod tests {
                 &TextQuery {
                     from: Some(&roots),
                     tags: None,
+                    paths: None,
                 },
             )
             .unwrap();
@@ -1378,6 +1407,7 @@ mod tests {
                 &TextQuery {
                     from: Some(&elsewhere),
                     tags: None,
+                    paths: None,
                 },
             )
             .unwrap();
@@ -1392,6 +1422,7 @@ mod tests {
                 &TextQuery {
                     from: None,
                     tags: Some(&tags),
+                    paths: None,
                 },
             )
             .unwrap();
@@ -1406,6 +1437,7 @@ mod tests {
                     &TextQuery {
                         from: None,
                         tags: Some(&missing),
+                        paths: None,
                     },
                 )
                 .unwrap()
