@@ -352,12 +352,27 @@ pub fn boost_and_rank(
 ) -> Vec<Hit> {
     if title_boost != 0.0 {
         for hit in &mut hits {
-            hit.score += title_boost * bm25::title_match(query_terms, &hit.title);
+            // A note has two names: the title gnosis derived (frontmatter, then
+            // the first H1) and its file name, which is what Obsidian shows
+            // and what its reader searches for. Templated notes share an H1
+            // ("# Notes") and lose the derived title, while a corpus named by
+            // id keeps its title in the H1, so the better match of the two
+            // counts.
+            let matched = bm25::title_match(query_terms, &hit.title)
+                .max(bm25::title_match(query_terms, file_name_title(&hit.path)));
+            hit.score += title_boost * matched;
         }
     }
     hits.sort_by(best_first);
     hits.truncate(limit);
     hits
+}
+
+/// A document's file name without its folders or extension: `Book Notes/Atomic Habits.md`
+/// is "Atomic Habits".
+fn file_name_title(path: &str) -> &str {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    name.rsplit_once('.').map_or(name, |(stem, _)| stem)
 }
 
 pub fn merge_normalized(per_space: Vec<Vec<Hit>>, limit: usize) -> Vec<Hit> {
@@ -1020,5 +1035,51 @@ mod tests {
     fn an_empty_query_gets_no_title_boost() {
         let got = fuse_hits(vec![titled("a.md", "HNSW", 0.5)], vec![], &[], &tcfg(1.0, 0.5), 10);
         assert!((got[0].score - 0.5).abs() < 1e-6);
+    }
+
+    /// A vault made from a template: every note opens with the same H1, so
+    /// the derived title says nothing, and the file name is the name.
+    #[test]
+    fn the_file_name_counts_when_the_derived_title_is_a_template_s() {
+        let hits = vec![
+            titled("Book Notes/Atomic Habits.md", "Notes", 0.5),
+            titled("Book Notes/Deep Work.md", "Notes", 0.6),
+        ];
+        let got = fuse_hits(hits, vec![], &bm25::tokenize("atomic habits"), &tcfg(1.0, 0.2), 10);
+        assert_eq!(got[0].path, "Book Notes/Atomic Habits.md");
+    }
+
+    /// A corpus named by id keeps its title in the H1, which still counts.
+    #[test]
+    fn the_derived_title_counts_when_the_file_name_is_an_id() {
+        let got = fuse_hits(
+            vec![titled("4983.md", "HNSW graphs", 0.5)],
+            vec![],
+            &bm25::tokenize("hnsw"),
+            &tcfg(1.0, 0.2),
+            10,
+        );
+        assert!((got[0].score - 0.7).abs() < 1e-6, "got {}", got[0].score);
+    }
+
+    /// The better of the two names, not their sum: a note whose H1 and file
+    /// name agree is not boosted twice.
+    #[test]
+    fn a_title_and_file_name_that_agree_are_counted_once() {
+        let got = fuse_hits(
+            vec![titled("notes/HNSW.md", "HNSW", 0.5)],
+            vec![],
+            &bm25::tokenize("hnsw"),
+            &tcfg(1.0, 0.2),
+            10,
+        );
+        assert!((got[0].score - 0.7).abs() < 1e-6, "got {}", got[0].score);
+    }
+
+    #[test]
+    fn a_file_name_title_drops_folders_and_extension() {
+        assert_eq!(file_name_title("Book Notes/Atomic Habits.md"), "Atomic Habits");
+        assert_eq!(file_name_title("a\\b\\v1.2 notes.md"), "v1.2 notes");
+        assert_eq!(file_name_title("README"), "README");
     }
 }
