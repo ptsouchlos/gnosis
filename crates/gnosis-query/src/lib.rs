@@ -185,6 +185,7 @@ pub fn fuse_text_space(
                 score: search::bm25::normalize(raw, ceiling),
                 width: c.width,
                 height: c.height,
+                parts: Default::default(),
             }
         })
         .collect();
@@ -340,6 +341,7 @@ mod tests {
             score,
             width: None,
             height: None,
+            parts: Default::default(),
         }
     }
 
