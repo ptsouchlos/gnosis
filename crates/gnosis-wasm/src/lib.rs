@@ -33,6 +33,16 @@ use store::artifact_store::ArtifactStore;
 use store::{Space, TextQuery};
 use wasm_bindgen::prelude::*;
 
+/// The artifact format version this build reads and writes.
+///
+/// A client compares it with a manifest's `format_version` to tell an index it
+/// must rebuild from one it can open, rather than finding out from the error
+/// that opening raises.
+#[wasm_bindgen(js_name = artifactFormatVersion)]
+pub fn artifact_format_version() -> u32 {
+    store::artifact::ARTIFACT_FORMAT_VERSION
+}
+
 /// A loaded artifact, queried through gnosis's own retrieval pipeline.
 #[wasm_bindgen]
 pub struct Index {

@@ -99,7 +99,7 @@ impl SqliteStore {
     pub fn export_documents(&self) -> Result<Vec<ExportDoc>> {
         let mut stmt = self.conn.prepare(
             "SELECT d.id, r.path, d.rel_path, COALESCE(d.title, ''), d.kind,
-                    d.content_hash, d.mtime
+                    d.content_hash, d.mtime, d.frontmatter
              FROM documents d JOIN roots r ON r.id = d.root_id
              ORDER BY r.path, d.rel_path",
         )?;
@@ -113,6 +113,9 @@ impl SqliteStore {
                     kind: row.get(4)?,
                     content_hash: row.get(5)?,
                     mtime: row.get(6)?,
+                    created_unix: row
+                        .get::<_, Option<String>>(7)?
+                        .and_then(|fm| parse::extract_created_unix(&fm)),
                     links: Vec::new(),
                     tags: Vec::new(),
                 })
@@ -725,6 +728,7 @@ pub struct ExportDoc {
     pub kind: String,
     pub content_hash: Vec<u8>,
     pub mtime: i64,
+    pub created_unix: Option<i64>,
     pub links: Vec<String>,
     pub tags: Vec<String>,
 }
@@ -1095,6 +1099,17 @@ impl Store for SqliteStore {
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    fn document_dates(&self) -> Result<HashMap<String, i64>> {
+        Ok(self
+            .all_document_meta()?
+            .into_iter()
+            .filter_map(|(path, frontmatter)| {
+                let date = parse::extract_created_unix(&frontmatter?)?;
+                Some((path, date))
+            })
+            .collect())
     }
 
     fn related_space(

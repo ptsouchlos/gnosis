@@ -545,6 +545,15 @@ impl Store for ArtifactStore {
             .collect())
     }
 
+    fn document_dates(&self) -> Result<std::collections::HashMap<String, i64>> {
+        Ok(self
+            .artifact
+            .documents()
+            .iter()
+            .filter_map(|d| Some((d.path.clone(), d.created_unix?)))
+            .collect())
+    }
+
     fn related_space(
         &self,
         space: Space,

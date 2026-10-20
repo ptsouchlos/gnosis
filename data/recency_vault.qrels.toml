@@ -1,0 +1,151 @@
+vault = "."
+
+[[query]]
+text = "what was I reading about sourdough"
+relevant = [
+  { path = "journal/sourdough-starter-care.md", grade = 2 },
+  { path = "journal/sourdough-scoring.md", grade = 1 },
+  { path = "journal/sourdough-hydration.md", grade = 0 },
+  { path = "journal/sourdough-shaping.md", grade = 0 },
+  { path = "journal/sourdough-baking-vessel.md", grade = 0 },
+  { path = "journal/sourdough-flour-choice.md", grade = 0 },
+]
+
+[[query]]
+text = "what was I learning about rust"
+relevant = [
+  { path = "journal/rust-lifetimes.md", grade = 2 },
+  { path = "journal/rust-macros.md", grade = 1 },
+  { path = "journal/rust-ownership.md", grade = 0 },
+  { path = "journal/rust-traits.md", grade = 0 },
+  { path = "journal/rust-error-handling.md", grade = 0 },
+  { path = "journal/rust-async.md", grade = 0 },
+]
+
+[[query]]
+text = "where did I get to with running"
+relevant = [
+  { path = "journal/running-long-runs.md", grade = 2 },
+  { path = "journal/running-base-building.md", grade = 1 },
+  { path = "journal/running-intervals.md", grade = 0 },
+  { path = "journal/running-shoes.md", grade = 0 },
+  { path = "journal/running-heart-rate.md", grade = 0 },
+  { path = "journal/running-racing.md", grade = 0 },
+]
+
+[[query]]
+text = "what's the latest on my japan trip"
+relevant = [
+  { path = "journal/japan-food-list.md", grade = 2 },
+  { path = "journal/japan-tokyo-neighborhoods.md", grade = 1 },
+  { path = "journal/japan-kyoto-temples.md", grade = 0 },
+  { path = "journal/japan-rail-pass.md", grade = 0 },
+  { path = "journal/japan-lodging.md", grade = 0 },
+  { path = "journal/japan-phrases.md", grade = 0 },
+]
+
+[[query]]
+text = "what am I practicing on guitar"
+relevant = [
+  { path = "journal/guitar-ear-training.md", grade = 2 },
+  { path = "journal/guitar-scales.md", grade = 1 },
+  { path = "journal/guitar-open-chords.md", grade = 0 },
+  { path = "journal/guitar-fingerstyle.md", grade = 0 },
+  { path = "journal/guitar-jazz-voicings.md", grade = 0 },
+  { path = "journal/guitar-metronome.md", grade = 0 },
+]
+
+[[query]]
+text = "where did I get to with the budget"
+relevant = [
+  { path = "journal/budget-after-the-move.md", grade = 2 },
+  { path = "journal/budget-irregular-costs.md", grade = 1 },
+  { path = "journal/budget-categories.md", grade = 0 },
+  { path = "journal/budget-zero-based.md", grade = 0 },
+  { path = "journal/budget-savings.md", grade = 0 },
+  { path = "journal/budget-subscriptions.md", grade = 0 },
+]
+
+[[query]]
+text = "how is the garden going"
+relevant = [
+  { path = "journal/garden-raised-beds.md", grade = 2 },
+  { path = "journal/garden-irrigation.md", grade = 1 },
+  { path = "journal/garden-tomatoes.md", grade = 0 },
+  { path = "journal/garden-compost.md", grade = 0 },
+  { path = "journal/garden-pests.md", grade = 0 },
+  { path = "journal/garden-planting-plan.md", grade = 0 },
+]
+
+[[query]]
+text = "what was I working on in photography"
+relevant = [
+  { path = "journal/photography-printing.md", grade = 2 },
+  { path = "journal/photography-exposure.md", grade = 1 },
+  { path = "journal/photography-portraits.md", grade = 0 },
+  { path = "journal/photography-composition.md", grade = 0 },
+  { path = "journal/photography-light.md", grade = 0 },
+  { path = "journal/photography-editing.md", grade = 0 },
+]
+
+[[query]]
+text = "what have I tried for sleep"
+relevant = [
+  { path = "journal/sleep-schedule.md", grade = 2 },
+  { path = "journal/sleep-caffeine.md", grade = 1 },
+  { path = "journal/sleep-tracking.md", grade = 0 },
+  { path = "journal/sleep-light.md", grade = 0 },
+  { path = "journal/sleep-temperature.md", grade = 0 },
+  { path = "journal/sleep-magnesium.md", grade = 0 },
+]
+
+[[query]]
+text = "what was I studying in chess"
+relevant = [
+  { path = "journal/chess-endgames.md", grade = 2 },
+  { path = "journal/chess-strategy.md", grade = 1 },
+  { path = "journal/chess-openings.md", grade = 0 },
+  { path = "journal/chess-tactics.md", grade = 0 },
+  { path = "journal/chess-time-control.md", grade = 0 },
+  { path = "journal/chess-analysis.md", grade = 0 },
+]
+
+[[query]]
+text = "how do I fold a commit with interactive rebase"
+relevant = [ { path = "reference/git-rebase-cheat-sheet.md", grade = 2 } ]
+
+[[query]]
+text = "what does a negative lookahead look like"
+relevant = [ { path = "reference/regex-lookahead-reference.md", grade = 2 } ]
+
+[[query]]
+text = "what does chmod 755 mean"
+relevant = [ { path = "reference/unix-file-permissions.md", grade = 2 } ]
+
+[[query]]
+text = "how does the tcp handshake open a connection"
+relevant = [ { path = "reference/tcp-three-way-handshake.md", grade = 2 } ]
+
+[[query]]
+text = "what is the complexity of binary search"
+relevant = [ { path = "reference/big-o-of-common-algorithms.md", grade = 2 } ]
+
+[[query]]
+text = "how do I align a markdown table column"
+relevant = [ { path = "reference/markdown-table-syntax.md", grade = 2 } ]
+
+[[query]]
+text = "how do baker's percentages work for dough"
+relevant = [ { path = "reference/bakers-percentages.md", grade = 2 } ]
+
+[[query]]
+text = "what are the borrow checker rules in rust"
+relevant = [ { path = "reference/rust-borrow-checker-rules.md", grade = 2 } ]
+
+[[query]]
+text = "how do I read chess algebraic notation"
+relevant = [ { path = "reference/chess-algebraic-notation.md", grade = 2 } ]
+
+[[query]]
+text = "what is a stop of exposure in a photo"
+relevant = [ { path = "reference/exposure-value-table.md", grade = 2 } ]

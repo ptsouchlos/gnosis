@@ -35,6 +35,11 @@ use crate::Space;
 /// silently. Required rather than defaulted, so a v4 manifest is refused with
 /// the re-export message instead of read as "no prefixes".
 ///
+/// **v6** adds `created_unix` to each document, the note's authoring date, so a
+/// client without frontmatter can still rank by recency. An older artifact
+/// would read fine, but it would silently have no dates until its notes next
+/// changed, so the version bump makes the rebuild happen.
+///
 /// **v4** gives a shard one section per vector space, each with its own
 /// dimensionality and its own fixed-stride vector block, so the image space
 /// (CLIP, 512d) can travel beside the text space (384d) in one artifact. v3 had
@@ -51,7 +56,7 @@ use crate::Space;
 /// — 5.4 MB at 20k documents — and rewrote in full on every export, so sharding
 /// the chunks alone would have saved nothing. The artifact is derived and
 /// regenerable, so the fix was a version bump rather than a migration.
-pub const ARTIFACT_FORMAT_VERSION: u32 = 5;
+pub const ARTIFACT_FORMAT_VERSION: u32 = 6;
 
 /// Shard file magic: "GNSA" (gnosis artifact).
 const SHARD_MAGIC: &[u8; 4] = b"GNSA";
@@ -207,6 +212,11 @@ pub struct DocumentEntry {
     /// that cannot afford to hash the vault compares `mtime` and says so.
     pub content_hash: String,
     pub mtime: i64,
+    /// Authoring date from frontmatter `created:`, in Unix seconds, for the
+    /// recency signal. Absent when the note has none: `mtime` is not a stand-in,
+    /// as a sync client can reset it for a whole vault.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_unix: Option<i64>,
     /// Wikilink targets, so a client's `related` can exclude already-linked
     /// notes the way the CLI does by default.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -920,6 +930,7 @@ mod tests {
             kind: "markdown".to_string(),
             content_hash: "00".to_string(),
             mtime: 0,
+            created_unix: None,
             links: Vec::new(),
             tags: Vec::new(),
         }

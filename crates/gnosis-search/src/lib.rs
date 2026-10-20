@@ -36,18 +36,19 @@ pub struct Hit {
     pub parts: ScoreParts,
 }
 
-/// A hit's score, by where it came from: the three add up to `score`.
+/// A hit's score, by where it came from: the four add up to `score`.
 ///
 /// Contributions, not raw channel scores: `meaning` is the dense score times
 /// its fusion weight, `keywords` the lexical score times its own, and `title`
-/// the bonus as added. So a reader can see why a note ranks where it does, in
-/// the same units as the score. A merge across spaces (`merge_normalized`)
+/// and `recency` the bonuses as added. So a reader can see why a note ranks
+/// where it does, in the same units as the score. A merge across spaces (`merge_normalized`)
 /// rescales `score` and leaves these as they were in their space.
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub struct ScoreParts {
     pub meaning: f32,
     pub keywords: f32,
     pub title: f32,
+    pub recency: f32,
 }
 
 /// Score `candidates` against `query` by cosine similarity (vectors are
@@ -327,6 +328,18 @@ pub fn fuse_hits(
     cfg: &bm25::SearchConfig,
     limit: usize,
 ) -> Vec<Hit> {
+    fuse_hits_with(dense, lexical, query_terms, cfg, None, limit)
+}
+
+/// [`fuse_hits`] with the recency bonus applied alongside the title bonus.
+pub fn fuse_hits_with(
+    dense: Vec<Hit>,
+    lexical: Vec<Hit>,
+    query_terms: &[String],
+    cfg: &bm25::SearchConfig,
+    recency: Option<&RecencyInput<'_>>,
+    limit: usize,
+) -> Vec<Hit> {
     let mut by_path: HashMap<String, (Hit, f32, f32)> = HashMap::new();
 
     for hit in dense {
@@ -355,12 +368,40 @@ pub fn fuse_hits(
                 meaning: alpha * dense_score,
                 keywords: (1.0 - alpha) * lexical_score,
                 title: 0.0,
+                recency: 0.0,
             };
             hit
         })
         .collect();
 
-    boost_and_rank(fused, query_terms, cfg.title_boost, limit)
+    boost_and_rank_with(fused, query_terms, cfg.title_boost, recency, limit)
+}
+
+/// Each note's authoring date and the clock to age it against: what the
+/// recency bonus needs and a [`Hit`] does not carry.
+#[derive(Debug, Clone, Copy)]
+pub struct RecencyInput<'a> {
+    /// Authoring date in Unix seconds, by document path. A path missing here
+    /// has no date and earns no bonus.
+    pub dates: &'a HashMap<String, i64>,
+    pub now_unix: i64,
+    pub weight: f32,
+    pub half_life_days: f32,
+}
+
+impl RecencyInput<'_> {
+    /// `weight` for a note written today, halving every `half_life_days`.
+    /// A date in the future counts as today.
+    fn bonus(&self, path: &str) -> f32 {
+        let Some(&date) = self.dates.get(path) else {
+            return 0.0;
+        };
+        if self.half_life_days <= 0.0 {
+            return 0.0;
+        }
+        let age_days = ((self.now_unix - date).max(0) as f32) / 86_400.0;
+        self.weight * 0.5_f32.powf(age_days / self.half_life_days)
+    }
 }
 
 /// Apply the title bonus, order, and truncate.
@@ -374,9 +415,22 @@ pub fn fuse_hits(
 /// after `limit` would make it useless for exactly the navigational case it
 /// exists to serve.
 pub fn boost_and_rank(
+    hits: Vec<Hit>,
+    query_terms: &[String],
+    title_boost: f32,
+    limit: usize,
+) -> Vec<Hit> {
+    boost_and_rank_with(hits, query_terms, title_boost, None, limit)
+}
+
+/// [`boost_and_rank`] plus the recency bonus, added after the title bonus and
+/// before truncation for the same reason: an old note must be able to fall out
+/// of the result set, and a recent one climb into it.
+pub fn boost_and_rank_with(
     mut hits: Vec<Hit>,
     query_terms: &[String],
     title_boost: f32,
+    recency: Option<&RecencyInput<'_>>,
     limit: usize,
 ) -> Vec<Hit> {
     if title_boost != 0.0 {
@@ -391,6 +445,13 @@ pub fn boost_and_rank(
                 .max(bm25::title_match(query_terms, file_name_title(&hit.path)));
             hit.score += title_boost * matched;
             hit.parts.title = title_boost * matched;
+        }
+    }
+    if let Some(recency) = recency {
+        for hit in &mut hits {
+            let bonus = recency.bonus(&hit.path);
+            hit.score += bonus;
+            hit.parts.recency = bonus;
         }
     }
     hits.sort_by(best_first);
@@ -992,6 +1053,60 @@ mod tests {
         let mut hit = h(path, score);
         hit.title = title.to_string();
         hit
+    }
+
+    // ---- recency ---------------------------------------------------------
+
+    const DAY: i64 = 86_400;
+
+    fn recency<'a>(dates: &'a HashMap<String, i64>, now_unix: i64) -> RecencyInput<'a> {
+        RecencyInput {
+            dates,
+            now_unix,
+            weight: 0.1,
+            half_life_days: 100.0,
+        }
+    }
+
+    #[test]
+    fn recency_halves_every_half_life_and_leaves_undated_notes_alone() {
+        let dates = HashMap::from([
+            ("new.md".to_string(), 1_000 * DAY),
+            ("old.md".to_string(), 900 * DAY),
+        ]);
+        let hits = vec![
+            titled("new.md", "x", 0.5),
+            titled("old.md", "x", 0.5),
+            titled("undated.md", "x", 0.5),
+        ];
+        let got = boost_and_rank_with(hits, &[], 0.0, Some(&recency(&dates, 1_000 * DAY)), 10);
+        let part = |p: &str| got.iter().find(|h| h.path == p).unwrap().parts.recency;
+        assert!((part("new.md") - 0.1).abs() < 1e-6);
+        assert!((part("old.md") - 0.05).abs() < 1e-6, "one half-life old");
+        assert_eq!(part("undated.md"), 0.0);
+        assert_eq!(got[0].path, "new.md");
+    }
+
+    #[test]
+    fn a_future_date_counts_as_today() {
+        let dates = HashMap::from([("a.md".to_string(), 2_000 * DAY)]);
+        let got = boost_and_rank_with(
+            vec![titled("a.md", "x", 0.5)],
+            &[],
+            0.0,
+            Some(&recency(&dates, 1_000 * DAY)),
+            10,
+        );
+        assert!((got[0].parts.recency - 0.1).abs() < 1e-6);
+    }
+
+    /// Applied before truncation, so a recent note can climb into the results.
+    #[test]
+    fn recency_can_lift_a_note_past_the_limit() {
+        let dates = HashMap::from([("recent.md".to_string(), 1_000 * DAY)]);
+        let hits = vec![titled("a.md", "x", 0.55), titled("recent.md", "x", 0.5)];
+        let got = boost_and_rank_with(hits, &[], 0.0, Some(&recency(&dates, 1_000 * DAY)), 1);
+        assert_eq!(got[0].path, "recent.md");
     }
 
     #[test]

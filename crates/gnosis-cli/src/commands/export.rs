@@ -283,6 +283,7 @@ pub(crate) fn build_artifact(
             kind: doc.kind.clone(),
             content_hash: hex(&doc.content_hash),
             mtime: doc.mtime,
+            created_unix: doc.created_unix,
             links: doc.links.clone(),
             tags: doc.tags.clone(),
         });
@@ -1600,7 +1601,7 @@ mod tests {
         std::fs::write(
             vault.join("notes/sourdough.md"),
             format!(
-                "---\ntags: [baking, bread]\n---\n\n# Sourdough\n\n{}\n\n## Feeding\n\nRefresh \
+                "---\ncreated: 2024-05-03\ntags: [baking, bread]\n---\n\n# Sourdough\n\n{}\n\n## Feeding\n\nRefresh \
                  at one to two to two and wait for peak. See [[Hydration]].\n",
                 "A wild yeast starter and a long overnight proof. ".repeat(40)
             ),
@@ -1684,6 +1685,9 @@ mod tests {
         )
         .expect("indexing the parity vault");
         assert_eq!(report.indexed, 4, "every note must index");
+        // The one dated note travels into the artifact on both paths: the
+        // shard comparison below fails if only one of them carries it.
+        assert_eq!(store.document_dates().unwrap().len(), 1);
 
         let (cli_manifest, cli_shards) = build_artifact(
             &store,

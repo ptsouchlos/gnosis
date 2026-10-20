@@ -32,6 +32,20 @@ pub struct EvalArgs {
     /// Emit results as JSON.
     #[arg(long)]
     pub json: bool,
+    /// Override `search.recency_weight` for this run, to sweep it.
+    #[arg(long)]
+    pub recency_weight: Option<f32>,
+    /// Override `search.recency_half_life_days` for this run.
+    #[arg(long)]
+    pub recency_half_life_days: Option<f32>,
+    /// Age notes against this `YYYY-MM-DD` instead of today, so a sweep gives
+    /// the same numbers next month.
+    #[arg(long, value_parser = parse_now)]
+    pub now: Option<i64>,
+}
+
+fn parse_now(text: &str) -> Result<i64, String> {
+    parse::parse_date_unix(text).ok_or_else(|| format!("expected YYYY-MM-DD, got {text:?}"))
 }
 
 /// Scores for one query.
@@ -118,7 +132,16 @@ pub fn execute(ws: &Workspace, args: EvalArgs) -> Result<()> {
 
     let available = resolve_spaces(ws, &[])?;
     let mut embedders = QueryEmbedders::new(ws);
-    let cfg = embedders.config().clone();
+    let mut cfg = embedders.config();
+    if let Some(weight) = args.recency_weight {
+        cfg.recency_weight = weight;
+    }
+    if let Some(days) = args.recency_half_life_days {
+        cfg.recency_half_life_days = days;
+    }
+    if let Some(now) = args.now {
+        cfg.now_unix = Some(now);
+    }
     let filter = TextQuery {
         from: None,
         tags: None,
