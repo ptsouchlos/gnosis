@@ -30,6 +30,13 @@ not. It is synthetic, and it needs `nltk` (`uv run --with nltk ...`) plus the
 WordNet corpus, which is why it is off by default: the rest of this script is
 standard library only.
 
+Two more shapes are opt-in (`--typos`): `title_partial_typo` and
+`body_phrase_typo` are the `title_partial` and `body_phrase` queries with one
+random edit (a deletion, insertion, substitution or swap) in every word of five
+or more characters, seeded. A keyword channel that matches whole words fails
+them by construction, which is what typo tolerance is measured against; the
+clean shapes stay the control that it costs nothing when spelling is right.
+
 What this does NOT measure: whether the retrieved note is the one a person
 *wanted*. Known-item retrieval only asks whether a query derived from a note
 finds that note back. Real queries are messier, half-remembered, and sometimes
@@ -116,6 +123,38 @@ def paraphrase(phrase: str, wn, rng: random.Random) -> str | None:
     return " ".join(out) if swapped >= 2 else None
 
 
+def typo(word: str, rng: random.Random) -> str:
+    """`word` with one random edit; the word itself if it is under five
+    characters, which a single edit would turn into another word."""
+    if len(word) < 5:
+        return word
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    for _ in range(10):
+        i = rng.randrange(len(word))
+        kind = rng.choice(("delete", "insert", "substitute", "swap"))
+        if kind == "delete":
+            out = word[:i] + word[i + 1 :]
+        elif kind == "insert":
+            out = word[:i] + rng.choice(letters) + word[i:]
+        elif kind == "substitute":
+            out = word[:i] + rng.choice(letters) + word[i + 1 :]
+        else:
+            if i == len(word) - 1:
+                i -= 1
+            out = word[:i] + word[i + 1] + word[i] + word[i + 2 :]
+        if out != word:
+            return out
+    return word
+
+
+def typos(phrase: str, rng: random.Random) -> str | None:
+    """`phrase` with a typo in each word of five or more characters, or None if
+    it has none."""
+    words = phrase.split()
+    out = [typo(w, rng) for w in words]
+    return " ".join(out) if out != words else None
+
+
 def toml_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").strip()
 
@@ -135,6 +174,11 @@ def main() -> int:
         "--paraphrase",
         action="store_true",
         help="also emit the synonym-swapped `paraphrase` shape (needs nltk + WordNet)",
+    )
+    ap.add_argument(
+        "--typos",
+        action="store_true",
+        help="also emit the `title_partial_typo` and `body_phrase_typo` shapes",
     )
     args = ap.parse_args()
     rng = random.Random(args.seed)
@@ -190,6 +234,8 @@ def main() -> int:
         partial = distinctive(title_terms, corpus_df, 2)
         if partial and " ".join(partial).lower() != title.lower():
             queries.append(("title_partial", " ".join(partial), rel))
+            if args.typos and (garbled := typos(" ".join(partial), rng)):
+                queries.append(("title_partial_typo", garbled, rel))
 
         # A phrase from the body that does not lean on the title, so the control
         # cannot be answered by title matching alone. Markdown and URLs are
@@ -212,6 +258,8 @@ def main() -> int:
         if usable:
             phrase = rng.choice(usable)
             queries.append(("body_phrase", phrase, rel))
+            if args.typos and (garbled := typos(phrase, rng)):
+                queries.append(("body_phrase_typo", garbled, rel))
             if wn is not None:
                 swapped = paraphrase(phrase, wn, rng)
                 if swapped:

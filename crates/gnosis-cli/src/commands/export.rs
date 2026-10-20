@@ -1516,6 +1516,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Fuzzy expansion lives in the shared pipeline over each store's own
+    /// vocabulary, so a misspelled query must rank the same on both.
+    #[test]
+    fn both_stores_answer_a_misspelled_query_the_same_way() {
+        let dir = temp_dir("fuzzy-agree");
+        let mut store = SqliteStore::open(&dir.join("gnosis.db")).unwrap();
+        store.set_meta("model.text", "bge-small-en-v1.5").unwrap();
+        store.set_meta("dim.text", "2").unwrap();
+        store.set_meta("prefix.text.query", BGE_QUERY_INSTRUCTION).unwrap();
+        store.set_meta("prefix.text.document", "").unwrap();
+        for (path, text) in [
+            ("a.md", "retrieval of graph indexes"),
+            ("b.md", "graph retrieval retrieval retrieval"),
+            ("c.md", "a recipe for chocolate cake"),
+        ] {
+            store
+                .replace_document(&DocWrite {
+                    path: &format!("/vault/{path}"),
+                    kind: "markdown",
+                    source_root: "/vault",
+                    content_hash: b"hash",
+                    mtime: 0,
+                    title: path,
+                    frontmatter: None,
+                    indexed_at: 0,
+                    chunks: &[ChunkWrite {
+                        ord: 0,
+                        space: "text".to_string(),
+                        modality: "text".to_string(),
+                        text: Some(text.to_string()),
+                        heading_path: String::new(),
+                        vector: vec![1.0, 0.0],
+                    }],
+                    links: &[],
+                    tags: &[],
+                    width: None,
+                    height: None,
+                })
+                .unwrap();
+        }
+        let (manifest, shards) = build_one(&store, Quantization::F32, Compression::Deflate);
+        let artifact = ArtifactStore::new(open_artifact(&manifest, shards));
+
+        let cfg = search::bm25::SearchConfig {
+            fuzzy: true,
+            title_boost: 0.0,
+            ..Default::default()
+        };
+        let rank = |s: &dyn Store| -> Vec<(String, f32)> {
+            query::fuse_text_space(s, "retreival graph", Vec::new(), 10, &TextQuery::default(), &cfg)
+                .unwrap()
+                .into_iter()
+                .map(|h| (h.path.rsplit('/').next().unwrap().to_string(), h.score))
+                .collect()
+        };
+        let from_db = rank(&store);
+        let from_artifact = rank(&artifact);
+
+        assert_eq!(from_db.len(), 2, "both retrieval notes match: {from_db:?}");
+        assert_eq!(from_db, from_artifact);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A deterministic stand-in for an embedding model: the same text always
     /// gives the same vector, and different text almost never does.
     ///

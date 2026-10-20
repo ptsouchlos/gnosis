@@ -38,6 +38,10 @@ pub struct EvalArgs {
     /// Override `search.recency_half_life_days` for this run.
     #[arg(long)]
     pub recency_half_life_days: Option<f32>,
+    /// Turn fuzzy matching on at this weight for this run, to sweep it. Zero
+    /// turns it off.
+    #[arg(long)]
+    pub fuzzy_weight: Option<f32>,
     /// Age notes against this `YYYY-MM-DD` instead of today, so a sweep gives
     /// the same numbers next month.
     #[arg(long, value_parser = parse_now)]
@@ -138,6 +142,10 @@ pub fn execute(ws: &Workspace, args: EvalArgs) -> Result<()> {
     }
     if let Some(days) = args.recency_half_life_days {
         cfg.recency_half_life_days = days;
+    }
+    if let Some(weight) = args.fuzzy_weight {
+        cfg.fuzzy = weight > 0.0;
+        cfg.fuzzy_weight = weight;
     }
     if let Some(now) = args.now {
         cfg.now_unix = Some(now);

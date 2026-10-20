@@ -75,6 +75,13 @@ pub struct SearchConfig {
     /// and an evaluation can pin it. Recency is off while this is `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub now_unix: Option<i64>,
+    /// Whether a query term the index has never seen is expanded to the
+    /// vocabulary terms a typo away. A query that spells every term correctly
+    /// is never touched.
+    pub fuzzy: bool,
+    /// How much a fuzzy expansion counts against an exact match, in
+    /// `0.0..=1.0`. Below 1.0 so an exact match always outranks a fuzzy one.
+    pub fuzzy_weight: f32,
 }
 
 impl Default for SearchConfig {
@@ -100,6 +107,15 @@ impl Default for SearchConfig {
             recency_weight: 0.0,
             recency_half_life_days: 365.0,
             now_unix: None,
+            // Measured on kepano's vault with one typo per word of 5+
+            // characters in short title queries: lexical-only nDCG@10 goes
+            // 0.25 -> 0.80 and hybrid 0.32 -> 0.38, and scifact / nfcorpus
+            // move by 0.001 and 0.002. The weight is flat from 0.3 to 0.7
+            // (+-0.002), so 0.5 sits in the middle. The cost is a term that
+            // is spelled right but absent from the index being matched to its
+            // neighbors: lexical-only title queries lose about 0.01.
+            fuzzy: true,
+            fuzzy_weight: 0.5,
         }
     }
 }
@@ -119,6 +135,19 @@ pub struct CorpusStats {
 pub struct QueryTerm {
     /// How many chunks contain this term.
     pub doc_freq: u64,
+    /// How much a match counts: 1.0 for a term the query spelled, less for a
+    /// fuzzy expansion of one it misspelled.
+    pub weight: f32,
+}
+
+impl QueryTerm {
+    /// A term the query spelled itself, at full weight.
+    pub fn exact(doc_freq: u64) -> Self {
+        Self {
+            doc_freq,
+            weight: 1.0,
+        }
+    }
 }
 
 /// What one candidate chunk contributes for a query.
@@ -158,6 +187,111 @@ pub fn tokenize(text: &str) -> Vec<String> {
         .filter(|t| !t.is_empty())
         .map(|t| t.to_lowercase())
         .collect()
+}
+
+/// Terms shorter than this are never expanded: one edit away from a three
+/// letter word is half the dictionary.
+pub const FUZZY_MIN_LEN: usize = 4;
+/// Terms this long may be two edits off; shorter ones, one.
+pub const FUZZY_LONG_LEN: usize = 8;
+/// The most expansions one misspelled term gets, nearest first, so a query's
+/// `OR` stays bounded however large the vocabulary.
+pub const FUZZY_MAX_EXPANSIONS: usize = 8;
+
+/// The edit distance within which a vocabulary term stands in for an unknown
+/// `term`: none for a short one, 1 up to seven characters, 2 from eight.
+pub fn fuzzy_bound(term: &str) -> usize {
+    match term.chars().count() {
+        n if n < FUZZY_MIN_LEN => 0,
+        n if n < FUZZY_LONG_LEN => 1,
+        _ => 2,
+    }
+}
+
+/// Edit distance between `a` and `b` if it is at most `max`, else `None`.
+///
+/// Optimal string alignment: insertions, deletions, substitutions and adjacent
+/// transpositions each cost one, since swapping two letters is the commonest
+/// typo and plain Levenshtein would charge it two.
+pub fn edit_distance_within(a: &str, b: &str, max: usize) -> Option<usize> {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.len().abs_diff(b.len()) > max {
+        return None;
+    }
+    let width = b.len() + 1;
+    let mut d = vec![0usize; (a.len() + 1) * width];
+    for (j, cell) in d.iter_mut().take(width).enumerate() {
+        *cell = j;
+    }
+    for i in 1..=a.len() {
+        d[i * width] = i;
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut best = (d[(i - 1) * width + j] + 1)
+                .min(d[i * width + j - 1] + 1)
+                .min(d[(i - 1) * width + j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                best = best.min(d[(i - 2) * width + j - 2] + 1);
+            }
+            d[i * width + j] = best;
+        }
+    }
+    let got = d[a.len() * width + b.len()];
+    (got <= max).then_some(got)
+}
+
+/// Collects, for terms the index has never seen, the vocabulary terms within
+/// [`fuzzy_bound`] of them.
+///
+/// Fed one vocabulary term at a time, so each store can supply its vocabulary
+/// however it holds it and both reach the same expansions: ordered nearest
+/// first, then alphabetically, and capped at [`FUZZY_MAX_EXPANSIONS`].
+pub struct FuzzyExpander<'a> {
+    unknown: Vec<(usize, &'a str, usize)>,
+    found: Vec<Vec<(usize, String)>>,
+}
+
+impl<'a> FuzzyExpander<'a> {
+    /// `unknown` pairs each term with its position in the query.
+    pub fn new(unknown: impl IntoIterator<Item = (usize, &'a str)>) -> Self {
+        let unknown: Vec<_> = unknown
+            .into_iter()
+            .map(|(i, t)| (i, t, fuzzy_bound(t)))
+            .filter(|&(_, _, bound)| bound > 0)
+            .collect();
+        let found = vec![Vec::new(); unknown.len()];
+        Self { unknown, found }
+    }
+
+    /// Whether any term is eligible, so a caller can skip walking the
+    /// vocabulary when none is.
+    pub fn is_empty(&self) -> bool {
+        self.unknown.is_empty()
+    }
+
+    pub fn offer(&mut self, word: &str) {
+        for (&(_, term, bound), found) in self.unknown.iter().zip(&mut self.found) {
+            if word == term {
+                continue;
+            }
+            if let Some(distance) = edit_distance_within(term, word, bound) {
+                found.push((distance, word.to_string()));
+            }
+        }
+    }
+
+    /// `(query position, expansion)` pairs.
+    pub fn finish(self) -> Vec<(usize, String)> {
+        let mut out = Vec::new();
+        for ((index, _, _), mut found) in self.unknown.into_iter().zip(self.found) {
+            found.sort();
+            found.dedup();
+            found.truncate(FUZZY_MAX_EXPANSIONS);
+            out.extend(found.into_iter().map(|(_, word)| (index, word)));
+        }
+        out
+    }
 }
 
 /// Count each of `terms` in `text`, returning counts positionally aligned with
@@ -239,7 +373,7 @@ pub fn score(
                 return 0.0;
             }
             let saturated = ((params.k1 + 1.0) * tf) / (norm_len + tf);
-            idf(term.doc_freq, stats.total_chunks) * (saturated + params.delta)
+            term.weight * idf(term.doc_freq, stats.total_chunks) * (saturated + params.delta)
         })
         .sum()
 }
@@ -254,8 +388,29 @@ pub fn score(
 pub fn max_score(terms: &[QueryTerm], stats: CorpusStats, params: Bm25Params) -> f32 {
     terms
         .iter()
-        .map(|t| idf(t.doc_freq, stats.total_chunks) * (params.k1 + 1.0 + params.delta))
+        .map(|t| t.weight * idf(t.doc_freq, stats.total_chunks) * (params.k1 + 1.0 + params.delta))
         .sum()
+}
+
+/// [`max_score`] for a query some of whose terms are fuzzy expansions.
+///
+/// `groups` gives, for each term, the index of the query term it stands for.
+/// Expansions of one misspelled term are alternatives for the same word, so the
+/// ceiling counts the best of them once rather than summing them; a query with
+/// no expansions has every term in its own group and gets [`max_score`] back.
+pub fn max_score_grouped(
+    terms: &[QueryTerm],
+    groups: &[usize],
+    stats: CorpusStats,
+    params: Bm25Params,
+) -> f32 {
+    let mut best: std::collections::BTreeMap<usize, f32> = Default::default();
+    for (t, &group) in terms.iter().zip(groups) {
+        let ceiling = t.weight * idf(t.doc_freq, stats.total_chunks) * (params.k1 + 1.0 + params.delta);
+        let slot = best.entry(group).or_insert(0.0);
+        *slot = slot.max(ceiling);
+    }
+    best.values().sum()
 }
 
 /// Scale a raw score into `0.0..=1.0` against a ceiling, clamping.
@@ -300,7 +455,7 @@ mod tests {
     }
 
     fn terms(dfs: &[u64]) -> Vec<QueryTerm> {
-        dfs.iter().map(|&doc_freq| QueryTerm { doc_freq }).collect()
+        dfs.iter().map(|&doc_freq| QueryTerm::exact(doc_freq)).collect()
     }
 
     // ---- idf --------------------------------------------------------------
@@ -650,5 +805,125 @@ mod tests {
         let q = terms_of("notes");
         assert_eq!(title_match(&q, "Meeting notes"), 1.0);
         assert_eq!(title_match(&q, "Reading notes"), 1.0);
+    }
+
+    // ---- fuzzy matching ----------------------------------------------------
+
+    #[test]
+    fn edit_distance_counts_each_kind_of_edit_once() {
+        assert_eq!(edit_distance_within("graph", "graph", 2), Some(0));
+        assert_eq!(edit_distance_within("graph", "graps", 2), Some(1), "substitution");
+        assert_eq!(edit_distance_within("graph", "grap", 2), Some(1), "deletion");
+        assert_eq!(edit_distance_within("graph", "graphs", 2), Some(1), "insertion");
+        assert_eq!(edit_distance_within("graph", "garph", 2), Some(1), "transposition");
+    }
+
+    #[test]
+    fn edit_distance_beyond_the_bound_is_none() {
+        assert_eq!(edit_distance_within("graph", "grxpy", 1), None);
+        assert_eq!(edit_distance_within("graph", "grxpy", 2), Some(2));
+        assert_eq!(edit_distance_within("graph", "gr", 2), None, "length alone rules it out");
+    }
+
+    #[test]
+    fn edit_distance_counts_characters_not_bytes() {
+        assert_eq!(edit_distance_within("café", "cafe", 1), Some(1));
+    }
+
+    #[test]
+    fn the_distance_bound_grows_with_the_term() {
+        assert_eq!(fuzzy_bound("cat"), 0, "too short to expand");
+        assert_eq!(fuzzy_bound("cake"), 1);
+        assert_eq!(fuzzy_bound("graphs"), 1);
+        assert_eq!(fuzzy_bound("retrieval"), 2, "eight characters or more");
+        assert_eq!(fuzzy_bound("naïveté!"), 2, "counted in characters");
+    }
+
+    fn expand(unknown: &[&str], vocabulary: &[&str]) -> Vec<(usize, String)> {
+        let mut e = FuzzyExpander::new(unknown.iter().copied().enumerate());
+        for w in vocabulary {
+            e.offer(w);
+        }
+        e.finish()
+    }
+
+    #[test]
+    fn an_unknown_term_expands_to_the_vocabulary_within_its_bound() {
+        let got = expand(&["grph"], &["graph", "group", "graphs", "cake"]);
+        assert_eq!(got, vec![(0, "graph".to_string())], "graphs is two edits, bound is one");
+    }
+
+    #[test]
+    fn a_longer_term_reaches_two_edits() {
+        let got = expand(&["retreival"], &["retrieval", "retrieve"]);
+        assert_eq!(got, vec![(0, "retrieval".to_string())], "a transposition, one edit");
+        let got = expand(&["retrievl"], &["retrieval"]);
+        assert_eq!(got.len(), 1);
+        let got = expand(&["retrievxx"], &["retrieval"]);
+        assert_eq!(got.len(), 1, "two edits is allowed from eight characters");
+    }
+
+    #[test]
+    fn a_short_term_is_never_expanded() {
+        assert!(expand(&["cat"], &["cut", "car", "cats"]).is_empty());
+    }
+
+    #[test]
+    fn expansions_are_nearest_first_then_alphabetical_and_capped() {
+        // Twenty words two edits from the term, and one a single edit away
+        // that sorts after all of them.
+        let far: Vec<String> = (0..20).map(|i| format!("stormcloudx{}", (b'a' + i) as char)).collect();
+        let mut vocab: Vec<&str> = far.iter().map(String::as_str).collect();
+        vocab.push("stormclouds");
+        let got = expand(&["stormcloud"], &vocab);
+        assert_eq!(got.len(), FUZZY_MAX_EXPANSIONS);
+        assert_eq!(got[0].1, "stormclouds", "the nearest comes first");
+        assert_eq!(got[1].1, "stormcloudxa", "then alphabetically");
+    }
+
+    #[test]
+    fn an_expansion_never_repeats_the_term_itself() {
+        assert!(expand(&["graph"], &["graph"]).is_empty());
+    }
+
+    #[test]
+    fn a_fuzzy_term_counts_at_its_weight() {
+        let s = stats(100, 50.0);
+        let p = Bm25Params::default();
+        let at = |weight| {
+            let t = [QueryTerm { doc_freq: 5, weight }];
+            score(&m(50, &[3]), &t, s, p)
+        };
+        assert!((at(0.5) - 0.5 * at(1.0)).abs() < 1e-6);
+        assert_eq!(at(1.0), score(&m(50, &[3]), &terms(&[5]), s, p));
+    }
+
+    #[test]
+    fn an_exact_match_outscores_the_same_match_found_fuzzily() {
+        let s = stats(100, 50.0);
+        let p = Bm25Params::default();
+        let exact = score(&m(50, &[2]), &[QueryTerm::exact(5)], s, p);
+        let fuzzy = score(&m(50, &[2]), &[QueryTerm { doc_freq: 5, weight: 0.7 }], s, p);
+        assert!(exact > fuzzy, "{exact} !> {fuzzy}");
+    }
+
+    #[test]
+    fn grouped_ceiling_without_expansions_is_the_plain_ceiling() {
+        let s = stats(500, 40.0);
+        let p = Bm25Params::default();
+        let t = terms(&[3, 7]);
+        assert_eq!(max_score_grouped(&t, &[0, 1], s, p), max_score(&t, s, p));
+    }
+
+    #[test]
+    fn expansions_of_one_term_share_a_ceiling() {
+        let s = stats(500, 40.0);
+        let p = Bm25Params::default();
+        let spelled = QueryTerm::exact(0);
+        let a = QueryTerm { doc_freq: 3, weight: 0.5 };
+        let b = QueryTerm { doc_freq: 9, weight: 0.5 };
+        let grouped = max_score_grouped(&[spelled, a, b], &[0, 0, 0], s, p);
+        let best = max_score_grouped(&[a], &[0], s, p);
+        assert_eq!(grouped, best, "alternatives for one word count once, at the best");
     }
 }
