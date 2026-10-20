@@ -426,7 +426,7 @@ impl Store for ArtifactStore {
         // that scores best.
         let query_terms: Vec<search::bm25::QueryTerm> = doc_freqs
             .iter()
-            .map(|&doc_freq| search::bm25::QueryTerm { doc_freq })
+            .map(|&doc_freq| search::bm25::QueryTerm::exact(doc_freq))
             .collect();
         // Walk the postings, accumulating each matched chunk's per-term
         // frequencies as they are encountered. This is the whole reason the
@@ -497,6 +497,13 @@ impl Store for ArtifactStore {
             doc_freqs,
             candidates,
         })
+    }
+
+    fn vocabulary(&self, visit: &mut dyn FnMut(&str)) -> Result<()> {
+        for term in self.lexical.postings.keys() {
+            visit(term);
+        }
+        Ok(())
     }
 
     fn search_space(

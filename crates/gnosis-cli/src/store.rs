@@ -1039,6 +1039,21 @@ impl Store for SqliteStore {
         })
     }
 
+    fn vocabulary(&self, visit: &mut dyn FnMut(&str)) -> Result<()> {
+        // A temp table, so the vocabulary view is not part of the stored
+        // schema: no format change, and nothing for an older build to trip on.
+        self.conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS temp.chunks_fts_vocab
+             USING fts5vocab(main, chunks_fts, 'row')",
+        )?;
+        let mut stmt = self.conn.prepare("SELECT term FROM temp.chunks_fts_vocab")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            visit(&row.get::<_, String>(0)?);
+        }
+        Ok(())
+    }
+
     fn search_space(&self, space: Space, query: &[f32], limit: usize, filter: &TextQuery) -> Result<Vec<Hit>> {
         // Over-fetch only when filtering by root/tag, which ANN can't apply.
         // Modality needs no over-fetch: the index is per-modality, so nothing
@@ -1923,6 +1938,21 @@ mod tests {
         store
             .lexical_candidates(&terms, 50, &TextQuery::default())
             .unwrap()
+    }
+
+    #[test]
+    fn vocabulary_lists_every_indexed_term() {
+        let (mut store, path) = temp_store();
+        write_text_doc_with(&mut store, "/vault/a.md", &["hnsw graph", "graph again"]);
+        let mut seen = std::collections::BTreeSet::new();
+        store.vocabulary(&mut |w| { seen.insert(w.to_string()); }).unwrap();
+        assert_eq!(
+            seen.into_iter().collect::<Vec<_>>(),
+            vec!["again", "graph", "hnsw"]
+        );
+        // Asking twice must not trip over the vocabulary table already existing.
+        store.vocabulary(&mut |_| {}).unwrap();
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

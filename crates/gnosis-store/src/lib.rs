@@ -212,6 +212,15 @@ pub trait Store {
         filter: &TextQuery,
     ) -> Result<LexicalMatches>;
 
+    /// Every term the lexical channel can match, one call of `visit` each, for
+    /// fuzzy expansion of a query term the index has never seen.
+    ///
+    /// Terms are as `bm25::tokenize` produced them. A store with no vocabulary
+    /// to offer visits nothing, and queries are then never expanded.
+    fn vocabulary(&self, _visit: &mut dyn FnMut(&str)) -> Result<()> {
+        Ok(())
+    }
+
     fn search_space(&self, space: Space, query: &[f32], limit: usize, filter: &TextQuery) -> Result<Vec<Hit>>;
 
     /// A document's own chunk vectors within one space — the query set for

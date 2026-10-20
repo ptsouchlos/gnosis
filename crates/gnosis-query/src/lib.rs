@@ -148,20 +148,42 @@ pub fn fuse_text_space(
     filter: &TextQuery,
     cfg: &SearchConfig,
 ) -> Result<Vec<search::Hit>> {
-    let terms = search::bm25::tokenize(query);
+    let mut terms = search::bm25::tokenize(query);
     if terms.is_empty() {
         return Ok(dense);
     }
 
     // Over-fetch the lexical side: a document fusion should surface may rank
     // well below `limit` on lexical score alone.
-    let matches = store.lexical_candidates(&terms, limit * LEXICAL_OVERFETCH, filter)?;
+    let overfetch = limit * LEXICAL_OVERFETCH;
+    let spelled = terms.len();
+    let mut matches = store.lexical_candidates(&terms, overfetch, filter)?;
+
+    // Terms the index has never seen are looked up again as the vocabulary
+    // terms a typo away. A query that spells everything correctly never gets
+    // here, so it scores exactly as it did before.
+    let mut groups: Vec<usize> = (0..spelled).collect();
+    let mut weights = vec![1.0; spelled];
+    if cfg.fuzzy && cfg.fuzzy_weight > 0.0 {
+        let expansions = fuzzy_expansions(store, &terms, &matches.doc_freqs)?;
+        if !expansions.is_empty() {
+            for (group, word) in expansions {
+                if !terms.contains(&word) {
+                    terms.push(word);
+                    groups.push(group);
+                    weights.push(cfg.fuzzy_weight.clamp(0.0, 1.0));
+                }
+            }
+            matches = store.lexical_candidates(&terms, overfetch, filter)?;
+        }
+    }
     let query_terms: Vec<search::bm25::QueryTerm> = matches
         .doc_freqs
         .iter()
-        .map(|&doc_freq| search::bm25::QueryTerm { doc_freq })
+        .zip(&weights)
+        .map(|(&doc_freq, &weight)| search::bm25::QueryTerm { doc_freq, weight })
         .collect();
-    let ceiling = search::bm25::max_score(&query_terms, matches.stats, cfg.bm25);
+    let ceiling = search::bm25::max_score_grouped(&query_terms, &groups, matches.stats, cfg.bm25);
 
     let lexical: Vec<search::Hit> = matches
         .candidates
@@ -194,7 +216,28 @@ pub fn fuse_text_space(
 
     let dates = recency_dates(store, cfg)?;
     let recency = recency_input(&dates, cfg);
-    Ok(search::fuse_hits_with(dense, lexical, &terms, cfg, recency.as_ref(), limit))
+    Ok(search::fuse_hits_with(dense, lexical, &terms[..spelled], cfg, recency.as_ref(), limit))
+}
+
+/// The vocabulary terms standing in for the query terms the index lacks, as
+/// `(position in the query, expansion)` pairs.
+fn fuzzy_expansions(
+    store: &dyn Store,
+    terms: &[String],
+    doc_freqs: &[u64],
+) -> Result<Vec<(usize, String)>> {
+    let unknown = terms
+        .iter()
+        .zip(doc_freqs)
+        .enumerate()
+        .filter(|&(_, (_, &df))| df == 0)
+        .map(|(i, (t, _))| (i, t.as_str()));
+    let mut expander = search::bm25::FuzzyExpander::new(unknown);
+    if expander.is_empty() {
+        return Ok(Vec::new());
+    }
+    store.vocabulary(&mut |word| expander.offer(word))?;
+    Ok(expander.finish())
 }
 
 /// The authoring dates recency needs, fetched only when it is on.
@@ -332,6 +375,12 @@ mod tests {
         /// `run_query` test still fails loudly if the pipeline ever starts
         /// asking for them.
         related: Option<Related>,
+        /// `(path, text)` documents that `lexical_candidates` matches for
+        /// real, instead of answering with the canned `lexical`. Empty means
+        /// the canned answer.
+        corpus: Vec<(&'static str, &'static str)>,
+        /// How often the vocabulary was walked.
+        vocabulary_walks: std::cell::Cell<usize>,
     }
 
     /// What `run_related` asks a store for, plus what it passed back out. The
@@ -407,11 +456,46 @@ mod tests {
 
         fn lexical_candidates(
             &self,
-            _terms: &[String],
+            terms: &[String],
             _limit: usize,
             _filter: &TextQuery,
         ) -> anyhow::Result<LexicalMatches> {
-            Ok(self.lexical.clone())
+            if self.corpus.is_empty() {
+                return Ok(self.lexical.clone());
+            }
+            let tokens: Vec<Vec<String>> = self
+                .corpus
+                .iter()
+                .map(|(_, text)| search::bm25::tokenize(text))
+                .collect();
+            let lengths: usize = self.corpus.iter().map(|(_, t)| t.chars().count() + 1).sum();
+            Ok(LexicalMatches {
+                stats: search::bm25::CorpusStats {
+                    total_chunks: self.corpus.len() as u64,
+                    avg_chunk_len: lengths as f32 / self.corpus.len() as f32,
+                },
+                doc_freqs: terms
+                    .iter()
+                    .map(|t| tokens.iter().filter(|d| d.contains(t)).count() as u64)
+                    .collect(),
+                candidates: self
+                    .corpus
+                    .iter()
+                    .zip(&tokens)
+                    .filter(|(_, d)| terms.iter().any(|t| d.contains(t)))
+                    .map(|((path, text), _)| candidate(path, text))
+                    .collect(),
+            })
+        }
+
+        fn vocabulary(&self, visit: &mut dyn FnMut(&str)) -> anyhow::Result<()> {
+            self.vocabulary_walks.set(self.vocabulary_walks.get() + 1);
+            for (_, text) in &self.corpus {
+                for token in search::bm25::tokenize(text) {
+                    visit(&token);
+                }
+            }
+            Ok(())
         }
 
         fn set_meta(&self, _k: &str, _v: &str) -> anyhow::Result<()> {
@@ -483,6 +567,8 @@ mod tests {
         FakeStore {
             dense,
             related: None,
+            corpus: Vec::new(),
+            vocabulary_walks: Default::default(),
             lexical: LexicalMatches {
                 stats: search::bm25::CorpusStats {
                     total_chunks: 100,
@@ -621,6 +707,8 @@ mod tests {
         let s = FakeStore {
             dense: vec![hit("photo.png", 0.4)],
             related: None,
+            corpus: Vec::new(),
+            vocabulary_walks: Default::default(),
             lexical: LexicalMatches {
                 stats: search::bm25::CorpusStats {
                     total_chunks: 0,
@@ -667,6 +755,8 @@ mod tests {
         FakeStore {
             dense: Vec::new(),
             related: Some(related),
+            corpus: Vec::new(),
+            vocabulary_walks: Default::default(),
             lexical: LexicalMatches {
                 stats: search::bm25::CorpusStats {
                     total_chunks: 0,
@@ -858,5 +948,115 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("is not indexed"), "got {err}");
+    }
+
+    // ---- fuzzy matching ----------------------------------------------------
+
+    fn corpus_store(corpus: Vec<(&'static str, &'static str)>) -> FakeStore {
+        FakeStore {
+            corpus,
+            ..store(Vec::new(), Vec::new())
+        }
+    }
+
+    fn fuzzy_config(fuzzy: bool) -> SearchConfig {
+        SearchConfig {
+            fuzzy,
+            title_boost: 0.0,
+            ..config(true)
+        }
+    }
+
+    /// Lexical-only (no dense hits), the paths in rank order with their scores.
+    fn keyword_search(s: &FakeStore, query: &str, cfg: &SearchConfig) -> Vec<(String, f32)> {
+        run_query(
+            s,
+            &mut FixedVector(vec![1.0, 0.0]),
+            query,
+            &[Space::Text],
+            10,
+            &TextQuery::default(),
+            cfg,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|h| (h.path, h.score))
+        .collect()
+    }
+
+    #[test]
+    fn a_misspelled_term_finds_nothing_with_fuzzy_off() {
+        let s = corpus_store(vec![("a.md", "retrieval of graph indexes")]);
+        assert!(keyword_search(&s, "retreival", &fuzzy_config(false)).is_empty());
+        assert_eq!(s.vocabulary_walks.get(), 0, "off means the vocabulary is never walked");
+    }
+
+    #[test]
+    fn a_misspelled_term_finds_its_note_with_fuzzy_on() {
+        let s = corpus_store(vec![
+            ("a.md", "retrieval of graph indexes"),
+            ("b.md", "a recipe for chocolate cake"),
+        ]);
+        let got = keyword_search(&s, "retreival", &fuzzy_config(true));
+        assert_eq!(got.len(), 1, "got {got:?}");
+        assert_eq!(got[0].0, "a.md");
+        assert!(got[0].1 > 0.0);
+    }
+
+    /// Correct queries must score exactly as they do without the feature.
+    #[test]
+    fn an_exact_term_is_never_expanded() {
+        let s = corpus_store(vec![
+            ("a.md", "retrieval of graph indexes"),
+            ("b.md", "retrieved retrieval retrievals"),
+        ]);
+        let off = keyword_search(&s, "retrieval graph", &fuzzy_config(false));
+        let on = keyword_search(&s, "retrieval graph", &fuzzy_config(true));
+        assert_eq!(on, off);
+        assert_eq!(s.vocabulary_walks.get(), 0, "no unknown term, so no vocabulary walk");
+    }
+
+    #[test]
+    fn only_the_unknown_term_of_a_query_is_expanded() {
+        let s = corpus_store(vec![
+            ("a.md", "graph indexes"),
+            ("b.md", "graphs and the grape harvest"),
+        ]);
+        // "graph" is known and keeps its exact meaning; "indxes" is not.
+        let got = keyword_search(&s, "graph indxes", &fuzzy_config(true));
+        assert_eq!(got[0].0, "a.md");
+        let plain = keyword_search(&s, "graph", &fuzzy_config(true));
+        assert_eq!(plain.len(), 1, "graph must not drag in graphs or grape: {plain:?}");
+    }
+
+    #[test]
+    fn an_exact_match_outranks_a_fuzzy_one() {
+        // Equal lengths and document frequencies, so only the weight differs.
+        let s = corpus_store(vec![
+            ("fuzzy.md", "retrieval xx"),
+            ("exact.md", "hnsw xxxxxxx"),
+            ("other.md", "unrelated words here"),
+        ]);
+        let cfg = fuzzy_config(true);
+        let got = keyword_search(&s, "hnsw retreival", &cfg);
+        assert_eq!(got.len(), 2, "got {got:?}");
+        assert_eq!(got[0].0, "exact.md", "got {got:?}");
+        assert!(got[0].1 > got[1].1);
+    }
+
+    #[test]
+    fn a_zero_fuzzy_weight_turns_fuzzy_off() {
+        let s = corpus_store(vec![("a.md", "retrieval of graph indexes")]);
+        let cfg = SearchConfig {
+            fuzzy_weight: 0.0,
+            ..fuzzy_config(true)
+        };
+        assert!(keyword_search(&s, "retreival", &cfg).is_empty());
+    }
+
+    #[test]
+    fn a_short_unknown_term_is_not_expanded() {
+        let s = corpus_store(vec![("a.md", "the cat sat")]);
+        assert!(keyword_search(&s, "cot", &fuzzy_config(true)).is_empty());
     }
 }
