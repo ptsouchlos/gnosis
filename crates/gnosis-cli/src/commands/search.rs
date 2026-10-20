@@ -74,8 +74,16 @@ impl<'a> QueryEmbedders<'a> {
 
     /// The search configuration this frontend was built with — the pipeline
     /// takes it explicitly rather than reading it off the embedder.
-    pub(crate) fn config(&self) -> &search::bm25::SearchConfig {
-        &self.ws.config.search
+    ///
+    /// Owned, because recency needs the clock and the pipeline deliberately has
+    /// none: the frontend stamps `now_unix` here.
+    pub(crate) fn config(&self) -> search::bm25::SearchConfig {
+        let mut cfg = self.ws.config.search.clone();
+        cfg.now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs() as i64);
+        cfg
     }
 }
 

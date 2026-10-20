@@ -73,7 +73,9 @@ pub fn run_query(
                 fuse_text_space(store, query, dense, limit, filter, cfg)?
             } else {
                 let terms = search::bm25::tokenize(query);
-                search::boost_and_rank(dense, &terms, cfg.title_boost, limit)
+                let dates = recency_dates(store, cfg)?;
+                let recency = recency_input(&dates, cfg);
+                search::boost_and_rank_with(dense, &terms, cfg.title_boost, recency.as_ref(), limit)
             };
             per_space.push(ranked);
         } else {
@@ -190,7 +192,32 @@ pub fn fuse_text_space(
         })
         .collect();
 
-    Ok(search::fuse_hits(dense, lexical, &terms, cfg, limit))
+    let dates = recency_dates(store, cfg)?;
+    let recency = recency_input(&dates, cfg);
+    Ok(search::fuse_hits_with(dense, lexical, &terms, cfg, recency.as_ref(), limit))
+}
+
+/// The authoring dates recency needs, fetched only when it is on.
+fn recency_dates(
+    store: &dyn Store,
+    cfg: &SearchConfig,
+) -> Result<std::collections::HashMap<String, i64>> {
+    if cfg.recency_weight == 0.0 || cfg.now_unix.is_none() {
+        return Ok(Default::default());
+    }
+    store.document_dates()
+}
+
+fn recency_input<'a>(
+    dates: &'a std::collections::HashMap<String, i64>,
+    cfg: &SearchConfig,
+) -> Option<search::RecencyInput<'a>> {
+    Some(search::RecencyInput {
+        dates,
+        now_unix: cfg.now_unix.filter(|_| cfg.recency_weight != 0.0)?,
+        weight: cfg.recency_weight,
+        half_life_days: cfg.recency_half_life_days,
+    })
 }
 
 /// How a frontend reads `aliases:` out of a document's raw frontmatter.

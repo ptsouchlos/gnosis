@@ -64,6 +64,17 @@ pub struct SearchConfig {
     /// A note titled for a topic is usually what someone looking for that topic
     /// wants, rather than one of many notes mentioning it in passing.
     pub title_boost: f32,
+    /// Largest bonus a brand-new note can earn for recency; 0 turns the signal
+    /// off. The bonus halves every `recency_half_life_days`, and a note with no
+    /// date earns none.
+    pub recency_weight: f32,
+    /// Age, in days, at which the recency bonus has halved.
+    pub recency_half_life_days: f32,
+    /// The moment ages are measured from, in Unix seconds. Set by the frontend
+    /// rather than read from a clock here, so the pipeline stays usable in wasm
+    /// and an evaluation can pin it. Recency is off while this is `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub now_unix: Option<i64>,
 }
 
 impl Default for SearchConfig {
@@ -86,6 +97,9 @@ impl Default for SearchConfig {
             // That asymmetry is roughly twentyfold in favour of enabling it,
             // so it is on by default and small.
             title_boost: 0.1,
+            recency_weight: 0.0,
+            recency_half_life_days: 365.0,
+            now_unix: None,
         }
     }
 }

@@ -250,6 +250,10 @@ impl ArtifactBuilder {
                     kind: "markdown".to_string(),
                     content_hash: hash,
                     mtime,
+                    created_unix: parsed
+                        .frontmatter
+                        .as_deref()
+                        .and_then(parse::extract_created_unix),
                     links: parsed.links,
                     tags: parsed.tags,
                 },

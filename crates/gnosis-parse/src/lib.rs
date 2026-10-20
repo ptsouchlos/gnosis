@@ -304,6 +304,40 @@ pub fn extract_aliases(frontmatter: &str) -> Vec<String> {
     extract_frontmatter_list(frontmatter, "aliases")
 }
 
+/// A note's authoring date from frontmatter `created:`, as Unix seconds (UTC).
+///
+/// Reads `YYYY-MM-DD`, optionally followed by `T` or a space and a time, which
+/// is how Obsidian and its templates write the property. A time of day is
+/// ignored: recency is measured in days. `None` for a missing or unreadable
+/// value, so a note without a date simply gets no recency bonus.
+pub fn extract_created_unix(frontmatter: &str) -> Option<i64> {
+    let value = serde_norway::from_str::<serde_norway::Value>(frontmatter).ok()?;
+    let raw = match value.get("created")? {
+        serde_norway::Value::String(s) => s.clone(),
+        _ => return None,
+    };
+    parse_date_unix(&raw)
+}
+
+/// A `YYYY-MM-DD` date, optionally followed by a time, as Unix seconds (UTC).
+pub fn parse_date_unix(text: &str) -> Option<i64> {
+    let date = text.trim().get(..10)?;
+    let mut parts = date.split('-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = parts.next()?.parse().ok()?;
+    let day: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Days from the civil calendar (Hinnant), so no date crate is needed.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some((era * 146_097 + doe - 719_468) * 86_400)
+}
+
 /// Tags from frontmatter `tags:` (see `extract_frontmatter_list`) plus
 /// inline `#tag` occurrences in the body, skipping fenced code blocks and
 /// ATX headings (avoids `# Heading`, `#include` in code, "C#" false
@@ -573,5 +607,26 @@ mod obsidian_tests {
         // as an empty document.
         let empty = b"%PDF-1.4\ntrailer\n<< /Size 1 >>\n%%EOF\n";
         assert!(parse_pdf(empty).is_err());
+    }
+
+    #[test]
+    fn created_reads_a_plain_date() {
+        assert_eq!(extract_created_unix("created: 1970-01-02"), Some(86_400));
+        assert_eq!(extract_created_unix("created: 2024-02-29"), Some(1_709_164_800));
+    }
+
+    #[test]
+    fn created_ignores_a_time_of_day() {
+        assert_eq!(
+            extract_created_unix("created: \"2024-02-29T13:45:00\""),
+            extract_created_unix("created: 2024-02-29")
+        );
+    }
+
+    #[test]
+    fn created_is_none_when_missing_or_unreadable() {
+        assert_eq!(extract_created_unix("title: x"), None);
+        assert_eq!(extract_created_unix("created: yesterday"), None);
+        assert_eq!(extract_created_unix("created: 2024-13-01"), None);
     }
 }

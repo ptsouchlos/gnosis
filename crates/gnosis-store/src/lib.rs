@@ -229,6 +229,13 @@ pub trait Store {
     /// link targets to paths (by filename stem or frontmatter alias).
     fn all_document_meta(&self) -> Result<Vec<(String, Option<String>)>>;
 
+    /// Each document's authoring date in Unix seconds, by path, for the recency
+    /// signal. A store that has no dates (the portable artifact carries none
+    /// yet) returns an empty map, and recency then changes nothing.
+    fn document_dates(&self) -> Result<std::collections::HashMap<String, i64>> {
+        Ok(std::collections::HashMap::new())
+    }
+
     /// Rank other documents by best chunk-to-chunk cosine similarity against
     /// `query_vectors` (the max across all of them per candidate) within one
     /// space, excluding `exclude_paths` before truncation to `limit`,
