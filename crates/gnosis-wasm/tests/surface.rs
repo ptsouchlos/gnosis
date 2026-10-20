@@ -700,6 +700,16 @@ fn an_image_space_built_here_opens_and_answers_an_image_query() {
 }
 
 #[wasm_bindgen_test]
+fn an_image_that_will_not_decode_can_be_dropped() {
+    let mut builder = Builder::create(image_spec()).expect("create");
+    builder
+        .add_image("img/corrupt.png", "00", 1.0)
+        .expect("addImage");
+    assert!(builder.remove_document("img/corrupt.png").expect("remove"));
+    assert!(!builder.remove_document("img/corrupt.png").expect("remove"));
+}
+
+#[wasm_bindgen_test]
 fn adding_an_image_without_an_image_space_says_so() {
     let mut builder = Builder::create(spec()).expect("create");
     let Err(err) = builder.add_image("img/loaf.png", "00", 1.0) else {

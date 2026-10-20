@@ -141,6 +141,14 @@ impl Builder {
         })
     }
 
+    /// Drop a document that was offered but cannot be completed, such as an
+    /// image that will not decode; `gnosis index` skips those too. Returns
+    /// whether it was there.
+    #[wasm_bindgen(js_name = removeDocument)]
+    pub fn remove_document(&mut self, path: &str) -> Result<bool, JsError> {
+        Ok(self.inner_mut()?.remove(path))
+    }
+
     /// Supply an image's vector, from CLIP's vision tower.
     #[wasm_bindgen(js_name = setImageVector)]
     pub fn set_image_vector(&mut self, path: &str, vector: &Float32Array) -> Result<(), JsError> {

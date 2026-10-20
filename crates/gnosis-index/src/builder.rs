@@ -404,6 +404,15 @@ impl ArtifactBuilder {
         })
     }
 
+    /// Drop a document that was offered but cannot be completed — an image
+    /// that will not decode, say. `gnosis index` skips such a file and carries
+    /// on, and a client has to be able to as well: a document still waiting
+    /// for its vectors would otherwise stop `finish`. Returns whether it was
+    /// there.
+    pub fn remove(&mut self, path: &str) -> bool {
+        self.documents.remove(path).is_some()
+    }
+
     /// Supply an image's vision-tower vector.
     pub fn set_image_vector(&mut self, path: &str, vector: &[f32]) -> Result<()> {
         let dim = self.image_dim()?;
@@ -912,6 +921,18 @@ mod tests {
         let note = rebuild.add_document("a.md", "# Alpha\n\nbody words", 10);
         assert!(note.reused, "the text space is unchanged");
         assert_eq!(note.title.as_deref(), Some("Alpha"));
+    }
+
+    #[test]
+    fn a_document_that_cannot_be_completed_can_be_dropped_and_the_build_finishes() {
+        let mut builder = ArtifactBuilder::new(spec(true));
+        note_and_image(&mut builder);
+        builder.add_image("img/corrupt.png", "bad", 30).unwrap();
+        assert_eq!(builder.pending(), 1);
+        assert!(builder.remove("img/corrupt.png"));
+        assert!(!builder.remove("img/corrupt.png"), "already gone");
+        let built = builder.finish(1).unwrap();
+        assert_eq!(built.documents, 2);
     }
 
     #[test]

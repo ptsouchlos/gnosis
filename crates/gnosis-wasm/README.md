@@ -87,6 +87,10 @@ builder.setImageVector(path, clipVisionVector);      // from CLIP's vision tower
 builder.setTitleVector(path, clipTextVector);        // the file's stem, as `added.title`
 ```
 
+A file that will not decode is dropped with `builder.removeDocument(path)`,
+as `gnosis index` skips it, since a document still owed its vectors stops
+`finish`.
+
 Every document owes a title-proxy vector, which is how `related` crosses
 between notes and images; `title` is absent when none is owed (no image space,
 or a reused document that already has one). A text-only index passed to
