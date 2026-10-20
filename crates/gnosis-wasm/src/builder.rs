@@ -25,6 +25,12 @@ pub fn content_hash(text: &str) -> String {
     index::builder::content_hash(text)
 }
 
+/// The content hash `addImage` expects for an image file's bytes.
+#[wasm_bindgen(js_name = contentHashBytes)]
+pub fn content_hash_bytes(bytes: &[u8]) -> String {
+    index::builder::content_hash_bytes(bytes)
+}
+
 /// What `addDocument` tells the client to do next.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,6 +40,21 @@ struct Added {
     reused: bool,
     /// The exact strings to embed, in chunk order.
     texts: Vec<String>,
+    /// The title to embed with CLIP's text tower for the document's title
+    /// proxy, when the spec has an image space and one is still owed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+}
+
+/// What `addImage` tells the client to do next.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AddedImage {
+    /// True when the image was carried over unchanged; nothing is owed for it
+    /// unless `title` says its title proxy is.
+    reused: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
 }
 
 /// What `finish` hands back, beside the shards themselves.
@@ -99,7 +120,41 @@ impl Builder {
         to_js(&Added {
             reused: added.reused,
             texts: added.texts,
+            title: added.title,
         })
+    }
+
+    /// Offer one image file to the index; needs `image` in the spec.
+    ///
+    /// `hash` is `contentHashBytes` of the file's bytes. A new image owes a
+    /// vision-tower vector (`setImageVector`) and a title proxy
+    /// (`setTitleVector`, with the `title` this returns).
+    #[wasm_bindgen(js_name = addImage)]
+    pub fn add_image(&mut self, path: &str, hash: &str, mtime_ms: f64) -> Result<JsValue, JsError> {
+        let added = self
+            .inner_mut()?
+            .add_image(path, hash, (mtime_ms / 1000.0).floor() as i64)
+            .map_err(anyhow_err)?;
+        to_js(&AddedImage {
+            reused: added.reused,
+            title: added.title,
+        })
+    }
+
+    /// Supply an image's vector, from CLIP's vision tower.
+    #[wasm_bindgen(js_name = setImageVector)]
+    pub fn set_image_vector(&mut self, path: &str, vector: &Float32Array) -> Result<(), JsError> {
+        self.inner_mut()?
+            .set_image_vector(path, &vector.to_vec())
+            .map_err(anyhow_err)
+    }
+
+    /// Supply a document's title-proxy vector, from CLIP's text tower.
+    #[wasm_bindgen(js_name = setTitleVector)]
+    pub fn set_title_vector(&mut self, path: &str, vector: &Float32Array) -> Result<(), JsError> {
+        self.inner_mut()?
+            .set_title_vector(path, &vector.to_vec())
+            .map_err(anyhow_err)
     }
 
     /// Supply one document's vectors, flat and in chunk order.

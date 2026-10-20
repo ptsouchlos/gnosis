@@ -73,6 +73,26 @@ what `gnosis index` embeds. Both prefixes are required: `""` is a statement that
 the model wants none, and leaving one out is refused rather than defaulted,
 because an E5 build that forgot `"passage: "` would look healthy and rank badly.
 
+An image space is opt-in with `image: { model: "clip-vit-b-32", queryId:
+"clip-vit-b-32", dim: 512 }` in the spec, and then matches what `gnosis index`
+writes with `[embed.image]` on:
+
+```js
+const { reused, texts, title } = builder.addDocument(path, text, mtime);
+builder.setTitleVector(path, clipTextVector);        // `title` through CLIP's text tower
+
+const hash = contentHashBytes(imageBytes);
+const added = builder.addImage(path, hash, mtime);   // { reused, title? }
+builder.setImageVector(path, clipVisionVector);      // from CLIP's vision tower
+builder.setTitleVector(path, clipTextVector);        // the file's stem, as `added.title`
+```
+
+Every document owes a title-proxy vector, which is how `related` crosses
+between notes and images; `title` is absent when none is owed (no image space,
+or a reused document that already has one). A text-only index passed to
+`fromArtifact` with an image spec is reused as it stands and asks only for those
+proxies.
+
 On the query side, `info()` reports each space's `queryPrefix` as the index
 recorded it. Prepend it before embedding a query; it is not derivable from the
 model id, since `query_instruction = false` turns it off per index. A document whose

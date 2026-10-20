@@ -606,3 +606,104 @@ fn a_spec_without_prefixes_is_refused() {
     let message = format!("{:?}", JsValue::from(err));
     assert!(message.contains("Prefix"), "got {message}");
 }
+
+// ---- Builder: the image space ----------------------------------------------
+
+fn image_spec() -> JsValue {
+    js_sys::JSON::parse(
+        r#"{"model":"bge-small-en-v1.5","pooling":"cls","dim":4,"root":"notes",
+            "queryPrefix":"","documentPrefix":"","quantization":"f32","compression":"deflate",
+            "image":{"model":"clip-vit-b-32","queryId":"clip-vit-b-32","dim":3}}"#,
+    )
+    .expect("spec")
+}
+
+/// Images and title proxies cross the boundary, and what comes out opens and
+/// answers an image query: the plugin's whole image path in one test.
+#[wasm_bindgen_test]
+fn an_image_space_built_here_opens_and_answers_an_image_query() {
+    use gnosis_wasm::builder::content_hash_bytes;
+    let mut builder = Builder::create(image_spec()).expect("create");
+
+    let note = json(
+        builder
+            .add_document("notes/hydration.md", NOTES[0].1, 1_700_000_000_000.0)
+            .expect("addDocument"),
+    );
+    assert_eq!(
+        note["title"], "Hydration",
+        "the title to embed for its proxy: {note}"
+    );
+    builder
+        .set_vectors(
+            "notes/hydration.md",
+            &Float32Array::from([1.0f32, 0.0, 0.0, 0.0].as_slice()),
+        )
+        .expect("setVectors");
+    builder
+        .set_title_vector(
+            "notes/hydration.md",
+            &Float32Array::from([0.0f32, 1.0, 0.0].as_slice()),
+        )
+        .expect("setTitleVector");
+
+    let hash = content_hash_bytes(b"not really a png");
+    let image = json(
+        builder
+            .add_image("img/loaf.png", &hash, 1_700_000_000_000.0)
+            .expect("addImage"),
+    );
+    assert_eq!(image["reused"], false);
+    assert_eq!(image["title"], "loaf");
+    builder
+        .set_image_vector(
+            "img/loaf.png",
+            &Float32Array::from([0.0f32, 0.0, 1.0].as_slice()),
+        )
+        .expect("setImageVector");
+    builder
+        .set_title_vector(
+            "img/loaf.png",
+            &Float32Array::from([1.0f32, 0.0, 0.0].as_slice()),
+        )
+        .expect("setTitleVector");
+
+    let built = builder.finish(1_700_000_400.0).expect("finish");
+    let report = json(built.clone());
+    let shards =
+        Map::from(js_sys::Reflect::get(&built, &JsValue::from_str("shards")).expect("shards"));
+    let manifest = report["manifest"].as_str().expect("manifest").to_string();
+    let index = Index::open(&manifest, &shards).expect("the built artifact must open");
+
+    let info = json(index.info().expect("info"));
+    assert_eq!(info["spaces"][1]["space"], "image");
+    assert_eq!(info["spaces"][1]["dim"], 3);
+    assert_eq!(info["spaces"][1]["queryModel"], "clip-vit-b-32");
+
+    // A query vector pointing at the image finds the image, not the note's
+    // title proxy that sits in the same space.
+    let hits = paths(
+        index
+            .search(
+                "",
+                &vectors(&[("image", &[0.0, 0.0, 1.0])]),
+                10,
+                JsValue::UNDEFINED,
+            )
+            .expect("search"),
+    );
+    assert_eq!(
+        hits.first().map(String::as_str),
+        Some("img/loaf.png"),
+        "got {hits:?}"
+    );
+}
+
+#[wasm_bindgen_test]
+fn adding_an_image_without_an_image_space_says_so() {
+    let mut builder = Builder::create(spec()).expect("create");
+    let Err(err) = builder.add_image("img/loaf.png", "00", 1.0) else {
+        panic!("a text-only build must refuse an image");
+    };
+    let _ = err;
+}
