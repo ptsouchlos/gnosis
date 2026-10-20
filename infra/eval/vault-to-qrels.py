@@ -22,6 +22,14 @@ those would be rigged. `body_phrase` is the check: a signal that helps the
 first two and hurts the third is shape-dependent, not a general improvement,
 and belongs off by default or behind query analysis.
 
+A fourth shape, `paraphrase`, is opt-in (`--paraphrase`). The shapes above are
+taken verbatim from the note, so the keyword channel matches them by
+construction. `paraphrase` takes a body phrase and swaps its content words for
+WordNet synonyms, so the words differ from the note's while the meaning does
+not. It is synthetic, and it needs `nltk` (`uv run --with nltk ...`) plus the
+WordNet corpus, which is why it is off by default: the rest of this script is
+standard library only.
+
 What this does NOT measure: whether the retrieved note is the one a person
 *wanted*. Known-item retrieval only asks whether a query derived from a note
 finds that note back. Real queries are messier, half-remembered, and sometimes
@@ -76,6 +84,38 @@ def distinctive(terms: list[str], corpus_df: dict[str, int], limit: int) -> list
     return [t for t in ranked if t not in STOPWORDS and len(t) > 2][:limit]
 
 
+def synonym(word: str, wn, rng: random.Random) -> str | None:
+    """A single-word synonym that is not an inflection of `word`, or None."""
+    found: list[str] = []
+    # Only the commonest sense: later senses are how "create" becomes "templet".
+    for syn in wn.synsets(word)[:1]:
+        for lemma in syn.lemma_names():
+            cand = lemma.lower()
+            if not cand.isalpha() or cand == word or cand[:4] == word[:4]:
+                continue
+            if cand not in found:
+                found.append(cand)
+    return rng.choice(found) if found else None
+
+
+def paraphrase(phrase: str, wn, rng: random.Random) -> str | None:
+    """`phrase` with its content words swapped for synonyms; None if fewer than
+    two words could be swapped, since that is barely a paraphrase."""
+    out: list[str] = []
+    swapped = 0
+    for word in phrase.split():
+        bare = re.sub(r"[^0-9A-Za-z]", "", word).lower()
+        sub = None
+        if bare and bare not in STOPWORDS and len(bare) > 3 and bare.isalpha() and rng.random() < 0.6:
+            sub = synonym(bare, wn, rng)
+        if sub:
+            out.append(sub)
+            swapped += 1
+        else:
+            out.append(word)
+    return " ".join(out) if swapped >= 2 else None
+
+
 def toml_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").strip()
 
@@ -91,8 +131,28 @@ def main() -> int:
         default=0,
         help="cap queries per type (0 = one per note where possible)",
     )
+    ap.add_argument(
+        "--paraphrase",
+        action="store_true",
+        help="also emit the synonym-swapped `paraphrase` shape (needs nltk + WordNet)",
+    )
     args = ap.parse_args()
     rng = random.Random(args.seed)
+
+    wn = None
+    if args.paraphrase:
+        try:
+            from nltk.corpus import wordnet as wn  # type: ignore[no-redef]
+
+            wn.ensure_loaded()
+        except (ImportError, LookupError):
+            print(
+                "--paraphrase needs nltk and its WordNet corpus:\n"
+                "  uv run --no-project --with nltk python -c "
+                "\"import nltk; nltk.download('wordnet')\"",
+                file=sys.stderr,
+            )
+            return 1
 
     vault = args.vault.expanduser().resolve()
     notes = [
@@ -150,7 +210,12 @@ def main() -> int:
                 continue
             usable.append(cand)
         if usable:
-            queries.append(("body_phrase", rng.choice(usable), rel))
+            phrase = rng.choice(usable)
+            queries.append(("body_phrase", phrase, rel))
+            if wn is not None:
+                swapped = paraphrase(phrase, wn, rng)
+                if swapped:
+                    queries.append(("paraphrase", swapped, rel))
 
     # A query that two notes answer equally well is not a known-item query —
     # scoring it against one of them would penalise a correct result. Drop
