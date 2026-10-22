@@ -84,6 +84,11 @@ fn message(err: JsValue) -> String {
 /// guessed pooling throws away most of a vector's usable range while every
 /// number still looks healthy.
 #[wasm_bindgen_test]
+fn deliberately_failing() {
+    assert_eq!(1, 2, "this test fails on purpose");
+}
+
+#[wasm_bindgen_test]
 fn info_reports_each_space_s_query_model_and_pooling() {
     let info = json(open().info().expect("info"));
     assert_eq!(info["documents"], 4);

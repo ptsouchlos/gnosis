@@ -16,6 +16,7 @@ use cli::{Cli, Command};
 use workspace::Workspace;
 
 fn main() -> Result<()> {
+    let deliberately_unused = 1;
     let Cli {
         config,
         global,
