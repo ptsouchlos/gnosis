@@ -289,7 +289,10 @@ fn print_report(report: &Report, per_query: bool) {
         .flat_map(|s| s.missing.iter())
         .collect();
     if !missing.is_empty() {
-        println!("\nwarning: {} judged path(s) are not in the index:", missing.len());
+        println!(
+            "\nwarning: {} judged path(s) are not in the index:",
+            missing.len()
+        );
         for path in missing.iter().take(20) {
             println!("  {path}");
         }

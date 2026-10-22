@@ -350,17 +350,12 @@ fn idf(doc_freq: u64, total_chunks: u64) -> f32 {
 ///
 /// `terms` and `m.term_freqs` are positionally aligned; a shorter
 /// `term_freqs` is treated as zero for the missing terms.
-pub fn score(
-    m: &LexicalMatch,
-    terms: &[QueryTerm],
-    stats: CorpusStats,
-    params: Bm25Params,
-) -> f32 {
+pub fn score(m: &LexicalMatch, terms: &[QueryTerm], stats: CorpusStats, params: Bm25Params) -> f32 {
     if terms.is_empty() || stats.total_chunks == 0 || stats.avg_chunk_len <= 0.0 {
         return 0.0;
     }
-    let norm_len = params.k1
-        * (1.0 - params.b + params.b * (m.chunk_len as f32 / stats.avg_chunk_len));
+    let norm_len =
+        params.k1 * (1.0 - params.b + params.b * (m.chunk_len as f32 / stats.avg_chunk_len));
 
     terms
         .iter()
@@ -406,7 +401,8 @@ pub fn max_score_grouped(
 ) -> f32 {
     let mut best: std::collections::BTreeMap<usize, f32> = Default::default();
     for (t, &group) in terms.iter().zip(groups) {
-        let ceiling = t.weight * idf(t.doc_freq, stats.total_chunks) * (params.k1 + 1.0 + params.delta);
+        let ceiling =
+            t.weight * idf(t.doc_freq, stats.total_chunks) * (params.k1 + 1.0 + params.delta);
         let slot = best.entry(group).or_insert(0.0);
         *slot = slot.max(ceiling);
     }
@@ -455,7 +451,9 @@ mod tests {
     }
 
     fn terms(dfs: &[u64]) -> Vec<QueryTerm> {
-        dfs.iter().map(|&doc_freq| QueryTerm::exact(doc_freq)).collect()
+        dfs.iter()
+            .map(|&doc_freq| QueryTerm::exact(doc_freq))
+            .collect()
     }
 
     // ---- idf --------------------------------------------------------------
@@ -558,7 +556,10 @@ mod tests {
         };
         // With delta 0 a sufficiently long document's contribution tends to 0.
         let very_long = score(&m(10_000_000, &[1]), &t, s, plain);
-        assert!(very_long < 1e-3, "expected ~0 without delta, got {very_long}");
+        assert!(
+            very_long < 1e-3,
+            "expected ~0 without delta, got {very_long}"
+        );
     }
 
     #[test]
@@ -589,14 +590,20 @@ mod tests {
         };
         let short = score(&m(10, &[2]), &t, s, p);
         let long = score(&m(5000, &[2]), &t, s, p);
-        assert!((short - long).abs() < 1e-6, "length must not matter: {short} vs {long}");
+        assert!(
+            (short - long).abs() < 1e-6,
+            "length must not matter: {short} vs {long}"
+        );
     }
 
     // ---- degenerate inputs ------------------------------------------------
 
     #[test]
     fn an_empty_query_scores_zero() {
-        assert_eq!(score(&m(50, &[]), &[], stats(100, 50.0), Bm25Params::default()), 0.0);
+        assert_eq!(
+            score(&m(50, &[]), &[], stats(100, 50.0), Bm25Params::default()),
+            0.0
+        );
     }
 
     #[test]
@@ -607,7 +614,12 @@ mod tests {
 
     #[test]
     fn a_zero_length_chunk_does_not_divide_by_zero() {
-        let got = score(&m(0, &[2]), &terms(&[5]), stats(100, 50.0), Bm25Params::default());
+        let got = score(
+            &m(0, &[2]),
+            &terms(&[5]),
+            stats(100, 50.0),
+            Bm25Params::default(),
+        );
         assert!(got.is_finite(), "got {got}");
     }
 
@@ -633,7 +645,10 @@ mod tests {
         let p = Bm25Params::default();
         // Same query, different retrieved sets -> same ceiling. This is the
         // property min-max normalization lacks.
-        assert_eq!(max_score(&terms(&[3, 7]), s, p), max_score(&terms(&[3, 7]), s, p));
+        assert_eq!(
+            max_score(&terms(&[3, 7]), s, p),
+            max_score(&terms(&[3, 7]), s, p)
+        );
         assert!(max_score(&terms(&[3]), s, p) < max_score(&terms(&[3, 7]), s, p));
     }
 
@@ -706,12 +721,18 @@ mod tests {
 
     #[test]
     fn tokenize_lowercases_and_splits_on_punctuation() {
-        assert_eq!(tokenize("HNSW graph-construction, fast!"), vec!["hnsw", "graph", "construction", "fast"]);
+        assert_eq!(
+            tokenize("HNSW graph-construction, fast!"),
+            vec!["hnsw", "graph", "construction", "fast"]
+        );
     }
 
     #[test]
     fn tokenize_keeps_digits_and_alphanumeric_runs() {
-        assert_eq!(tokenize("bge-small-en-v1.5"), vec!["bge", "small", "en", "v1", "5"]);
+        assert_eq!(
+            tokenize("bge-small-en-v1.5"),
+            vec!["bge", "small", "en", "v1", "5"]
+        );
     }
 
     #[test]
@@ -727,7 +748,11 @@ mod tests {
 
     #[test]
     fn term_freqs_counts_each_term_positionally() {
-        let terms = vec!["graph".to_string(), "missing".to_string(), "hnsw".to_string()];
+        let terms = vec![
+            "graph".to_string(),
+            "missing".to_string(),
+            "hnsw".to_string(),
+        ];
         let got = term_freqs("HNSW graph: a graph of graphs", &terms);
         assert_eq!(got, vec![2, 0, 1], "'graphs' must not count as 'graph'");
     }
@@ -760,12 +785,18 @@ mod tests {
 
     #[test]
     fn a_title_containing_the_whole_query_scores_one() {
-        assert_eq!(title_match(&terms_of("hnsw graph"), "HNSW graph construction"), 1.0);
+        assert_eq!(
+            title_match(&terms_of("hnsw graph"), "HNSW graph construction"),
+            1.0
+        );
     }
 
     #[test]
     fn a_title_containing_none_of_the_query_scores_zero() {
-        assert_eq!(title_match(&terms_of("hnsw graph"), "Chocolate cake recipe"), 0.0);
+        assert_eq!(
+            title_match(&terms_of("hnsw graph"), "Chocolate cake recipe"),
+            0.0
+        );
     }
 
     #[test]
@@ -777,7 +808,10 @@ mod tests {
     #[test]
     fn title_match_is_case_and_punctuation_insensitive() {
         assert_eq!(title_match(&terms_of("hnsw"), "HNSW!"), 1.0);
-        assert_eq!(title_match(&terms_of("graph construction"), "Graph-Construction"), 1.0);
+        assert_eq!(
+            title_match(&terms_of("graph construction"), "Graph-Construction"),
+            1.0
+        );
     }
 
     #[test]
@@ -812,17 +846,37 @@ mod tests {
     #[test]
     fn edit_distance_counts_each_kind_of_edit_once() {
         assert_eq!(edit_distance_within("graph", "graph", 2), Some(0));
-        assert_eq!(edit_distance_within("graph", "graps", 2), Some(1), "substitution");
-        assert_eq!(edit_distance_within("graph", "grap", 2), Some(1), "deletion");
-        assert_eq!(edit_distance_within("graph", "graphs", 2), Some(1), "insertion");
-        assert_eq!(edit_distance_within("graph", "garph", 2), Some(1), "transposition");
+        assert_eq!(
+            edit_distance_within("graph", "graps", 2),
+            Some(1),
+            "substitution"
+        );
+        assert_eq!(
+            edit_distance_within("graph", "grap", 2),
+            Some(1),
+            "deletion"
+        );
+        assert_eq!(
+            edit_distance_within("graph", "graphs", 2),
+            Some(1),
+            "insertion"
+        );
+        assert_eq!(
+            edit_distance_within("graph", "garph", 2),
+            Some(1),
+            "transposition"
+        );
     }
 
     #[test]
     fn edit_distance_beyond_the_bound_is_none() {
         assert_eq!(edit_distance_within("graph", "grxpy", 1), None);
         assert_eq!(edit_distance_within("graph", "grxpy", 2), Some(2));
-        assert_eq!(edit_distance_within("graph", "gr", 2), None, "length alone rules it out");
+        assert_eq!(
+            edit_distance_within("graph", "gr", 2),
+            None,
+            "length alone rules it out"
+        );
     }
 
     #[test]
@@ -850,13 +904,21 @@ mod tests {
     #[test]
     fn an_unknown_term_expands_to_the_vocabulary_within_its_bound() {
         let got = expand(&["grph"], &["graph", "group", "graphs", "cake"]);
-        assert_eq!(got, vec![(0, "graph".to_string())], "graphs is two edits, bound is one");
+        assert_eq!(
+            got,
+            vec![(0, "graph".to_string())],
+            "graphs is two edits, bound is one"
+        );
     }
 
     #[test]
     fn a_longer_term_reaches_two_edits() {
         let got = expand(&["retreival"], &["retrieval", "retrieve"]);
-        assert_eq!(got, vec![(0, "retrieval".to_string())], "a transposition, one edit");
+        assert_eq!(
+            got,
+            vec![(0, "retrieval".to_string())],
+            "a transposition, one edit"
+        );
         let got = expand(&["retrievl"], &["retrieval"]);
         assert_eq!(got.len(), 1);
         let got = expand(&["retrievxx"], &["retrieval"]);
@@ -872,7 +934,9 @@ mod tests {
     fn expansions_are_nearest_first_then_alphabetical_and_capped() {
         // Twenty words two edits from the term, and one a single edit away
         // that sorts after all of them.
-        let far: Vec<String> = (0..20).map(|i| format!("stormcloudx{}", (b'a' + i) as char)).collect();
+        let far: Vec<String> = (0..20)
+            .map(|i| format!("stormcloudx{}", (b'a' + i) as char))
+            .collect();
         let mut vocab: Vec<&str> = far.iter().map(String::as_str).collect();
         vocab.push("stormclouds");
         let got = expand(&["stormcloud"], &vocab);
@@ -891,7 +955,10 @@ mod tests {
         let s = stats(100, 50.0);
         let p = Bm25Params::default();
         let at = |weight| {
-            let t = [QueryTerm { doc_freq: 5, weight }];
+            let t = [QueryTerm {
+                doc_freq: 5,
+                weight,
+            }];
             score(&m(50, &[3]), &t, s, p)
         };
         assert!((at(0.5) - 0.5 * at(1.0)).abs() < 1e-6);
@@ -903,7 +970,15 @@ mod tests {
         let s = stats(100, 50.0);
         let p = Bm25Params::default();
         let exact = score(&m(50, &[2]), &[QueryTerm::exact(5)], s, p);
-        let fuzzy = score(&m(50, &[2]), &[QueryTerm { doc_freq: 5, weight: 0.7 }], s, p);
+        let fuzzy = score(
+            &m(50, &[2]),
+            &[QueryTerm {
+                doc_freq: 5,
+                weight: 0.7,
+            }],
+            s,
+            p,
+        );
         assert!(exact > fuzzy, "{exact} !> {fuzzy}");
     }
 
@@ -920,10 +995,19 @@ mod tests {
         let s = stats(500, 40.0);
         let p = Bm25Params::default();
         let spelled = QueryTerm::exact(0);
-        let a = QueryTerm { doc_freq: 3, weight: 0.5 };
-        let b = QueryTerm { doc_freq: 9, weight: 0.5 };
+        let a = QueryTerm {
+            doc_freq: 3,
+            weight: 0.5,
+        };
+        let b = QueryTerm {
+            doc_freq: 9,
+            weight: 0.5,
+        };
         let grouped = max_score_grouped(&[spelled, a, b], &[0, 0, 0], s, p);
         let best = max_score_grouped(&[a], &[0], s, p);
-        assert_eq!(grouped, best, "alternatives for one word count once, at the best");
+        assert_eq!(
+            grouped, best,
+            "alternatives for one word count once, at the best"
+        );
     }
 }

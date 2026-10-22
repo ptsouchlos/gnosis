@@ -16,9 +16,7 @@ use search::Hit;
 /// scattered across index names, `--in` validation, and match arms) so an
 /// unsupported space is a compile error almost everywhere but the CLI
 /// boundary, where `FromStr` turns it into one clear, user-facing error.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Space {
     Text,
@@ -141,7 +139,8 @@ pub struct TextQuery<'a> {
 impl TextQuery<'_> {
     /// Whether `path` survives the `paths` restriction.
     pub fn allows_path(&self, path: &str) -> bool {
-        self.paths.is_none_or(|paths| paths.iter().any(|p| p == path))
+        self.paths
+            .is_none_or(|paths| paths.iter().any(|p| p == path))
     }
 }
 
@@ -221,7 +220,13 @@ pub trait Store {
         Ok(())
     }
 
-    fn search_space(&self, space: Space, query: &[f32], limit: usize, filter: &TextQuery) -> Result<Vec<Hit>>;
+    fn search_space(
+        &self,
+        space: Space,
+        query: &[f32],
+        limit: usize,
+        filter: &TextQuery,
+    ) -> Result<Vec<Hit>>;
 
     /// A document's own chunk vectors within one space — the query set for
     /// `related`, as [`search::related_sources`] selects them: in the text

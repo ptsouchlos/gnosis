@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use fastembed::{EmbeddingModel, ImageEmbedding, ImageEmbeddingModel, ImageInitOptions, InitOptions, TextEmbedding};
+use fastembed::{
+    EmbeddingModel, ImageEmbedding, ImageEmbeddingModel, ImageInitOptions, InitOptions,
+    TextEmbedding,
+};
 
 pub use embed::Embedder;
 
@@ -26,7 +29,8 @@ impl TextEmbedder {
     /// Construct from a config model name. Downloads/caches the model on first use.
     pub fn new(model_name: &str, batch_size: usize, query_instruction: bool) -> Result<Self> {
         let resolved = resolve_text_model(model_name)?;
-        let (model, dim, max_input_tokens) = (resolved.model, resolved.dim, resolved.max_input_tokens);
+        let (model, dim, max_input_tokens) =
+            (resolved.model, resolved.dim, resolved.max_input_tokens);
         let (query_prefix, document_prefix) = resolve_prefixes(model_name, query_instruction)?;
         let mut opts = InitOptions::new(model);
         if let Some(dir) = model_cache_dir() {
@@ -366,7 +370,11 @@ mod tests {
 
     #[test]
     fn bge_instructs_queries_only_and_symmetric_models_neither_side() {
-        for bge in ["bge-small-en-v1.5", "bge-small-en-v1.5-q", "bge-base-en-v1.5"] {
+        for bge in [
+            "bge-small-en-v1.5",
+            "bge-small-en-v1.5-q",
+            "bge-base-en-v1.5",
+        ] {
             assert_eq!(
                 resolve_prefixes(bge, true).expect("known model"),
                 (BGE_EN_QUERY_INSTRUCTION, ""),
@@ -384,7 +392,8 @@ mod tests {
     /// that instructs documents, and with different text from its queries.
     #[test]
     fn e5_instructs_both_sides_with_different_text() {
-        let (query, document) = resolve_prefixes("multilingual-e5-small", true).expect("known model");
+        let (query, document) =
+            resolve_prefixes("multilingual-e5-small", true).expect("known model");
         assert_eq!(query, "query: ");
         assert_eq!(document, "passage: ");
         assert_ne!(query, document);
@@ -552,14 +561,15 @@ mod tests {
         // A verified-valid 2x1 red/blue PNG, embedded as a temp file so the
         // test needs no external fixture.
         let png: &[u8] = &[
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
-            0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01,
-            0x08, 0x02, 0x00, 0x00, 0x00, 0x7B, 0x40, 0xE8, 0xDD, 0x00, 0x00, 0x00,
-            0x0F, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0xC0,
-            0xC0, 0xF0, 0x1F, 0x00, 0x07, 0x00, 0x01, 0xFF, 0x7E, 0x08, 0xB1, 0xD0,
-            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x7B, 0x40, 0xE8, 0xDD, 0x00, 0x00, 0x00, 0x0F, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0xC0, 0xC0, 0xF0, 0x1F, 0x00, 0x07, 0x00, 0x01, 0xFF,
+            0x7E, 0x08, 0xB1, 0xD0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42,
+            0x60, 0x82,
         ];
-        let path = std::env::temp_dir().join(format!("gnosis-embedder-test-{}.png", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("gnosis-embedder-test-{}.png", std::process::id()));
         std::fs::write(&path, png).unwrap();
 
         let image_vec = image_embedder
@@ -600,14 +610,16 @@ mod tests {
     fn embeds_images_whose_extension_lies_about_the_format() {
         // 3x2 lossless WebP, deliberately written under a .png name.
         let webp: &[u8] = &[
-            0x52, 0x49, 0x46, 0x46, 0x1E, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38,
-            0x4C, 0x11, 0x00, 0x00, 0x00, 0x2F, 0x02, 0x40, 0x00, 0x00, 0x07, 0x50, 0x8F, 0x22, 0x17,
-            0xA5, 0xFF, 0x81, 0x88, 0xE8, 0x7F, 0x00, 0x00
+            0x52, 0x49, 0x46, 0x46, 0x1E, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50,
+            0x38, 0x4C, 0x11, 0x00, 0x00, 0x00, 0x2F, 0x02, 0x40, 0x00, 0x00, 0x07, 0x50, 0x8F,
+            0x22, 0x17, 0xA5, 0xFF, 0x81, 0x88, 0xE8, 0x7F, 0x00, 0x00,
         ];
         let mut embedder = ImageEmbedder::new("clip-vit-b-32").expect("load image model");
 
-        let path = std::env::temp_dir()
-            .join(format!("gnosis-embedder-misnamed-{}.png", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "gnosis-embedder-misnamed-{}.png",
+            std::process::id()
+        ));
         std::fs::write(&path, webp).unwrap();
 
         let result = embedder.embed(&[path.to_string_lossy().to_string()]);
@@ -617,5 +629,4 @@ mod tests {
         assert_eq!(vectors.len(), 1);
         assert_eq!(vectors[0].len(), 512);
     }
-
 }

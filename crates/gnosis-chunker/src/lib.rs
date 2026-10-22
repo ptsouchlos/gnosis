@@ -295,7 +295,10 @@ Some text under heading 2 that is also long enough to be split into multiple chu
 
     #[test]
     fn chunk_pages_tags_each_chunk_with_its_page() {
-        let pages = vec![(1u32, "alpha beta".to_string()), (2u32, "gamma delta".to_string())];
+        let pages = vec![
+            (1u32, "alpha beta".to_string()),
+            (2u32, "gamma delta".to_string()),
+        ];
         let chunks = super::chunk_pages(&pages, 100, 10);
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].heading_path, "Page 1");
@@ -318,9 +321,15 @@ Some text under heading 2 that is also long enough to be split into multiple chu
 
     #[test]
     fn chunk_pages_windows_a_long_page_into_several_chunks() {
-        let long = (1..=50).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+        let long = (1..=50)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let chunks = super::chunk_pages(&[(7u32, long)], 10, 2);
-        assert!(chunks.len() > 1, "a 50-word page must split at max_tokens 10");
+        assert!(
+            chunks.len() > 1,
+            "a 50-word page must split at max_tokens 10"
+        );
         assert!(
             chunks.iter().all(|c| c.heading_path == "Page 7"),
             "every chunk of a page keeps that page's label"
@@ -329,7 +338,10 @@ Some text under heading 2 that is also long enough to be split into multiple chu
 
     #[test]
     fn chunk_pages_ord_is_sequential_across_pages() {
-        let long = (1..=30).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+        let long = (1..=30)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let pages = vec![(1u32, long.clone()), (2u32, long)];
         let chunks = super::chunk_pages(&pages, 10, 2);
         let ords: Vec<usize> = chunks.iter().map(|c| c.ord).collect();
@@ -368,10 +380,20 @@ mod document_tests {
     /// is added alongside it.
     #[test]
     fn a_document_with_a_body_chunks_as_its_body() {
-        let chunks = chunk_document("Sourdough", "author: someone", "# Sourdough\n\nA long proof.\n", 256, 43);
+        let chunks = chunk_document(
+            "Sourdough",
+            "author: someone",
+            "# Sourdough\n\nA long proof.\n",
+            256,
+            43,
+        );
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].heading_path, "Sourdough");
-        assert!(chunks[0].text.contains("A long proof"), "got {:?}", chunks[0].text);
+        assert!(
+            chunks[0].text.contains("A long proof"),
+            "got {:?}",
+            chunks[0].text
+        );
         assert!(
             !chunks[0].text.contains("author"),
             "frontmatter belongs to the fallback, not to a body chunk"

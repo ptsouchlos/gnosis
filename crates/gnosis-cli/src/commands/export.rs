@@ -138,7 +138,11 @@ pub fn execute(ws: &Workspace, args: ExportArgs) -> Result<()> {
     if let Some(old) = &previous {
         let current: std::collections::HashSet<&str> =
             shards.iter().map(|(n, _)| n.as_str()).collect();
-        for stale in old.shards.iter().filter(|s| !current.contains(s.name.as_str())) {
+        for stale in old
+            .shards
+            .iter()
+            .filter(|s| !current.contains(s.name.as_str()))
+        {
             if std::fs::remove_file(out.join(&stale.name)).is_ok() {
                 removed += 1;
             }
@@ -487,7 +491,10 @@ mod tests {
 
     fn temp_dir(tag: &str) -> PathBuf {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
         let dir = std::env::temp_dir().join(format!(
             "gnosis-export-{tag}-{}-{nanos}",
             std::process::id()
@@ -513,9 +520,24 @@ mod tests {
         store.set_meta("prefix.text.document", "").unwrap();
 
         let docs: [(&str, &str, Vec<f32>, &str); 3] = [
-            ("/vault/near.md", "Near", vec![1.0, 0.0, 0.0, 0.0], "alpha beta"),
-            ("/vault/mid.md", "Mid", vec![0.7, 0.7, 0.0, 0.0], "beta gamma"),
-            ("/vault/deep/far.md", "Far", vec![0.0, 1.0, 0.0, 0.0], "gamma delta"),
+            (
+                "/vault/near.md",
+                "Near",
+                vec![1.0, 0.0, 0.0, 0.0],
+                "alpha beta",
+            ),
+            (
+                "/vault/mid.md",
+                "Mid",
+                vec![0.7, 0.7, 0.0, 0.0],
+                "beta gamma",
+            ),
+            (
+                "/vault/deep/far.md",
+                "Far",
+                vec![0.0, 1.0, 0.0, 0.0],
+                "gamma delta",
+            ),
         ];
         for (path, title, vector, text) in docs {
             store
@@ -664,7 +686,8 @@ mod tests {
             compression,
             Space::ALL,
             256,
-        ).unwrap()
+        )
+        .unwrap()
     }
 
     /// **The acceptance gate for this format.** Querying an artifact must
@@ -681,8 +704,7 @@ mod tests {
             .search_space(Space::Text, &query, 10, &TextQuery::default())
             .unwrap();
 
-        let (manifest, shards) =
-            build_one(&store, Quantization::F32, Compression::Deflate);
+        let (manifest, shards) = build_one(&store, Quantization::F32, Compression::Deflate);
         let artifact = open_artifact(&manifest, shards);
         let from_artifact = search::rank(&query, artifact.search_candidates(Space::Text), 10);
 
@@ -708,15 +730,11 @@ mod tests {
     fn f32_export_preserves_vectors_bit_for_bit() {
         let dir = temp_dir("vectors");
         let store = seeded_store(&dir);
-        let (manifest, shards) =
-            build_one(&store, Quantization::F32, Compression::Deflate);
+        let (manifest, shards) = build_one(&store, Quantization::F32, Compression::Deflate);
         let artifact = open_artifact(&manifest, shards);
 
-        let mut vectors: Vec<Vec<f32>> = artifact
-            .chunks()
-            .iter()
-            .map(|c| c.vector.clone())
-            .collect();
+        let mut vectors: Vec<Vec<f32>> =
+            artifact.chunks().iter().map(|c| c.vector.clone()).collect();
         vectors.sort_by(|a, b| b[0].partial_cmp(&a[0]).unwrap());
         assert_eq!(vectors[0], vec![1.0, 0.0, 0.0, 0.0]);
         assert_eq!(vectors[1], vec![0.7, 0.7, 0.0, 0.0]);
@@ -730,9 +748,16 @@ mod tests {
         let dir = temp_dir("relative");
         let store = seeded_store(&dir);
         let (manifest, shards) = build_one(&store, Quantization::F32, Compression::Deflate);
-        assert_eq!(manifest.roots, vec!["vault".to_string()], "roots are labels");
+        assert_eq!(
+            manifest.roots,
+            vec!["vault".to_string()],
+            "roots are labels"
+        );
         let json = manifest.to_json().unwrap();
-        assert!(!json.contains("/vault"), "an absolute path leaked into the manifest");
+        assert!(
+            !json.contains("/vault"),
+            "an absolute path leaked into the manifest"
+        );
 
         // Documents live in the shards now, so check the bytes that ship.
         for (_, body) in &shards {
@@ -756,7 +781,8 @@ mod tests {
 
         assert_eq!(text_space(&manifest).id, "bge-small-en-v1.5");
         assert_eq!(
-            text_space(&manifest).pooling, "cls",
+            text_space(&manifest).pooling,
+            "cls",
             "a client that guesses pooling produces plausible, wrong vectors"
         );
         assert_eq!(text_space(&manifest).dim, 4);
@@ -828,7 +854,7 @@ mod tests {
             Space::ALL,
             256,
         )
-            .expect_err("should refuse");
+        .expect_err("should refuse");
         assert!(err.to_string().contains("some-future-model"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -838,15 +864,15 @@ mod tests {
         let dir = temp_dir("shards");
         let store = seeded_store(&dir);
         // One document per shard, so the split is unambiguous.
-        let (manifest, shards) =
-            build_artifact(
+        let (manifest, shards) = build_artifact(
             &store,
             "bge-small-en-v1.5",
             Quantization::F32,
             Compression::Deflate,
             Space::ALL,
             1,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(manifest.shards.len(), 3, "three documents, one per shard");
         assert_eq!(shards.len(), 3);
@@ -859,7 +885,11 @@ mod tests {
         // And the assembled artifact is indistinguishable from a single-shard
         // one, which is the property that matters to a reader.
         let artifact = open_artifact(&manifest, shards);
-        let mut paths: Vec<&str> = artifact.documents().iter().map(|d| d.path.as_str()).collect();
+        let mut paths: Vec<&str> = artifact
+            .documents()
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect();
         paths.sort();
         assert_eq!(paths, vec!["deep/far.md", "mid.md", "near.md"]);
         let _ = std::fs::remove_dir_all(dir);
@@ -875,15 +905,15 @@ mod tests {
 
         let mut rankings = Vec::new();
         for shard_docs in [1, 2, 256] {
-            let (manifest, shards) =
-                build_artifact(
-            &store,
-            "bge-small-en-v1.5",
-            Quantization::F32,
-            Compression::Deflate,
-            Space::ALL,
-            shard_docs,
-        ).unwrap();
+            let (manifest, shards) = build_artifact(
+                &store,
+                "bge-small-en-v1.5",
+                Quantization::F32,
+                Compression::Deflate,
+                Space::ALL,
+                shard_docs,
+            )
+            .unwrap();
             let artifact = open_artifact(&manifest, shards);
             let hits = search::rank(&query, artifact.search_candidates(Space::Text), 10);
             rankings.push(
@@ -921,7 +951,8 @@ mod tests {
             Compression::Deflate,
             Space::ALL,
             2,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(before.len(), 2, "three documents at two per shard");
 
         store
@@ -950,16 +981,20 @@ mod tests {
             })
             .unwrap();
 
-        let (manifest, after) =
-            build_artifact(
+        let (manifest, after) = build_artifact(
             &store,
             "bge-small-en-v1.5",
             Quantization::F32,
             Compression::Deflate,
             Space::ALL,
             2,
-        ).unwrap();
-        assert_eq!(after.len(), 2, "four documents at two per shard is still two shards");
+        )
+        .unwrap();
+        assert_eq!(
+            after.len(),
+            2,
+            "four documents at two per shard is still two shards"
+        );
 
         let changed = before
             .iter()
@@ -994,7 +1029,8 @@ mod tests {
             Compression::Deflate,
             Space::ALL,
             1,
-        ).unwrap();
+        )
+        .unwrap();
 
         store
             .replace_document(&DocWrite {
@@ -1028,7 +1064,8 @@ mod tests {
             Compression::Deflate,
             Space::ALL,
             1,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(before.len(), after.len(), "shard count should not change");
 
         let changed = before
@@ -1037,7 +1074,8 @@ mod tests {
             .filter(|((_, a), (_, b))| a != b)
             .count();
         assert_eq!(
-            changed, 1,
+            changed,
+            1,
             "editing one note should rewrite exactly one of {} shards",
             before.len()
         );
@@ -1050,10 +1088,8 @@ mod tests {
         let store = seeded_store(&dir);
         let query = [1.0, 0.0, 0.0, 0.0];
 
-        let (_, f32_shards) =
-            build_one(&store, Quantization::F32, Compression::Deflate);
-        let (manifest, i8_shards) =
-            build_one(&store, Quantization::I8, Compression::Deflate);
+        let (_, f32_shards) = build_one(&store, Quantization::F32, Compression::Deflate);
+        let (manifest, i8_shards) = build_one(&store, Quantization::I8, Compression::Deflate);
         let i8_bytes: usize = i8_shards.iter().map(|(_, b)| b.len()).sum();
         let f32_bytes: usize = f32_shards.iter().map(|(_, b)| b.len()).sum();
         assert!(
@@ -1130,7 +1166,10 @@ mod tests {
 
         let mut other = base.clone();
         other.spaces.clear();
-        assert!(!carries_over(&base, &other), "dropping a space must invalidate");
+        assert!(
+            !carries_over(&base, &other),
+            "dropping a space must invalidate"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1179,7 +1218,11 @@ mod tests {
             "related must still see both title proxies and the image"
         );
         // The text space is untouched by the image space riding along.
-        let text = search::rank(&[1.0, 0.0, 0.0, 0.0], artifact.search_candidates(Space::Text), 10);
+        let text = search::rank(
+            &[1.0, 0.0, 0.0, 0.0],
+            artifact.search_candidates(Space::Text),
+            10,
+        );
         assert_eq!(text.len(), 3);
         assert_eq!(text[0].path, "near.md");
         let _ = std::fs::remove_dir_all(dir);
@@ -1269,7 +1312,11 @@ mod tests {
                     art.path,
                     "'{query}' ranked differently"
                 );
-                assert_eq!(db.score, art.score, "'{query}' scored {} differently", art.path);
+                assert_eq!(
+                    db.score, art.score,
+                    "'{query}' scored {} differently",
+                    art.path
+                );
             }
         }
         let _ = std::fs::remove_dir_all(dir);
@@ -1296,10 +1343,22 @@ mod tests {
         let exclude_db = vec!["/vault/near.md".to_string()];
         let exclude_art = vec!["near.md".to_string()];
         let from_db = store
-            .related_space(Space::Text, &vectors, &exclude_db, 10, &TextQuery::default())
+            .related_space(
+                Space::Text,
+                &vectors,
+                &exclude_db,
+                10,
+                &TextQuery::default(),
+            )
             .unwrap();
         let from_artifact = artifact
-            .related_space(Space::Text, &vectors, &exclude_art, 10, &TextQuery::default())
+            .related_space(
+                Space::Text,
+                &vectors,
+                &exclude_art,
+                10,
+                &TextQuery::default(),
+            )
             .unwrap();
         assert_eq!(from_db.len(), from_artifact.len());
         for (db, art) in from_db.iter().zip(&from_artifact) {
@@ -1354,22 +1413,34 @@ mod tests {
         let (manifest, shards) = build_one(&store, Quantization::F32, Compression::Deflate);
         let artifact = ArtifactStore::new(open_artifact(&manifest, shards));
         let query = [1.0, 0.0, 0.0, 0.0];
-        let all = artifact.search_space(Space::Text, &query, 10, &TextQuery::default()).unwrap();
+        let all = artifact
+            .search_space(Space::Text, &query, 10, &TextQuery::default())
+            .unwrap();
         let last = vec![all.last().expect("a seeded document").path.clone()];
 
         let named = TextQuery {
             paths: Some(&last),
             ..TextQuery::default()
         };
-        let hits = artifact.search_space(Space::Text, &query, 1, &named).unwrap();
-        assert_eq!(hits.iter().map(|h| h.path.clone()).collect::<Vec<_>>(), last);
+        let hits = artifact
+            .search_space(Space::Text, &query, 1, &named)
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.path.clone()).collect::<Vec<_>>(),
+            last
+        );
 
         let none: Vec<String> = Vec::new();
         let nothing = TextQuery {
             paths: Some(&none),
             ..TextQuery::default()
         };
-        assert!(artifact.search_space(Space::Text, &query, 10, &nothing).unwrap().is_empty());
+        assert!(
+            artifact
+                .search_space(Space::Text, &query, 10, &nothing)
+                .unwrap()
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1462,9 +1533,14 @@ mod tests {
         let mut store = SqliteStore::open(&dir.join("gnosis.db")).unwrap();
         store.set_meta("model.text", "bge-small-en-v1.5").unwrap();
         store.set_meta("dim.text", "2").unwrap();
-        store.set_meta("prefix.text.query", BGE_QUERY_INSTRUCTION).unwrap();
+        store
+            .set_meta("prefix.text.query", BGE_QUERY_INSTRUCTION)
+            .unwrap();
         store.set_meta("prefix.text.document", "").unwrap();
-        for (path, text) in [("accented.md", "une pause café"), ("plain.md", "a cafe stop")] {
+        for (path, text) in [
+            ("accented.md", "une pause café"),
+            ("plain.md", "a cafe stop"),
+        ] {
             store
                 .replace_document(&DocWrite {
                     path: &format!("/vault/{path}"),
@@ -1524,7 +1600,9 @@ mod tests {
         let mut store = SqliteStore::open(&dir.join("gnosis.db")).unwrap();
         store.set_meta("model.text", "bge-small-en-v1.5").unwrap();
         store.set_meta("dim.text", "2").unwrap();
-        store.set_meta("prefix.text.query", BGE_QUERY_INSTRUCTION).unwrap();
+        store
+            .set_meta("prefix.text.query", BGE_QUERY_INSTRUCTION)
+            .unwrap();
         store.set_meta("prefix.text.document", "").unwrap();
         for (path, text) in [
             ("a.md", "retrieval of graph indexes"),
@@ -1565,11 +1643,18 @@ mod tests {
             ..Default::default()
         };
         let rank = |s: &dyn Store| -> Vec<(String, f32)> {
-            query::fuse_text_space(s, "retreival graph", Vec::new(), 10, &TextQuery::default(), &cfg)
-                .unwrap()
-                .into_iter()
-                .map(|h| (h.path.rsplit('/').next().unwrap().to_string(), h.score))
-                .collect()
+            query::fuse_text_space(
+                s,
+                "retreival graph",
+                Vec::new(),
+                10,
+                &TextQuery::default(),
+                &cfg,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.path.rsplit('/').next().unwrap().to_string(), h.score))
+            .collect()
         };
         let from_db = rank(&store);
         let from_artifact = rank(&artifact);
@@ -1783,12 +1868,10 @@ mod tests {
             let mtime = fs::FileReader::mtime(&crate::fs::StdFs, path);
             let added = builder.add_document(&rel, &text, mtime);
             assert!(!added.reused, "a fresh build reuses nothing");
-            let vectors: Vec<f32> = added
-                .texts
-                .iter()
-                .flat_map(|t| hash_vector(t))
-                .collect();
-            builder.set_vectors(&rel, &vectors).expect("setting vectors");
+            let vectors: Vec<f32> = added.texts.iter().flat_map(|t| hash_vector(t)).collect();
+            builder
+                .set_vectors(&rel, &vectors)
+                .expect("setting vectors");
         }
         let built = builder
             .finish(cli_manifest.created_unix)
@@ -1975,9 +2058,10 @@ mod tests {
             query_prefix: "",
             ..e5
         };
-        let Err(err) =
-            index::builder::ArtifactBuilder::reusing(spec_for(&unprefixed, "mean", "vault"), artifact)
-        else {
+        let Err(err) = index::builder::ArtifactBuilder::reusing(
+            spec_for(&unprefixed, "mean", "vault"),
+            artifact,
+        ) else {
             panic!("an artifact embedded with another document prefix must not be reusable");
         };
         assert!(format!("{err:#}").contains("passage: "), "got {err:#}");

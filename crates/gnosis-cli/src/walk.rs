@@ -7,8 +7,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
-use walk::{DocKind, Found};
 pub use walk::Walker;
+use walk::{DocKind, Found};
 
 /// Filesystem-backed [`Walker`] using the `ignore` crate.
 pub struct FsWalker {
@@ -65,11 +65,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn temp_vault(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "gnosis-walk-test-{}-{}",
-            std::process::id(),
-            name
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("gnosis-walk-test-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("note.md"), "# n").unwrap();

@@ -106,9 +106,7 @@ fn first_h1(body: &str) -> Option<String> {
             in_code = !in_code;
             continue;
         }
-        if !in_code
-            && let Some(rest) = trimmed.strip_prefix("# ")
-        {
+        if !in_code && let Some(rest) = trimmed.strip_prefix("# ") {
             let title = rest.trim();
             if !title.is_empty() {
                 return Some(title.to_string());
@@ -385,7 +383,9 @@ fn extract_inline_tags(body: &str) -> Vec<String> {
             let is_tag_start = bytes[i] == b'#'
                 && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
                 && i + 1 < bytes.len()
-                && (bytes[i + 1].is_ascii_alphabetic() || bytes[i + 1] == b'_' || bytes[i + 1] == b'/');
+                && (bytes[i + 1].is_ascii_alphabetic()
+                    || bytes[i + 1] == b'_'
+                    || bytes[i + 1] == b'/');
             if is_tag_start {
                 let start = i + 1;
                 let mut end = start;
@@ -612,7 +612,10 @@ mod obsidian_tests {
     #[test]
     fn created_reads_a_plain_date() {
         assert_eq!(extract_created_unix("created: 1970-01-02"), Some(86_400));
-        assert_eq!(extract_created_unix("created: 2024-02-29"), Some(1_709_164_800));
+        assert_eq!(
+            extract_created_unix("created: 2024-02-29"),
+            Some(1_709_164_800)
+        );
     }
 
     #[test]

@@ -11,8 +11,8 @@ pub mod export;
 pub mod forget;
 pub mod index;
 pub mod init;
-pub mod related;
 pub mod rebuild;
+pub mod related;
 pub mod search;
 pub mod status;
 
@@ -51,5 +51,9 @@ pub(crate) fn build_embedders(config: &EmbedConfig) -> Result<Embedders> {
     } else {
         (None, None)
     };
-    Ok(Embedders { text, image, image_text })
+    Ok(Embedders {
+        text,
+        image,
+        image_text,
+    })
 }

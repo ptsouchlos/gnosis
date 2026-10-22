@@ -48,7 +48,10 @@ pub trait Embedder {
         if prefix.is_empty() {
             return self.embed(inputs);
         }
-        let prefixed: Vec<String> = inputs.iter().map(|text| format!("{prefix}{text}")).collect();
+        let prefixed: Vec<String> = inputs
+            .iter()
+            .map(|text| format!("{prefix}{text}"))
+            .collect();
         self.embed(&prefixed)
     }
 
@@ -196,7 +199,11 @@ mod tests {
     fn text_batch_size_round_trips_through_toml() {
         let cfg: TextEmbedConfig = toml::from_str("batch_size = 4\n").unwrap();
         assert_eq!(cfg.batch_size, 4);
-        assert_eq!(cfg.model, TextEmbedConfig::default().model, "other fields keep their defaults");
+        assert_eq!(
+            cfg.model,
+            TextEmbedConfig::default().model,
+            "other fields keep their defaults"
+        );
     }
 
     #[test]
@@ -295,7 +302,10 @@ mod tests {
             .expect("embed document");
         assert_eq!(
             e5.seen,
-            vec!["query: tent repair".to_string(), "passage: patching a fly".to_string()]
+            vec![
+                "query: tent repair".to_string(),
+                "passage: patching a fly".to_string()
+            ]
         );
     }
 }

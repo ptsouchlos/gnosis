@@ -405,8 +405,6 @@ impl SqliteStore {
         Ok(())
     }
 
-
-
     /// Add `column` to `table` if it isn't already present. `CREATE TABLE IF
     /// NOT EXISTS` only helps brand-new databases; existing ones need an
     /// explicit, idempotent `ALTER TABLE` — SQLite has no `ADD COLUMN IF NOT
@@ -470,7 +468,8 @@ impl SqliteStore {
         // the index's *shape* changed, and `CREATE VIRTUAL TABLE IF NOT EXISTS`
         // is a no-op against an existing table, so a column added here would
         // otherwise never reach a database that already had an index.
-        self.conn.execute_batch("DROP TABLE IF EXISTS chunks_fts;")?;
+        self.conn
+            .execute_batch("DROP TABLE IF EXISTS chunks_fts;")?;
         self.conn.execute_batch(LEXICAL_INDEX_DDL)?;
         self.conn.execute_batch(
             "INSERT INTO chunks_fts(rowid, heading_path, text)
@@ -559,7 +558,10 @@ impl SqliteStore {
             if paths.is_empty() {
                 return Ok(Vec::new());
             }
-            sql.push_str(&format!(" AND d.path IN ({})", in_placeholders(paths.len())));
+            sql.push_str(&format!(
+                " AND d.path IN ({})",
+                in_placeholders(paths.len())
+            ));
         }
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -841,9 +843,7 @@ impl Store for SqliteStore {
         let sql = format!("SELECT path FROM documents_abs WHERE source_root IN ({placeholders})");
         let mut stmt = self.conn.prepare(&sql)?;
         let paths = stmt
-            .query_map(rusqlite::params_from_iter(roots), |r| {
-                r.get::<_, String>(0)
-            })?
+            .query_map(rusqlite::params_from_iter(roots), |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(paths)
     }
@@ -1013,7 +1013,10 @@ impl Store for SqliteStore {
                     candidates: Vec::new(),
                 });
             }
-            sql.push_str(&format!(" AND d.path IN ({})", in_placeholders(paths.len())));
+            sql.push_str(&format!(
+                " AND d.path IN ({})",
+                in_placeholders(paths.len())
+            ));
         }
         // FTS5's own bm25() only orders the candidate set here; BM25+ does the
         // real scoring. Ordering by it means a truncated set keeps the most
@@ -1046,7 +1049,9 @@ impl Store for SqliteStore {
             "CREATE VIRTUAL TABLE IF NOT EXISTS temp.chunks_fts_vocab
              USING fts5vocab(main, chunks_fts, 'row')",
         )?;
-        let mut stmt = self.conn.prepare("SELECT term FROM temp.chunks_fts_vocab")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT term FROM temp.chunks_fts_vocab")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             visit(&row.get::<_, String>(0)?);
@@ -1054,7 +1059,13 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    fn search_space(&self, space: Space, query: &[f32], limit: usize, filter: &TextQuery) -> Result<Vec<Hit>> {
+    fn search_space(
+        &self,
+        space: Space,
+        query: &[f32],
+        limit: usize,
+        filter: &TextQuery,
+    ) -> Result<Vec<Hit>> {
         // Over-fetch only when filtering by root/tag, which ANN can't apply.
         // Modality needs no over-fetch: the index is per-modality, so nothing
         // is discarded after retrieval.
@@ -1109,9 +1120,13 @@ impl Store for SqliteStore {
     }
 
     fn all_document_meta(&self) -> Result<Vec<(String, Option<String>)>> {
-        let mut stmt = self.conn.prepare("SELECT path, frontmatter FROM documents_abs")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, frontmatter FROM documents_abs")?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))?
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -1233,8 +1248,11 @@ mod tests {
     /// (and corrupt each other's) `index/text.usearch`/`index/image.usearch`
     /// files. Returns the directory so callers can `remove_dir_all` it.
     fn temp_store() -> (SqliteStore, PathBuf) {
-        let dir = std::env::temp_dir()
-            .join(format!("gnosis-store-space-test-{}-{}", std::process::id(), rand_suffix()));
+        let dir = std::env::temp_dir().join(format!(
+            "gnosis-store-space-test-{}-{}",
+            std::process::id(),
+            rand_suffix()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("gnosis.db");
@@ -1256,7 +1274,10 @@ mod tests {
     /// document would be worse than storing something visibly wrong.
     #[test]
     fn relative_to_root_keeps_a_path_outside_the_root() {
-        assert_eq!(relative_to_root("/elsewhere/x.md", "/vault"), "/elsewhere/x.md");
+        assert_eq!(
+            relative_to_root("/elsewhere/x.md", "/vault"),
+            "/elsewhere/x.md"
+        );
     }
 
     #[test]
@@ -1283,7 +1304,10 @@ mod tests {
 
         // Callers still see absolute paths: the storage changed, not the API.
         let paths = store.paths_for_roots(&["/vault".to_string()]).unwrap();
-        assert!(paths.contains(&"/vault/nested/b.md".to_string()), "got {paths:?}");
+        assert!(
+            paths.contains(&"/vault/nested/b.md".to_string()),
+            "got {paths:?}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1370,8 +1394,11 @@ mod tests {
 
     #[test]
     fn migration_rewrites_paths_relative_and_keeps_document_ids() {
-        let dir = std::env::temp_dir()
-            .join(format!("gnosis-migrate-{}-{}", std::process::id(), rand_suffix()));
+        let dir = std::env::temp_dir().join(format!(
+            "gnosis-migrate-{}-{}",
+            std::process::id(),
+            rand_suffix()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = legacy_store(&dir);
@@ -1417,8 +1444,11 @@ mod tests {
     /// still leaves a working-looking index behind.
     #[test]
     fn migration_preserves_chunks_despite_cascading_foreign_keys() {
-        let dir = std::env::temp_dir()
-            .join(format!("gnosis-migrate-fk-{}-{}", std::process::id(), rand_suffix()));
+        let dir = std::env::temp_dir().join(format!(
+            "gnosis-migrate-fk-{}-{}",
+            std::process::id(),
+            rand_suffix()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = legacy_store(&dir);
@@ -1451,8 +1481,11 @@ mod tests {
     /// table's shape, so it has to recognize its own output.
     #[test]
     fn migration_is_idempotent_across_reopens() {
-        let dir = std::env::temp_dir()
-            .join(format!("gnosis-migrate-twice-{}-{}", std::process::id(), rand_suffix()));
+        let dir = std::env::temp_dir().join(format!(
+            "gnosis-migrate-twice-{}-{}",
+            std::process::id(),
+            rand_suffix()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = legacy_store(&dir);
@@ -1475,7 +1508,10 @@ mod tests {
 
     fn rand_suffix() -> u64 {
         use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos() as u64
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos() as u64
     }
 
     fn write_full_doc(
@@ -1568,15 +1604,25 @@ mod tests {
             paths: Some(&far),
             ..TextQuery::default()
         };
-        let hits = store.search_space(Space::Text, &[1.0, 0.0], 1, &named).unwrap();
-        assert_eq!(hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(), vec!["/vault/far.md"]);
+        let hits = store
+            .search_space(Space::Text, &[1.0, 0.0], 1, &named)
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+            vec!["/vault/far.md"]
+        );
 
         let none: Vec<String> = Vec::new();
         let nothing = TextQuery {
             paths: Some(&none),
             ..TextQuery::default()
         };
-        assert!(store.search_space(Space::Text, &[1.0, 0.0], 10, &nothing).unwrap().is_empty());
+        assert!(
+            store
+                .search_space(Space::Text, &[1.0, 0.0], 10, &nothing)
+                .unwrap()
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&path);
     }
 
@@ -1601,7 +1647,13 @@ mod tests {
         );
 
         let hits = store
-            .related_space(Space::Image, &[vec![1.0, 0.0]], &[], 10, &TextQuery::default())
+            .related_space(
+                Space::Image,
+                &[vec![1.0, 0.0]],
+                &[],
+                10,
+                &TextQuery::default(),
+            )
             .unwrap();
 
         let mut paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
@@ -1626,10 +1678,25 @@ mod tests {
             None,
         );
 
-        assert_eq!(store.chunk_vectors("/vault/note.md", Space::Text).unwrap().len(), 1);
-        assert_eq!(store.chunk_vectors("/vault/note.md", Space::Image).unwrap().len(), 1);
         assert_eq!(
-            store.chunk_vectors("/vault/photo.png", Space::Image).unwrap().len(),
+            store
+                .chunk_vectors("/vault/note.md", Space::Text)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .chunk_vectors("/vault/note.md", Space::Image)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .chunk_vectors("/vault/photo.png", Space::Image)
+                .unwrap()
+                .len(),
             0
         );
 
@@ -1728,7 +1795,8 @@ mod tests {
     /// indexing/forgetting one vault never touches another in a shared DB.
     #[test]
     fn root_scoped_queries() {
-        let path = std::env::temp_dir().join(format!("gnosis-store-test-{}.db", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("gnosis-store-test-{}.db", std::process::id()));
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
@@ -1744,7 +1812,12 @@ mod tests {
         assert!(store.paths_for_roots(&[]).unwrap().is_empty());
 
         assert_eq!(store.delete_by_root("/a").unwrap(), 2);
-        assert!(store.paths_for_roots(&["/a".to_string()]).unwrap().is_empty());
+        assert!(
+            store
+                .paths_for_roots(&["/a".to_string()])
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             store.paths_for_roots(&["/b".to_string()]).unwrap(),
             vec!["/b/1.md".to_string()]
@@ -1839,7 +1912,10 @@ mod tests {
                 None,
             );
         }
-        for (i, v) in [vec![0.6, 0.8], vec![0.8, 0.6], vec![0.0, 1.0]].iter().enumerate() {
+        for (i, v) in [vec![0.6, 0.8], vec![0.8, 0.6], vec![0.0, 1.0]]
+            .iter()
+            .enumerate()
+        {
             write_full_doc(
                 &mut store,
                 &format!("/vault/photo{i}.png"),
@@ -1945,7 +2021,11 @@ mod tests {
         let (mut store, path) = temp_store();
         write_text_doc_with(&mut store, "/vault/a.md", &["hnsw graph", "graph again"]);
         let mut seen = std::collections::BTreeSet::new();
-        store.vocabulary(&mut |w| { seen.insert(w.to_string()); }).unwrap();
+        store
+            .vocabulary(&mut |w| {
+                seen.insert(w.to_string());
+            })
+            .unwrap();
         assert_eq!(
             seen.into_iter().collect::<Vec<_>>(),
             vec!["again", "graph", "hnsw"]
@@ -1993,7 +2073,11 @@ mod tests {
         let got = store
             .lexical_candidates(&terms, 50, &TextQuery::default())
             .unwrap();
-        assert_eq!(got.doc_freqs, vec![2, 0], "df must align with the terms given");
+        assert_eq!(
+            got.doc_freqs,
+            vec![2, 0],
+            "df must align with the terms given"
+        );
 
         let _ = std::fs::remove_dir_all(&path);
     }
@@ -2231,7 +2315,11 @@ mod tests {
             1,
             "a heading-only term must match its own chunk"
         );
-        assert_eq!(got.doc_freqs, vec![1], "and must count toward document frequency");
+        assert_eq!(
+            got.doc_freqs,
+            vec![1],
+            "and must count toward document frequency"
+        );
 
         let _ = std::fs::remove_dir_all(&path);
     }
@@ -2250,7 +2338,12 @@ mod tests {
                 title: "b",
                 frontmatter: None,
                 indexed_at: 0,
-                chunks: &[chunk("text", "text", Some("sharedterm two"), vec![1.0, 0.0])],
+                chunks: &[chunk(
+                    "text",
+                    "text",
+                    Some("sharedterm two"),
+                    vec![1.0, 0.0],
+                )],
                 links: &[],
                 tags: &[],
                 width: None,
