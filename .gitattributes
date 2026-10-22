@@ -1,0 +1,4 @@
+# A PDF can hold no NUL byte, and git then treats it as text: a Windows
+# checkout with core.autocrlf rewrites its line endings and breaks its byte
+# offsets.
+*.pdf binary
