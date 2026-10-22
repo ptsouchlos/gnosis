@@ -512,9 +512,8 @@ pub fn write_shard(
     // Documents ride inside the shard as JSON at a known offset: self-contained
     // in one file with one hash, still readable with `head -c`, and small enough
     // next to the vector block that a binary encoding would not pay for itself.
-    let docs_json = compression.pack(
-        serde_json::to_vec(documents).context("serializing shard documents")?,
-    );
+    let docs_json =
+        compression.pack(serde_json::to_vec(documents).context("serializing shard documents")?);
     let strings = compression.pack(strings);
 
     let mut out = Vec::with_capacity(
@@ -684,12 +683,8 @@ pub fn read_shard(bytes: &[u8]) -> Result<(Vec<DocumentEntry>, Vec<ArtifactChunk
             let heading_len = u32_at(bytes, r + 16) as usize;
             let text_off = u32_at(bytes, r + 20) as usize;
             let text_len = u32_at(bytes, r + 24) as usize;
-            let scale = f32::from_le_bytes([
-                bytes[r + 28],
-                bytes[r + 29],
-                bytes[r + 30],
-                bytes[r + 31],
-            ]);
+            let scale =
+                f32::from_le_bytes([bytes[r + 28], bytes[r + 29], bytes[r + 30], bytes[r + 31]]);
 
             let heading_path = read_str(strings, heading_off, heading_len, "heading_path")?;
             let text = read_str(strings, text_off, text_len, "text")?;
@@ -697,12 +692,14 @@ pub fn read_shard(bytes: &[u8]) -> Result<(Vec<DocumentEntry>, Vec<ArtifactChunk
             let v = vector_at;
             let vector = match quantization {
                 Quantization::F32 => (0..dim)
-                    .map(|d| f32::from_le_bytes([
-                        bytes[v + d * 4],
-                        bytes[v + d * 4 + 1],
-                        bytes[v + d * 4 + 2],
-                        bytes[v + d * 4 + 3],
-                    ]))
+                    .map(|d| {
+                        f32::from_le_bytes([
+                            bytes[v + d * 4],
+                            bytes[v + d * 4 + 1],
+                            bytes[v + d * 4 + 2],
+                            bytes[v + d * 4 + 3],
+                        ])
+                    })
                     .collect(),
                 Quantization::I8 => (0..dim)
                     .map(|d| (bytes[v + d] as i8) as f32 * scale)
@@ -860,7 +857,12 @@ impl Artifact {
             .filter(|c| c.space == space && keep(c))
             .filter_map(|c| {
                 let doc = self.documents.get(c.doc_index)?;
-                let root = self.manifest.roots.get(doc.root).cloned().unwrap_or_default();
+                let root = self
+                    .manifest
+                    .roots
+                    .get(doc.root)
+                    .cloned()
+                    .unwrap_or_default();
                 Some(search::Candidate {
                     path: doc.path.clone(),
                     title: doc.title.clone(),
@@ -960,8 +962,14 @@ mod tests {
     }
 
     fn one_shard(documents: &[DocumentEntry], chunks: &[ArtifactChunk]) -> (Manifest, Vec<u8>) {
-        let bytes = write_shard(documents, chunks, &text2(), Quantization::F32, Compression::None)
-            .expect("write");
+        let bytes = write_shard(
+            documents,
+            chunks,
+            &text2(),
+            Quantization::F32,
+            Compression::None,
+        )
+        .expect("write");
         let m = manifest(
             vec![ShardInfo {
                 name: shard_name(0),
@@ -981,7 +989,14 @@ mod tests {
             chunk(0, "Heading", "first body", vec![1.0, 0.0]),
             chunk(1, "", "second body", vec![0.0, 1.0]),
         ];
-        let bytes = write_shard(&docs, &chunks, &text2(), Quantization::F32, Compression::None).expect("write");
+        let bytes = write_shard(
+            &docs,
+            &chunks,
+            &text2(),
+            Quantization::F32,
+            Compression::None,
+        )
+        .expect("write");
         let (back_docs, back_chunks) = read_shard(&bytes).expect("read");
         assert_eq!(back_docs, docs);
         assert_eq!(
@@ -994,7 +1009,14 @@ mod tests {
     fn i8_shard_round_trips_within_quantization_error() {
         let docs = vec![doc("a.md", "A")];
         let chunks = vec![chunk(0, "", "body", vec![0.6, -0.8])];
-        let bytes = write_shard(&docs, &chunks, &text2(), Quantization::I8, Compression::None).expect("write");
+        let bytes = write_shard(
+            &docs,
+            &chunks,
+            &text2(),
+            Quantization::I8,
+            Compression::None,
+        )
+        .expect("write");
         let (_, back) = read_shard(&bytes).expect("read");
         for (original, restored) in chunks[0].vector.iter().zip(&back[0].vector) {
             assert!(
@@ -1015,8 +1037,30 @@ mod tests {
                 c
             })
             .collect();
-        let f32_len = write_shard(&docs, &chunks, &[SpaceSpec { space: Space::Text, dim: 384 }], Quantization::F32, Compression::None).unwrap().len();
-        let i8_len = write_shard(&docs, &chunks, &[SpaceSpec { space: Space::Text, dim: 384 }], Quantization::I8, Compression::None).unwrap().len();
+        let f32_len = write_shard(
+            &docs,
+            &chunks,
+            &[SpaceSpec {
+                space: Space::Text,
+                dim: 384,
+            }],
+            Quantization::F32,
+            Compression::None,
+        )
+        .unwrap()
+        .len();
+        let i8_len = write_shard(
+            &docs,
+            &chunks,
+            &[SpaceSpec {
+                space: Space::Text,
+                dim: 384,
+            }],
+            Quantization::I8,
+            Compression::None,
+        )
+        .unwrap()
+        .len();
         assert_eq!(f32_len - i8_len, 16 * 384 * 3);
     }
 
@@ -1038,7 +1082,17 @@ mod tests {
                 c
             })
             .collect();
-        write_shard(&docs, &chunks, &[SpaceSpec { space: Space::Text, dim: 384 }], Quantization::I8, compression).expect("write")
+        write_shard(
+            &docs,
+            &chunks,
+            &[SpaceSpec {
+                space: Space::Text,
+                dim: 384,
+            }],
+            Quantization::I8,
+            compression,
+        )
+        .expect("write")
     }
 
     #[test]
@@ -1048,8 +1102,14 @@ mod tests {
             chunk(0, "Heading", "first body", vec![1.0, 0.0]),
             chunk(1, "", "second body", vec![0.0, 1.0]),
         ];
-        let bytes = write_shard(&docs, &chunks, &text2(), Quantization::F32, Compression::Deflate)
-            .expect("write");
+        let bytes = write_shard(
+            &docs,
+            &chunks,
+            &text2(),
+            Quantization::F32,
+            Compression::Deflate,
+        )
+        .expect("write");
         let (back_docs, back_chunks) = read_shard(&bytes).expect("read");
         assert_eq!(back_docs, docs);
         assert_eq!(
@@ -1155,8 +1215,14 @@ mod tests {
                 vector: vec![0.0, 0.0, 1.0],
             },
         ];
-        let bytes =
-            write_shard(&docs, &chunks, &spaces, Quantization::F32, Compression::None).unwrap();
+        let bytes = write_shard(
+            &docs,
+            &chunks,
+            &spaces,
+            Quantization::F32,
+            Compression::None,
+        )
+        .unwrap();
         let (back_docs, back_chunks) = read_shard(&bytes).expect("read");
         assert_eq!(back_docs, docs);
         // Grouped by section: the text chunk first, then both image chunks.
@@ -1181,8 +1247,14 @@ mod tests {
             text: String::new(),
             vector: vec![1.0, 0.0],
         }];
-        let err = write_shard(&docs, &chunks, &text2(), Quantization::F32, Compression::None)
-            .expect_err("should refuse");
+        let err = write_shard(
+            &docs,
+            &chunks,
+            &text2(),
+            Quantization::F32,
+            Compression::None,
+        )
+        .expect_err("should refuse");
         assert!(err.to_string().contains("does not declare"), "{err}");
     }
 
@@ -1210,8 +1282,14 @@ mod tests {
     fn read_shard_rejects_a_record_whose_space_contradicts_its_section() {
         let docs = vec![doc("a.md", "A")];
         let chunks = vec![chunk(0, "", "body", vec![1.0, 0.0])];
-        let mut bytes =
-            write_shard(&docs, &chunks, &text2(), Quantization::F32, Compression::None).unwrap();
+        let mut bytes = write_shard(
+            &docs,
+            &chunks,
+            &text2(),
+            Quantization::F32,
+            Compression::None,
+        )
+        .unwrap();
         // The first record's space byte: past the header, the one section and
         // the document block.
         let records_at = SHARD_HEADER_LEN + SECTION_LEN + u32_at(&bytes, 12) as usize;
@@ -1226,8 +1304,20 @@ mod tests {
         // that wrong would split a multi-byte character and fail only on
         // non-ASCII vaults.
         let docs = vec![doc("한국.md", "한국")];
-        let chunks = vec![chunk(0, "제목", "대한민국의 수도는 서울이다", vec![1.0, 0.0])];
-        let bytes = write_shard(&docs, &chunks, &text2(), Quantization::F32, Compression::None).expect("write");
+        let chunks = vec![chunk(
+            0,
+            "제목",
+            "대한민국의 수도는 서울이다",
+            vec![1.0, 0.0],
+        )];
+        let bytes = write_shard(
+            &docs,
+            &chunks,
+            &text2(),
+            Quantization::F32,
+            Compression::None,
+        )
+        .expect("write");
         let (back_docs, back_chunks) = read_shard(&bytes).expect("read");
         assert_eq!(back_docs, docs);
         assert_eq!(back_chunks, chunks);
@@ -1235,7 +1325,17 @@ mod tests {
 
     #[test]
     fn a_shard_with_no_chunks_is_valid() {
-        let bytes = write_shard(&[], &[], &[SpaceSpec { space: Space::Text, dim: 384 }], Quantization::F32, Compression::None).expect("write");
+        let bytes = write_shard(
+            &[],
+            &[],
+            &[SpaceSpec {
+                space: Space::Text,
+                dim: 384,
+            }],
+            Quantization::F32,
+            Compression::None,
+        )
+        .expect("write");
         let (docs, chunks) = read_shard(&bytes).expect("read");
         assert!(docs.is_empty());
         assert!(chunks.is_empty());
@@ -1245,7 +1345,14 @@ mod tests {
     fn write_shard_rejects_a_vector_of_the_wrong_dimensionality() {
         let docs = vec![doc("a.md", "A")];
         let chunks = vec![chunk(0, "", "body", vec![1.0, 0.0, 0.0])];
-        let err = write_shard(&docs, &chunks, &text2(), Quantization::F32, Compression::None).expect_err("should refuse");
+        let err = write_shard(
+            &docs,
+            &chunks,
+            &text2(),
+            Quantization::F32,
+            Compression::None,
+        )
+        .expect_err("should refuse");
         assert!(err.to_string().contains("dimensions"), "{err}");
     }
 
@@ -1256,7 +1363,14 @@ mod tests {
     fn write_shard_rejects_a_chunk_with_a_dangling_document() {
         let docs = vec![doc("a.md", "A")];
         let chunks = vec![chunk(3, "", "body", vec![1.0, 0.0])];
-        let err = write_shard(&docs, &chunks, &text2(), Quantization::F32, Compression::None).expect_err("should refuse");
+        let err = write_shard(
+            &docs,
+            &chunks,
+            &text2(),
+            Quantization::F32,
+            Compression::None,
+        )
+        .expect_err("should refuse");
         assert!(err.to_string().contains("refers to document"), "{err}");
     }
 
@@ -1270,7 +1384,14 @@ mod tests {
     fn read_shard_rejects_a_truncated_file() {
         let docs = vec![doc("a.md", "A")];
         let chunks = vec![chunk(0, "", "body", vec![1.0, 0.0])];
-        let bytes = write_shard(&docs, &chunks, &text2(), Quantization::F32, Compression::None).expect("write");
+        let bytes = write_shard(
+            &docs,
+            &chunks,
+            &text2(),
+            Quantization::F32,
+            Compression::None,
+        )
+        .expect("write");
         let err = read_shard(&bytes[..bytes.len() - 4]).expect_err("should refuse");
         let msg = err.to_string();
         assert!(
@@ -1451,8 +1572,14 @@ mod tests {
             vector: vec![0.0, 1.0],
         };
         let chunks = vec![chunk(0, "", "body", vec![1.0, 0.0]), proxy, image];
-        let bytes =
-            write_shard(&docs, &chunks, &spaces, Quantization::F32, Compression::None).unwrap();
+        let bytes = write_shard(
+            &docs,
+            &chunks,
+            &spaces,
+            Quantization::F32,
+            Compression::None,
+        )
+        .unwrap();
         let mut m = manifest(
             vec![ShardInfo {
                 name: shard_name(0),
@@ -1530,8 +1657,22 @@ mod tests {
             chunk(1, "", "gamma", vec![0.5, 0.5]),
         ];
 
-        let bytes_a = write_shard(&docs_a, &chunks_a, &text2(), Quantization::F32, Compression::None).unwrap();
-        let bytes_b = write_shard(&docs_b, &chunks_b, &text2(), Quantization::F32, Compression::None).unwrap();
+        let bytes_a = write_shard(
+            &docs_a,
+            &chunks_a,
+            &text2(),
+            Quantization::F32,
+            Compression::None,
+        )
+        .unwrap();
+        let bytes_b = write_shard(
+            &docs_b,
+            &chunks_b,
+            &text2(),
+            Quantization::F32,
+            Compression::None,
+        )
+        .unwrap();
         let m = manifest(
             vec![
                 ShardInfo {
@@ -1559,7 +1700,12 @@ mod tests {
         let by_text: Vec<(&str, &str)> = artifact
             .chunks()
             .iter()
-            .map(|c| (c.text.as_str(), artifact.documents()[c.doc_index].path.as_str()))
+            .map(|c| {
+                (
+                    c.text.as_str(),
+                    artifact.documents()[c.doc_index].path.as_str(),
+                )
+            })
             .collect();
         assert_eq!(
             by_text,
@@ -1573,8 +1719,14 @@ mod tests {
     #[test]
     fn open_rejects_a_shard_that_does_not_match_the_manifest() {
         let docs = vec![doc("a.md", "A")];
-        let bytes = write_shard(&docs, &[chunk(0, "", "x", vec![1.0, 0.0])], &text2(), Quantization::F32, Compression::None)
-            .unwrap();
+        let bytes = write_shard(
+            &docs,
+            &[chunk(0, "", "x", vec![1.0, 0.0])],
+            &text2(),
+            Quantization::F32,
+            Compression::None,
+        )
+        .unwrap();
         let m = manifest(
             vec![ShardInfo {
                 name: shard_name(0),

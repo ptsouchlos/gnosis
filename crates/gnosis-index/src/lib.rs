@@ -106,10 +106,13 @@ pub fn run(
     // was never told about.
     args.store
         .set_meta("prefix.text.query", args.embedders.text.query_prefix())?;
-    args.store
-        .set_meta("prefix.text.document", args.embedders.text.document_prefix())?;
+    args.store.set_meta(
+        "prefix.text.document",
+        args.embedders.text.document_prefix(),
+    )?;
     if let Some(image) = &args.embedders.image {
-        args.store.set_meta("model.image_vision", image.model_id())?;
+        args.store
+            .set_meta("model.image_vision", image.model_id())?;
         args.store.set_meta("dim.image", &image.dim().to_string())?;
     }
     if let Some(image_text) = &args.embedders.image_text {
@@ -156,7 +159,12 @@ pub fn run(
                         Ok(Some(pending)) => {
                             pending_titles.push(pending);
                             if pending_titles.len() >= image_batch_size {
-                                flush_title_batch(args, &mut pending_titles, &mut report, fail_fast)?;
+                                flush_title_batch(
+                                    args,
+                                    &mut pending_titles,
+                                    &mut report,
+                                    fail_fast,
+                                )?;
                             }
                         }
                         Ok(None) => report.skipped += 1,
@@ -181,7 +189,12 @@ pub fn run(
                         Ok(Some(pending)) => {
                             pending_titles.push(pending);
                             if pending_titles.len() >= image_batch_size {
-                                flush_title_batch(args, &mut pending_titles, &mut report, fail_fast)?;
+                                flush_title_batch(
+                                    args,
+                                    &mut pending_titles,
+                                    &mut report,
+                                    fail_fast,
+                                )?;
                             }
                         }
                         Ok(None) => report.skipped += 1,
@@ -342,7 +355,10 @@ fn embed_markdown_chunks(
     // Joined only where both halves exist: an identity chunk for a note with
     // no properties is its title alone, and a trailing newline would make its
     // vector differ from the same title embedded anywhere else.
-    let texts: Vec<String> = chunks.iter().map(|c| join_lines(&c.heading_path, &c.text)).collect();
+    let texts: Vec<String> = chunks
+        .iter()
+        .map(|c| join_lines(&c.heading_path, &c.text))
+        .collect();
 
     let vectors = args.embedders.text.embed_document(&texts)?;
 
@@ -384,7 +400,10 @@ pub(crate) fn join_lines(heading_path: &str, text: &str) -> String {
 /// `text`/`text` chunk for the same reason: a distinct modality would exclude
 /// it from text search, which is the one thing it exists for.
 fn identity_chunk(args: &mut IndexerArgs, title: &str, text: String) -> Result<ChunkWrite> {
-    let mut vectors = args.embedders.text.embed_document(&[join_lines(title, &text)])?;
+    let mut vectors = args
+        .embedders
+        .text
+        .embed_document(&[join_lines(title, &text)])?;
     Ok(ChunkWrite {
         ord: 0,
         space: "text".to_string(),
@@ -706,11 +725,10 @@ fn flush_image_batch(
         }
         Err(_) => {
             for item in batch {
-                let image_embedder = args
-                    .embedders
-                    .image
-                    .as_mut()
-                    .context("an image file was discovered but [embed.image].enabled is false")?;
+                let image_embedder =
+                    args.embedders.image.as_mut().context(
+                        "an image file was discovered but [embed.image].enabled is false",
+                    )?;
                 match image_embedder.embed(std::slice::from_ref(&item.path)) {
                     Ok(vectors) => {
                         let vector = vectors
@@ -901,7 +919,10 @@ fn flush_title_batch(
                         write_title_doc(args, item, vector, report)?;
                     }
                     Err(e) if !must_propagate && !fail_fast => {
-                        report.errors.push(IndexError { path, message: e.to_string() });
+                        report.errors.push(IndexError {
+                            path,
+                            message: e.to_string(),
+                        });
                     }
                     Err(e) => return Err(e),
                 }
@@ -1123,7 +1144,8 @@ mod tests {
         }
         fn replace_document(&mut self, doc: &DocWrite<'_>) -> Result<()> {
             self.written.push(doc.path.to_string());
-            self.kinds.push((doc.path.to_string(), doc.kind.to_string()));
+            self.kinds
+                .push((doc.path.to_string(), doc.kind.to_string()));
             for chunk in doc.chunks {
                 self.chunk_headings
                     .push((doc.path.to_string(), chunk.heading_path.clone()));
@@ -1151,7 +1173,13 @@ mod tests {
                 candidates: Vec::new(),
             })
         }
-        fn search_space(&self, _: Space, _: &[f32], _: usize, _: &TextQuery) -> Result<Vec<search::Hit>> {
+        fn search_space(
+            &self,
+            _: Space,
+            _: &[f32],
+            _: usize,
+            _: &TextQuery,
+        ) -> Result<Vec<search::Hit>> {
             Ok(Vec::new())
         }
         fn chunk_vectors(&self, _: &str, _: Space) -> Result<Vec<Vec<f32>>> {
@@ -1184,7 +1212,10 @@ mod tests {
             Ok(self
                 .files
                 .iter()
-                .map(|(path, kind)| Found { path: path.clone(), kind: *kind })
+                .map(|(path, kind)| Found {
+                    path: path.clone(),
+                    kind: *kind,
+                })
                 .collect())
         }
     }
@@ -1337,10 +1368,17 @@ mod tests {
         .expect("a failing image must not abort the run by default");
 
         assert_eq!(report.scanned, 3);
-        assert_eq!(report.indexed, 2, "both markdown files indexed despite the image failing");
+        assert_eq!(
+            report.indexed, 2,
+            "both markdown files indexed despite the image failing"
+        );
         assert_eq!(report.errors.len(), 1);
         assert_eq!(report.errors[0].path, "/vault/bad.png");
-        assert!(report.errors[0].message.contains("simulated decode failure"));
+        assert!(
+            report.errors[0]
+                .message
+                .contains("simulated decode failure")
+        );
     }
 
     #[test]
@@ -1373,7 +1411,10 @@ mod tests {
             32,
         );
 
-        assert!(result.is_err(), "fail_fast must propagate the image error instead of collecting it");
+        assert!(
+            result.is_err(),
+            "fail_fast must propagate the image error instead of collecting it"
+        );
     }
 
     #[test]
@@ -1416,7 +1457,11 @@ mod tests {
 
         assert_eq!(report.indexed, 3);
         let calls = image_embedder.calls.borrow();
-        assert_eq!(calls.len(), 1, "three images under the default batch size must embed in a single call");
+        assert_eq!(
+            calls.len(),
+            1,
+            "three images under the default batch size must embed in a single call"
+        );
         assert_eq!(calls[0].len(), 3);
     }
 
@@ -1460,7 +1505,11 @@ mod tests {
 
         assert_eq!(report.indexed, 3);
         let calls = image_embedder.calls.borrow();
-        assert_eq!(calls.len(), 2, "batch_size=2 over 3 images must flush once at the threshold and once at the end");
+        assert_eq!(
+            calls.len(),
+            2,
+            "batch_size=2 over 3 images must flush once at the threshold and once at the end"
+        );
         assert_eq!(calls[0].len(), 2);
         assert_eq!(calls[1].len(), 1);
     }
@@ -1527,7 +1576,10 @@ mod tests {
         )
         .expect("a single bad file in a batch must not abort the run by default");
 
-        assert_eq!(report.indexed, 2, "a.png and c.png survive the one-by-one retry");
+        assert_eq!(
+            report.indexed, 2,
+            "a.png and c.png survive the one-by-one retry"
+        );
         assert_eq!(report.errors.len(), 1);
         assert_eq!(report.errors[0].path, "/vault/bad.png");
     }
@@ -1599,7 +1651,11 @@ mod tests {
         }
     }
 
-    fn run_with(walker: &FakeWalker, store: &mut FakeStore, fail_fast: bool) -> Result<IndexReport> {
+    fn run_with(
+        walker: &FakeWalker,
+        store: &mut FakeStore,
+        fail_fast: bool,
+    ) -> Result<IndexReport> {
         let fs_reader = FakeFileReader;
         let mut text_embedder = FakeTextEmbedder;
         let progress = progress::NoopProgress;
@@ -1650,10 +1706,7 @@ mod tests {
             text.contains("director: Ridley Scott"),
             "a property someone would search for must be indexed, got {text:?}"
         );
-        assert!(
-            text.contains("year: 1982"),
-            "got {text:?}"
-        );
+        assert!(text.contains("year: 1982"), "got {text:?}");
         assert!(
             !text.contains("http"),
             "a cover image URL is not prose and would dominate the chunk's length, got {text:?}"
@@ -1725,8 +1778,14 @@ mod tests {
         let mut store = FakeStore::default();
         let walker = mixed_kind_walker();
         run_with(&walker, &mut store, false).expect("index");
-        assert_eq!(store.get_meta("prefix.text.query").unwrap(), Some(String::new()));
-        assert_eq!(store.get_meta("prefix.text.document").unwrap(), Some(String::new()));
+        assert_eq!(
+            store.get_meta("prefix.text.query").unwrap(),
+            Some(String::new())
+        );
+        assert_eq!(
+            store.get_meta("prefix.text.document").unwrap(),
+            Some(String::new())
+        );
     }
 
     /// Turning `query_instruction` off under an E5 index drops `"passage: "`
@@ -1735,7 +1794,9 @@ mod tests {
     #[test]
     fn run_refuses_a_changed_document_prefix() {
         let mut store = FakeStore::default();
-        store.set_meta("prefix.text.document", "passage: ").expect("seed");
+        store
+            .set_meta("prefix.text.document", "passage: ")
+            .expect("seed");
         let walker = mixed_kind_walker();
         let err = run_with(&walker, &mut store, false).expect_err("must refuse");
         let message = format!("{err:#}");
@@ -1841,8 +1902,8 @@ mod tests {
                 (PathBuf::from("/vault/b.md"), DocKind::Markdown),
             ],
         };
-        let report = run_with(&walker, &mut store, false)
-            .expect("a panicking PDF must not abort the run");
+        let report =
+            run_with(&walker, &mut store, false).expect("a panicking PDF must not abort the run");
 
         assert_eq!(report.scanned, 3);
         assert_eq!(report.indexed, 2, "both markdown files still index");

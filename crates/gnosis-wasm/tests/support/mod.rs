@@ -172,8 +172,7 @@ pub fn chunks() -> Vec<ArtifactChunk> {
 }
 
 /// What the CLI prepends to a bge query, as an index records it.
-pub const BGE_QUERY_INSTRUCTION: &str =
-    "Represent this sentence for searching relevant passages: ";
+pub const BGE_QUERY_INSTRUCTION: &str = "Represent this sentence for searching relevant passages: ";
 
 fn space_info(
     space: Space,

@@ -86,7 +86,9 @@ impl Default for PdfConfig {
 
 impl Default for AnnConfig {
     fn default() -> Self {
-        Self { quantization: "f16".to_string() }
+        Self {
+            quantization: "f16".to_string(),
+        }
     }
 }
 

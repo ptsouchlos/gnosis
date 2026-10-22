@@ -171,7 +171,8 @@ relevant = []
 
     #[test]
     fn an_unknown_space_is_an_error() {
-        let q = Qrels::parse("vault = \"/v\"\n[[query]]\ntext = \"x\"\nspace = \"audio\"\n").unwrap();
+        let q =
+            Qrels::parse("vault = \"/v\"\n[[query]]\ntext = \"x\"\nspace = \"audio\"\n").unwrap();
         assert!(
             q.queries[0].spaces(&[Space::Text]).is_err(),
             "an unsupported space name must fail loudly, not be silently ignored"

@@ -48,7 +48,8 @@ fn search_image_space(vault: &std::path::Path, query: &str) -> Vec<serde_json::V
 #[test]
 #[ignore = "downloads CLIP models and runs inference"]
 fn indexed_image_content_is_found_by_semantic_search() {
-    let vault = std::env::temp_dir().join(format!("gnosis-image-search-test-{}", std::process::id()));
+    let vault =
+        std::env::temp_dir().join(format!("gnosis-image-search-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&vault);
     std::fs::create_dir_all(&vault).unwrap();
 
@@ -63,14 +64,24 @@ fn indexed_image_content_is_found_by_semantic_search() {
     run(&vault, &["index", "."]);
 
     let matching = search_image_space(&vault, "a small red and blue image");
-    assert_eq!(matching.len(), 1, "the image must be the only image-space hit");
+    assert_eq!(
+        matching.len(),
+        1,
+        "the image must be the only image-space hit"
+    );
     let hit = &matching[0];
     assert!(
         hit["path"].as_str().unwrap().ends_with("photo.png"),
         "expected photo.png, got {hit}"
     );
-    assert_eq!(hit["width"], 2, "indexed image's actual pixel width must be read correctly");
-    assert_eq!(hit["height"], 1, "indexed image's actual pixel height must be read correctly");
+    assert_eq!(
+        hit["width"], 2,
+        "indexed image's actual pixel width must be read correctly"
+    );
+    assert_eq!(
+        hit["height"], 1,
+        "indexed image's actual pixel height must be read correctly"
+    );
     let matching_score = hit["score"].as_f64().unwrap();
 
     let unrelated = search_image_space(&vault, "a recipe for chocolate cake");

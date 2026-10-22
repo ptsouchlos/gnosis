@@ -216,7 +216,14 @@ pub fn fuse_text_space(
 
     let dates = recency_dates(store, cfg)?;
     let recency = recency_input(&dates, cfg);
-    Ok(search::fuse_hits_with(dense, lexical, &terms[..spelled], cfg, recency.as_ref(), limit))
+    Ok(search::fuse_hits_with(
+        dense,
+        lexical,
+        &terms[..spelled],
+        cfg,
+        recency.as_ref(),
+        limit,
+    ))
 }
 
 /// The vocabulary terms standing in for the query terms the index lacks, as
@@ -677,7 +684,10 @@ mod tests {
     #[test]
     fn a_note_named_by_the_query_is_a_candidate_past_the_dense_cut() {
         let paths = search_named(&named_store(), "who not how", &config(false));
-        assert!(paths.contains(&"Notes/Who Not How.md".to_string()), "got {paths:?}");
+        assert!(
+            paths.contains(&"Notes/Who Not How.md".to_string()),
+            "got {paths:?}"
+        );
     }
 
     /// With the title bonus off, a name means nothing, here as in ranking.
@@ -688,7 +698,10 @@ mod tests {
             ..config(false)
         };
         let paths = search_named(&named_store(), "who not how", &cfg);
-        assert!(!paths.contains(&"Notes/Who Not How.md".to_string()), "got {paths:?}");
+        assert!(
+            !paths.contains(&"Notes/Who Not How.md".to_string()),
+            "got {paths:?}"
+        );
     }
 
     /// Only a file name carrying every query term: one shared word is how
@@ -696,7 +709,10 @@ mod tests {
     #[test]
     fn a_partly_matching_file_name_adds_no_candidate() {
         let paths = search_named(&named_store(), "who else", &config(false));
-        assert!(!paths.contains(&"Notes/Who Not How.md".to_string()), "got {paths:?}");
+        assert!(
+            !paths.contains(&"Notes/Who Not How.md".to_string()),
+            "got {paths:?}"
+        );
     }
 
     /// The image space has no lexical channel: image chunks carry no text and
@@ -988,7 +1004,11 @@ mod tests {
     fn a_misspelled_term_finds_nothing_with_fuzzy_off() {
         let s = corpus_store(vec![("a.md", "retrieval of graph indexes")]);
         assert!(keyword_search(&s, "retreival", &fuzzy_config(false)).is_empty());
-        assert_eq!(s.vocabulary_walks.get(), 0, "off means the vocabulary is never walked");
+        assert_eq!(
+            s.vocabulary_walks.get(),
+            0,
+            "off means the vocabulary is never walked"
+        );
     }
 
     #[test]
@@ -1013,7 +1033,11 @@ mod tests {
         let off = keyword_search(&s, "retrieval graph", &fuzzy_config(false));
         let on = keyword_search(&s, "retrieval graph", &fuzzy_config(true));
         assert_eq!(on, off);
-        assert_eq!(s.vocabulary_walks.get(), 0, "no unknown term, so no vocabulary walk");
+        assert_eq!(
+            s.vocabulary_walks.get(),
+            0,
+            "no unknown term, so no vocabulary walk"
+        );
     }
 
     #[test]
@@ -1026,7 +1050,11 @@ mod tests {
         let got = keyword_search(&s, "graph indxes", &fuzzy_config(true));
         assert_eq!(got[0].0, "a.md");
         let plain = keyword_search(&s, "graph", &fuzzy_config(true));
-        assert_eq!(plain.len(), 1, "graph must not drag in graphs or grape: {plain:?}");
+        assert_eq!(
+            plain.len(),
+            1,
+            "graph must not drag in graphs or grape: {plain:?}"
+        );
     }
 
     #[test]

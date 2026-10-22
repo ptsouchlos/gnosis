@@ -55,7 +55,10 @@ pub fn execute(ws: &Workspace, args: RebuildArgs) -> Result<()> {
         args.fail_fast,
         ws.config.embed.image.batch_size,
     )?;
-    println!("Done: {} indexed, {} chunks.", report.indexed, report.chunks);
+    println!(
+        "Done: {} indexed, {} chunks.",
+        report.indexed, report.chunks
+    );
     crate::commands::print_index_errors(&report.errors);
 
     let quantization = crate::store::resolve_quantization(&ws.config.ann.quantization)?;

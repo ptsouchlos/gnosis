@@ -26,7 +26,10 @@ pub fn execute(global: bool, args: InitArgs) -> Result<()> {
     };
 
     if path.exists() && !args.force {
-        bail!("{} already exists; pass --force to overwrite", path.display());
+        bail!(
+            "{} already exists; pass --force to overwrite",
+            path.display()
+        );
     }
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()

@@ -65,9 +65,18 @@ mod tests {
 
     #[test]
     fn classifies_pdf_extensions() {
-        assert_eq!(DocKind::from_path(Path::new("paper.pdf")), Some(DocKind::Pdf));
-        assert_eq!(DocKind::from_path(Path::new("PAPER.PDF")), Some(DocKind::Pdf));
-        assert_eq!(DocKind::from_path(Path::new("report.v2.pdf")), Some(DocKind::Pdf));
+        assert_eq!(
+            DocKind::from_path(Path::new("paper.pdf")),
+            Some(DocKind::Pdf)
+        );
+        assert_eq!(
+            DocKind::from_path(Path::new("PAPER.PDF")),
+            Some(DocKind::Pdf)
+        );
+        assert_eq!(
+            DocKind::from_path(Path::new("report.v2.pdf")),
+            Some(DocKind::Pdf)
+        );
     }
 
     #[test]
@@ -77,11 +86,26 @@ mod tests {
 
     #[test]
     fn classifies_markdown_and_image_extensions() {
-        assert_eq!(DocKind::from_path(Path::new("note.md")), Some(DocKind::Markdown));
-        assert_eq!(DocKind::from_path(Path::new("photo.PNG")), Some(DocKind::Image));
-        assert_eq!(DocKind::from_path(Path::new("photo.jpg")), Some(DocKind::Image));
-        assert_eq!(DocKind::from_path(Path::new("photo.JPEG")), Some(DocKind::Image));
-        assert_eq!(DocKind::from_path(Path::new("photo.webp")), Some(DocKind::Image));
+        assert_eq!(
+            DocKind::from_path(Path::new("note.md")),
+            Some(DocKind::Markdown)
+        );
+        assert_eq!(
+            DocKind::from_path(Path::new("photo.PNG")),
+            Some(DocKind::Image)
+        );
+        assert_eq!(
+            DocKind::from_path(Path::new("photo.jpg")),
+            Some(DocKind::Image)
+        );
+        assert_eq!(
+            DocKind::from_path(Path::new("photo.JPEG")),
+            Some(DocKind::Image)
+        );
+        assert_eq!(
+            DocKind::from_path(Path::new("photo.webp")),
+            Some(DocKind::Image)
+        );
         assert_eq!(DocKind::from_path(Path::new("photo.gif")), None);
         assert_eq!(DocKind::from_path(Path::new("readme.txt")), None);
         assert_eq!(DocKind::Image.as_str(), "image");

@@ -55,7 +55,11 @@ pub struct ScoreParts {
 /// assumed L2-normalized, so a dot product suffices), keep only the
 /// best-scoring chunk per document path, and return the top `limit` sorted
 /// descending by score.
-pub fn rank(query: &[f32], candidates: impl IntoIterator<Item = Candidate>, limit: usize) -> Vec<Hit> {
+pub fn rank(
+    query: &[f32],
+    candidates: impl IntoIterator<Item = Candidate>,
+    limit: usize,
+) -> Vec<Hit> {
     rank_by(|v| dot(query, v), candidates, &[], limit)
 }
 
@@ -478,11 +482,18 @@ pub fn merge_normalized(per_space: Vec<Vec<Hit>>, limit: usize) -> Vec<Hit> {
         if hits.is_empty() {
             continue;
         }
-        let max = hits.iter().map(|h| h.score).fold(f32::NEG_INFINITY, f32::max);
+        let max = hits
+            .iter()
+            .map(|h| h.score)
+            .fold(f32::NEG_INFINITY, f32::max);
         let min = hits.iter().map(|h| h.score).fold(f32::INFINITY, f32::min);
         let range = max - min;
         for hit in &mut hits {
-            hit.score = if range > f32::EPSILON { (hit.score - min) / range } else { 1.0 };
+            hit.score = if range > f32::EPSILON {
+                (hit.score - min) / range
+            } else {
+                1.0
+            };
         }
         for hit in hits {
             match best.get(&hit.path) {
@@ -505,7 +516,9 @@ pub fn merge_normalized(per_space: Vec<Vec<Hit>>, limit: usize) -> Vec<Hit> {
 /// the path, the same query could rank them differently on each run, which
 /// makes evaluation irreproducible and parity checks flaky.
 fn best_first(a: &Hit, b: &Hit) -> std::cmp::Ordering {
-    b.score.total_cmp(&a.score).then_with(|| a.path.cmp(&b.path))
+    b.score
+        .total_cmp(&a.score)
+        .then_with(|| a.path.cmp(&b.path))
 }
 
 /// Dot product of two equal-length vectors (0.0 on length mismatch).
@@ -814,17 +827,28 @@ mod tests {
     fn exact_ties_rank_by_path_every_time() {
         let paths: Vec<String> = (0..10).map(|i| format!("{i}.md")).collect();
         let tied = || {
-            paths
-                .iter()
-                .rev()
-                .map(|p| candidate(p, "", "A passage every one of these notes shares.", vec![1.0]))
+            paths.iter().rev().map(|p| {
+                candidate(
+                    p,
+                    "",
+                    "A passage every one of these notes shares.",
+                    vec![1.0],
+                )
+            })
         };
         let ranked = |hits: Vec<Hit>| hits.into_iter().map(|h| h.path).collect::<Vec<_>>();
 
         assert_eq!(ranked(rank(&[1.0], tied(), 10)), paths);
-        assert_eq!(ranked(rank_related(&[vec![1.0]], tied(), &[], 10, true)), paths);
+        assert_eq!(
+            ranked(rank_related(&[vec![1.0]], tied(), &[], 10, true)),
+            paths
+        );
         let text = rank(&[1.0], tied(), 10);
-        let image = vec![Hit { path: "x.png".into(), score: 0.5, ..text[0].clone() }];
+        let image = vec![Hit {
+            path: "x.png".into(),
+            score: 0.5,
+            ..text[0].clone()
+        }];
         let merged = ranked(merge_normalized(vec![text, image], 11));
         assert_eq!(merged[..10], paths[..]);
     }
@@ -845,12 +869,28 @@ mod tests {
         // Backward compatibility: today's text-only callers must see raw
         // cosine scores, not normalized ones, when only one space is queried.
         let hits = vec![
-            Hit { path: "a.md".into(), title: "a".into(), source_root: "/r".into(),
-                  heading_path: String::new(), text: String::new(), score: 0.42,
-                  width: None, height: None, parts: Default::default() },
-            Hit { path: "b.md".into(), title: "b".into(), source_root: "/r".into(),
-                  heading_path: String::new(), text: String::new(), score: 0.10,
-                  width: None, height: None, parts: Default::default() },
+            Hit {
+                path: "a.md".into(),
+                title: "a".into(),
+                source_root: "/r".into(),
+                heading_path: String::new(),
+                text: String::new(),
+                score: 0.42,
+                width: None,
+                height: None,
+                parts: Default::default(),
+            },
+            Hit {
+                path: "b.md".into(),
+                title: "b".into(),
+                source_root: "/r".into(),
+                heading_path: String::new(),
+                text: String::new(),
+                score: 0.10,
+                width: None,
+                height: None,
+                parts: Default::default(),
+            },
         ];
         let merged = merge_normalized(vec![hits], 10);
         assert_eq!(merged[0].score, 0.42);
@@ -860,20 +900,52 @@ mod tests {
     #[test]
     fn merge_normalized_normalizes_per_space_before_merging() {
         let text_hits = vec![
-            Hit { path: "a.md".into(), title: "a".into(), source_root: "/r".into(),
-                  heading_path: String::new(), text: String::new(), score: 0.80,
-                  width: None, height: None, parts: Default::default() },
-            Hit { path: "b.md".into(), title: "b".into(), source_root: "/r".into(),
-                  heading_path: String::new(), text: String::new(), score: 0.40,
-                  width: None, height: None, parts: Default::default() },
+            Hit {
+                path: "a.md".into(),
+                title: "a".into(),
+                source_root: "/r".into(),
+                heading_path: String::new(),
+                text: String::new(),
+                score: 0.80,
+                width: None,
+                height: None,
+                parts: Default::default(),
+            },
+            Hit {
+                path: "b.md".into(),
+                title: "b".into(),
+                source_root: "/r".into(),
+                heading_path: String::new(),
+                text: String::new(),
+                score: 0.40,
+                width: None,
+                height: None,
+                parts: Default::default(),
+            },
         ];
         let image_hits = vec![
-            Hit { path: "c.png".into(), title: "c".into(), source_root: "/r".into(),
-                  heading_path: String::new(), text: String::new(), score: 0.30,
-                  width: Some(10), height: Some(10), parts: Default::default() },
-            Hit { path: "d.png".into(), title: "d".into(), source_root: "/r".into(),
-                  heading_path: String::new(), text: String::new(), score: 0.10,
-                  width: Some(20), height: Some(20), parts: Default::default() },
+            Hit {
+                path: "c.png".into(),
+                title: "c".into(),
+                source_root: "/r".into(),
+                heading_path: String::new(),
+                text: String::new(),
+                score: 0.30,
+                width: Some(10),
+                height: Some(10),
+                parts: Default::default(),
+            },
+            Hit {
+                path: "d.png".into(),
+                title: "d".into(),
+                source_root: "/r".into(),
+                heading_path: String::new(),
+                text: String::new(),
+                score: 0.10,
+                width: Some(20),
+                height: Some(20),
+                parts: Default::default(),
+            },
         ];
         let merged = merge_normalized(vec![text_hits, image_hits], 10);
         // Each space's best hit normalizes to 1.0, worst to 0.0 — so the top
@@ -888,13 +960,29 @@ mod tests {
     #[test]
     fn merge_normalized_truncates_to_limit() {
         let hits = (0..5)
-            .map(|i| Hit { path: format!("{i}.md"), title: "t".into(), source_root: "/r".into(),
-                           heading_path: String::new(), text: String::new(), score: i as f32,
-                           width: None, height: None, parts: Default::default() })
+            .map(|i| Hit {
+                path: format!("{i}.md"),
+                title: "t".into(),
+                source_root: "/r".into(),
+                heading_path: String::new(),
+                text: String::new(),
+                score: i as f32,
+                width: None,
+                height: None,
+                parts: Default::default(),
+            })
             .collect();
-        let other = vec![Hit { path: "x.png".into(), title: "x".into(), source_root: "/r".into(),
-                                heading_path: String::new(), text: String::new(), score: 1.0,
-                                width: None, height: None, parts: Default::default() }];
+        let other = vec![Hit {
+            path: "x.png".into(),
+            title: "x".into(),
+            source_root: "/r".into(),
+            heading_path: String::new(),
+            text: String::new(),
+            score: 1.0,
+            width: None,
+            height: None,
+            parts: Default::default(),
+        }];
         assert_eq!(merge_normalized(vec![hits, other], 2).len(), 2);
     }
 
@@ -905,25 +993,60 @@ mod tests {
         // legitimately score in both spaces' results for `related` — it
         // must appear once, at its best normalized score, not twice.
         let text_hits = vec![
-            Hit { path: "note.md".into(), title: "note".into(), source_root: "/r".into(),
-                  heading_path: String::new(), text: String::new(), score: 0.90,
-                  width: None, height: None, parts: Default::default() },
-            Hit { path: "other.md".into(), title: "other".into(), source_root: "/r".into(),
-                  heading_path: String::new(), text: String::new(), score: 0.10,
-                  width: None, height: None, parts: Default::default() },
+            Hit {
+                path: "note.md".into(),
+                title: "note".into(),
+                source_root: "/r".into(),
+                heading_path: String::new(),
+                text: String::new(),
+                score: 0.90,
+                width: None,
+                height: None,
+                parts: Default::default(),
+            },
+            Hit {
+                path: "other.md".into(),
+                title: "other".into(),
+                source_root: "/r".into(),
+                heading_path: String::new(),
+                text: String::new(),
+                score: 0.10,
+                width: None,
+                height: None,
+                parts: Default::default(),
+            },
         ];
         let image_hits = vec![
-            Hit { path: "note.md".into(), title: "note".into(), source_root: "/r".into(),
-                  heading_path: String::new(), text: String::new(), score: 0.20,
-                  width: None, height: None, parts: Default::default() },
-            Hit { path: "img.png".into(), title: "img".into(), source_root: "/r".into(),
-                  heading_path: String::new(), text: String::new(), score: 0.05,
-                  width: Some(1), height: Some(1), parts: Default::default() },
+            Hit {
+                path: "note.md".into(),
+                title: "note".into(),
+                source_root: "/r".into(),
+                heading_path: String::new(),
+                text: String::new(),
+                score: 0.20,
+                width: None,
+                height: None,
+                parts: Default::default(),
+            },
+            Hit {
+                path: "img.png".into(),
+                title: "img".into(),
+                source_root: "/r".into(),
+                heading_path: String::new(),
+                text: String::new(),
+                score: 0.05,
+                width: Some(1),
+                height: Some(1),
+                parts: Default::default(),
+            },
         ];
         let merged = merge_normalized(vec![text_hits, image_hits], 10);
         let note_hits: Vec<&Hit> = merged.iter().filter(|h| h.path == "note.md").collect();
         assert_eq!(note_hits.len(), 1, "note.md must appear exactly once");
-        assert_eq!(note_hits[0].score, 1.0, "kept at its best (text-space) normalized score");
+        assert_eq!(
+            note_hits[0].score, 1.0,
+            "kept at its best (text-space) normalized score"
+        );
         assert_eq!(merged.len(), 3);
     }
 
@@ -955,7 +1078,13 @@ mod tests {
 
     #[test]
     fn fuse_hits_combines_both_channels_for_a_shared_document() {
-        let got = fuse_hits(vec![h("a.md", 1.0)], vec![h("a.md", 0.0)], &[], &fcfg(0.5), 10);
+        let got = fuse_hits(
+            vec![h("a.md", 1.0)],
+            vec![h("a.md", 0.0)],
+            &[],
+            &fcfg(0.5),
+            10,
+        );
         assert_eq!(got.len(), 1);
         assert!((got[0].score - 0.5).abs() < 1e-6, "got {}", got[0].score);
     }
@@ -964,7 +1093,13 @@ mod tests {
     /// whole reason for a lexical channel.
     #[test]
     fn fuse_hits_keeps_a_document_only_the_lexical_channel_found() {
-        let got = fuse_hits(vec![h("dense.md", 0.9)], vec![h("lexonly.md", 1.0)], &[], &fcfg(0.5), 10);
+        let got = fuse_hits(
+            vec![h("dense.md", 0.9)],
+            vec![h("lexonly.md", 1.0)],
+            &[],
+            &fcfg(0.5),
+            10,
+        );
         let paths: Vec<&str> = got.iter().map(|x| x.path.as_str()).collect();
         assert!(paths.contains(&"lexonly.md"), "got {paths:?}");
     }
@@ -973,7 +1108,10 @@ mod tests {
     fn fuse_hits_keeps_a_document_only_the_dense_channel_found() {
         let got = fuse_hits(vec![h("denseonly.md", 1.0)], vec![], &[], &fcfg(0.5), 10);
         assert_eq!(got.len(), 1);
-        assert!((got[0].score - 0.5).abs() < 1e-6, "missing channel scores 0");
+        assert!(
+            (got[0].score - 0.5).abs() < 1e-6,
+            "missing channel scores 0"
+        );
     }
 
     #[test]
@@ -985,12 +1123,21 @@ mod tests {
         assert_eq!(got[0].score, 0.9);
         assert_eq!(got[1].path, "b.md");
         assert_eq!(got[1].score, 0.4);
-        assert_eq!(got[2].score, 0.0, "a lexical-only hit contributes nothing at weight 1");
+        assert_eq!(
+            got[2].score, 0.0,
+            "a lexical-only hit contributes nothing at weight 1"
+        );
     }
 
     #[test]
     fn fuse_hits_at_weight_zero_ranks_by_lexical_alone() {
-        let got = fuse_hits(vec![h("a.md", 1.0)], vec![h("b.md", 0.8)], &[], &fcfg(0.0), 10);
+        let got = fuse_hits(
+            vec![h("a.md", 1.0)],
+            vec![h("b.md", 0.8)],
+            &[],
+            &fcfg(0.0),
+            10,
+        );
         assert_eq!(got[0].path, "b.md");
     }
 
@@ -1113,7 +1260,10 @@ mod tests {
     fn a_title_boost_of_zero_changes_nothing() {
         let hits = vec![titled("a.md", "HNSW", 0.5), titled("b.md", "Cake", 0.6)];
         let got = fuse_hits(hits, vec![], &bm25::tokenize("hnsw"), &tcfg(1.0, 0.0), 10);
-        assert_eq!(got[0].path, "b.md", "without a boost the stronger score wins");
+        assert_eq!(
+            got[0].path, "b.md",
+            "without a boost the stronger score wins"
+        );
     }
 
     #[test]
@@ -1158,11 +1308,16 @@ mod tests {
     /// navigational case it exists to serve.
     #[test]
     fn a_title_boost_can_lift_a_document_into_the_result_set() {
-        let mut hits: Vec<Hit> = (0..5).map(|i| titled(&format!("{i}.md"), "unrelated", 0.6)).collect();
+        let mut hits: Vec<Hit> = (0..5)
+            .map(|i| titled(&format!("{i}.md"), "unrelated", 0.6))
+            .collect();
         hits.push(titled("target.md", "HNSW", 0.45));
         let got = fuse_hits(hits, vec![], &bm25::tokenize("hnsw"), &tcfg(1.0, 0.3), 2);
         assert_eq!(got.len(), 2);
-        assert_eq!(got[0].path, "target.md", "a boosted document must be able to enter the top-k");
+        assert_eq!(
+            got[0].path, "target.md",
+            "a boosted document must be able to enter the top-k"
+        );
     }
 
     #[test]
@@ -1179,7 +1334,13 @@ mod tests {
 
     #[test]
     fn an_empty_query_gets_no_title_boost() {
-        let got = fuse_hits(vec![titled("a.md", "HNSW", 0.5)], vec![], &[], &tcfg(1.0, 0.5), 10);
+        let got = fuse_hits(
+            vec![titled("a.md", "HNSW", 0.5)],
+            vec![],
+            &[],
+            &tcfg(1.0, 0.5),
+            10,
+        );
         assert!((got[0].score - 0.5).abs() < 1e-6);
     }
 
@@ -1217,9 +1378,16 @@ mod tests {
         }];
         let ranked = rank(&[1.0, 0.0], candidates, 10);
         let got = boost_and_rank(ranked, &bm25::tokenize("a"), 0.1, 10);
-        assert!((got[0].parts.meaning - 0.6).abs() < 1e-6, "{:?}", got[0].parts);
+        assert!(
+            (got[0].parts.meaning - 0.6).abs() < 1e-6,
+            "{:?}",
+            got[0].parts
+        );
         assert_eq!(got[0].parts.keywords, 0.0);
-        assert!((got[0].parts.title - 0.1).abs() < 1e-6, "the file name a.md matches");
+        assert!(
+            (got[0].parts.title - 0.1).abs() < 1e-6,
+            "the file name a.md matches"
+        );
         assert!((got[0].parts.meaning + got[0].parts.title - got[0].score).abs() < 1e-6);
     }
 
@@ -1231,7 +1399,13 @@ mod tests {
             titled("Book Notes/Atomic Habits.md", "Notes", 0.5),
             titled("Book Notes/Deep Work.md", "Notes", 0.6),
         ];
-        let got = fuse_hits(hits, vec![], &bm25::tokenize("atomic habits"), &tcfg(1.0, 0.2), 10);
+        let got = fuse_hits(
+            hits,
+            vec![],
+            &bm25::tokenize("atomic habits"),
+            &tcfg(1.0, 0.2),
+            10,
+        );
         assert_eq!(got[0].path, "Book Notes/Atomic Habits.md");
     }
 
@@ -1264,7 +1438,10 @@ mod tests {
 
     #[test]
     fn a_file_name_title_drops_folders_and_extension() {
-        assert_eq!(file_name_title("Book Notes/Atomic Habits.md"), "Atomic Habits");
+        assert_eq!(
+            file_name_title("Book Notes/Atomic Habits.md"),
+            "Atomic Habits"
+        );
         assert_eq!(file_name_title("a\\b\\v1.2 notes.md"), "v1.2 notes");
         assert_eq!(file_name_title("README"), "README");
     }
