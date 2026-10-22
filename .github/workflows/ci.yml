@@ -13,19 +13,43 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # fmt, clippy and the default test set. The tests that download a model are
-  # #[ignore]d, so this needs no network beyond building.
-  rust:
+  # Formatting and clippy give the same answer on every platform, so they run once.
+  lint:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: ptsouchlos/infra/.github/actions/setup-rust@v1
-      - uses: ptsouchlos/infra/.github/actions/cargo-check@v1
         with:
-          args: --workspace
+          just: "true"
+      - name: Check formatting
+        shell: bash
+        run: just format-check
+      - name: Clippy
+        shell: bash
+        run: just lint
+
+  # The default test set. The tests that download a model are #[ignore]d, so
+  # this needs no network beyond building.
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ptsouchlos/infra/.github/actions/setup-rust@v1
+        with:
+          components: ""
+          just: "true"
+      - name: Test
+        shell: bash
+        run: just test
 
   # The query client the Obsidian plugin vendors: its tests in node, then the
-  # release build, whose size the log reports.
+  # release build, whose size the log reports. Linux only: the pinned tools
+  # are x86_64 Linux binaries, and the bundle is the same on any host.
   wasm:
     runs-on: ubuntu-24.04
     steps:
@@ -34,14 +58,13 @@ jobs:
         with:
           components: ""
           targets: wasm32-unknown-unknown
+          just: "true"
       - name: Install the wasm tools
         shell: bash
         run: script/ci/install-wasm-tools.sh "$RUNNER_TEMP/wasm-tools"
       - name: Test
         shell: bash
-        env:
-          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
-        run: cargo test -p gnosis-wasm --target wasm32-unknown-unknown
+        run: just wasm-test
       - name: Build
         shell: bash
-        run: script/wasm/build.sh "$RUNNER_TEMP/gnosis-wasm"
+        run: just wasm-build "$RUNNER_TEMP/gnosis-wasm"
