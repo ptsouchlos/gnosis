@@ -304,16 +304,24 @@ impl SqliteStore {
         )?;
 
         // Reads go through this view, so every `SELECT` keeps the column names
-        // it had when paths were stored absolutely. Joining with '/' is correct
-        // on Windows too — Win32 accepts forward slashes — and keeps `rel_path`
-        // identical across platforms, which is the point of storing it at all.
+        // it had when paths were stored absolutely. `rel_path` is always
+        // '/'-separated, identical across platforms, which is the point of
+        // storing it at all. The absolute path is rebuilt in the root's own
+        // separator, because callers compare it with the path they walked: a
+        // root with no '/' can only be a Windows path, since every Unix
+        // absolute path has one. Dropped first so a database created with an
+        // older definition gets this one.
         self.conn.execute_batch(
             r#"
-            CREATE VIEW IF NOT EXISTS documents_abs AS
+            DROP VIEW IF EXISTS documents_abs;
+            CREATE VIEW documents_abs AS
             SELECT d.id, d.kind, d.content_hash, d.mtime, d.title, d.frontmatter,
                    d.indexed_at, d.width, d.height, d.root_id, d.rel_path,
                    r.path AS source_root,
-                   r.path || '/' || d.rel_path AS path
+                   CASE WHEN instr(r.path, '/') = 0
+                        THEN r.path || '\' || replace(d.rel_path, '/', '\')
+                        ELSE r.path || '/' || d.rel_path
+                   END AS path
             FROM documents d JOIN roots r ON r.id = d.root_id;
             "#,
         )?;
@@ -1278,6 +1286,29 @@ mod tests {
             relative_to_root("/elsewhere/x.md", "/vault"),
             "/elsewhere/x.md"
         );
+    }
+
+    /// The indexer looks documents up, and prunes them, by the path it walked,
+    /// so a path must read back exactly as it was written. On Windows that is
+    /// a backslash path; joined with '/' it never matched, and every index run
+    /// deleted every document it had just written.
+    #[test]
+    fn a_windows_path_reads_back_as_written() {
+        let (mut store, dir) = temp_store();
+        write_doc(&mut store, r"C:\vault\notes\a.md", r"C:\vault");
+
+        assert_eq!(
+            store.paths_for_roots(&[r"C:\vault".to_string()]).unwrap(),
+            vec![r"C:\vault\notes\a.md".to_string()]
+        );
+        assert!(
+            store
+                .document_hash(r"C:\vault\notes\a.md")
+                .unwrap()
+                .is_some(),
+            "an unchanged file must be found by the path it was written under"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
