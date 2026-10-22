@@ -44,8 +44,13 @@ pub fn parse_markdown(path: &Path, content: &str) -> ParsedDoc {
 
 /// Split a leading `---` ... `---` YAML frontmatter block from the body.
 /// Returns (frontmatter_without_fences, remaining_body).
+/// Line endings may be `\n` or `\r\n`: a note saved on Windows keeps its
+/// frontmatter.
 fn split_frontmatter(content: &str) -> (Option<&str>, &str) {
-    let rest = match content.strip_prefix("---\n") {
+    let rest = match content
+        .strip_prefix("---\n")
+        .or_else(|| content.strip_prefix("---\r\n"))
+    {
         Some(r) => r,
         None => return (None, content),
     };
@@ -56,9 +61,17 @@ fn split_frontmatter(content: &str) -> (Option<&str>, &str) {
         let idx = search_from + rel;
         let after = &rest[idx + 4..];
         // The closing fence line must end (newline or EOF) right after `---`.
-        if after.is_empty() || after.starts_with('\n') {
+        let body = if after.is_empty() {
+            Some(after)
+        } else {
+            after
+                .strip_prefix('\n')
+                .or_else(|| after.strip_prefix("\r\n"))
+        };
+        if let Some(body) = body {
+            // The fence's own line break, not the frontmatter's last line's.
             let fm = &rest[..idx];
-            let body = after.strip_prefix('\n').unwrap_or(after);
+            let fm = fm.strip_suffix('\r').unwrap_or(fm);
             return (Some(fm), body);
         }
         search_from = idx + 4;
@@ -518,6 +531,27 @@ mod obsidian_tests {
         assert_eq!(frontmatter_text(""), "");
         assert_eq!(frontmatter_text("- just\n- a list\n"), "");
         assert_eq!(frontmatter_text("key: [unterminated\n"), "");
+    }
+
+    /// A note saved with Windows line endings keeps its frontmatter: its
+    /// properties, its date and its title.
+    #[test]
+    fn crlf_frontmatter_is_split_like_lf() {
+        let content =
+            "---\r\ntitle: Sourdough\r\ncreated: 2024-05-03\r\n---\r\n\r\nA long proof.\r\n";
+        let parsed = parse_markdown(Path::new("notes/x.md"), content);
+        let fm = parsed
+            .frontmatter
+            .expect("CRLF frontmatter must be recognized");
+        assert_eq!(parsed.title, "Sourdough");
+        assert_eq!(extract_created_unix(&fm), parse_date_unix("2024-05-03"));
+        assert_eq!(parsed.body, "\r\nA long proof.\r\n");
+    }
+
+    #[test]
+    fn a_fence_must_end_its_line() {
+        let parsed = parse_markdown(Path::new("x.md"), "---\r\na: 1\r\n---x\r\n");
+        assert_eq!(parsed.frontmatter, None, "`---x` is not a closing fence");
     }
 
     #[test]
