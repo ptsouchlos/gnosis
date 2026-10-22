@@ -1639,6 +1639,7 @@ mod tests {
             shard_docs: 256,
             max_tokens: chunk_cfg.max_tokens,
             overlap: chunk_cfg.overlap,
+            image: None,
         }
     }
 
@@ -1835,6 +1836,7 @@ mod tests {
             shard_docs: 256,
             max_tokens: 256,
             overlap: 43,
+            image: None,
         };
         let read = |name: &str| std::fs::read_to_string(vault.join("notes").join(name)).unwrap();
         let names = ["sourdough.md", "hydration.md", "blade-runner.md", "stub.md"];
@@ -1930,6 +1932,7 @@ mod tests {
                 shard_docs: 256,
                 max_tokens: 256,
                 overlap: 43,
+                image: None,
             },
             artifact,
         );
