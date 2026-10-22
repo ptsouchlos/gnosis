@@ -82,7 +82,12 @@ impl QrelsQuery {
         self.relevant
             .iter()
             .map(|j| {
-                let full = vault.join(&j.path);
+                // Joined part by part, so the '/' a qrels file is written with
+                // becomes the platform's separator, as the store returns paths.
+                let full = j
+                    .path
+                    .split('/')
+                    .fold(vault.to_path_buf(), |p, part| p.join(part));
                 eval::Judged::new(full.to_string_lossy().to_string(), j.grade)
             })
             .collect()
@@ -183,7 +188,10 @@ relevant = []
     fn judged_paths_resolve_against_the_vault() {
         let q = Qrels::parse(SAMPLE).unwrap();
         let judged = q.queries[0].judged(std::path::Path::new("/vault"));
-        assert_eq!(judged[0].path, "/vault/20 Notes/HNSW.md");
+        let expected = std::path::Path::new("/vault")
+            .join("20 Notes")
+            .join("HNSW.md");
+        assert_eq!(judged[0].path, expected.to_string_lossy());
         assert_eq!(judged[0].grade, 2);
     }
 
