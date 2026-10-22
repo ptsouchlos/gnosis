@@ -2,6 +2,7 @@
 name = "eval"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Relevance metrics (nDCG, recall, MRR) for scoring gnosis retrieval quality"
 
 [dependencies]

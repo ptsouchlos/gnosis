@@ -2,6 +2,7 @@
 name = "chunker"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Markdown chunking shared across gnosis front-ends"
 
 [dependencies]
