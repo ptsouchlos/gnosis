@@ -37,9 +37,6 @@ jobs:
       matrix:
         os: [ubuntu-24.04, windows-2025, macos-15]
     runs-on: ${{ matrix.os }}
-    # Windows reports without blocking until its path and line-ending
-    # failures are fixed.
-    continue-on-error: ${{ startsWith(matrix.os, 'windows') }}
     steps:
       - uses: actions/checkout@v7
       - uses: ptsouchlos/infra/.github/actions/setup-rust@v1
