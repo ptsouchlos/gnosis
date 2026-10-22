@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # fmt, clippy and the default test set. The tests that download a model are
+  # #[ignore]d, so this needs no network beyond building.
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ptsouchlos/infra/.github/actions/setup-rust@v1
+      - uses: ptsouchlos/infra/.github/actions/cargo-check@v1
+        with:
+          args: --workspace
+
+  # The query client the Obsidian plugin vendors: its tests in node, then the
+  # release build, whose size the log reports.
+  wasm:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ptsouchlos/infra/.github/actions/setup-rust@v1
+        with:
+          components: ""
+          targets: wasm32-unknown-unknown
+      - name: Install the wasm tools
+        shell: bash
+        run: script/ci/install-wasm-tools.sh "$RUNNER_TEMP/wasm-tools"
+      - name: Test
+        shell: bash
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: cargo test -p gnosis-wasm --target wasm32-unknown-unknown
+      - name: Build
+        shell: bash
+        run: script/wasm/build.sh "$RUNNER_TEMP/gnosis-wasm"
