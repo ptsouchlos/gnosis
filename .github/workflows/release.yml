@@ -1,0 +1,69 @@
+name: Release
+
+# Pushing a tag like v1.2.3 publishes a GitHub release carrying the wasm query
+# client, and asks the Obsidian plugin to re-vendor it.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ptsouchlos/infra/.github/actions/setup-rust@v1
+        with:
+          components: ""
+          targets: wasm32-unknown-unknown
+      - name: Check the tag against the workspace version
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: script/release/check-version.sh "$TAG"
+      - name: Install the wasm tools
+        shell: bash
+        run: script/ci/install-wasm-tools.sh "$RUNNER_TEMP/wasm-tools"
+      - name: Package the wasm query client
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: script/release/package-wasm.sh "$TAG" dist
+      - name: Create the GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # A release created by hand already owns the tag; leave it alone.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; skipping."
+          else
+            gh release create "$TAG" --generate-notes --verify-tag \
+              "dist/gnosis-wasm-$TAG.tar.gz" "dist/gnosis-wasm-$TAG.tar.gz.sha256"
+          fi
+
+  notify-plugin:
+    # Skipped until the GitHub App is configured, so forks and a first dry run
+    # still work.
+    if: vars.INFRA_BOT_APP_ID != ''
+    needs: release
+    runs-on: ubuntu-24.04
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.INFRA_BOT_APP_ID }}
+          private-key: ${{ secrets.INFRA_BOT_PRIVATE_KEY }}
+          owner: ptsouchlos
+          repositories: obsidian-gnosis
+      - name: Ask the plugin to re-vendor the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh api -X POST /repos/ptsouchlos/obsidian-gnosis/dispatches \
+            -f event_type=gnosis-release -f "client_payload[tag]=$TAG"
