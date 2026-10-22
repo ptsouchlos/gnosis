@@ -1,0 +1,13 @@
+[metadata]
+remote = "https://github.com/ptsouchlos/infra"
+commit_hash = "a0704de6951a40145ffef95361443bff96f43156"
+allow_untracked = true
+include = [
+    "just/**",
+    "rust/**",
+]
+
+[files]
+"just/shells.just" = "sha256:ca031066da941b192b18859a4c8ebda1ecfe91ff14f57fe31489c6e83cb3bfa7"
+"rust/just/clippy.just" = "sha256:5ce758826bbd8f4f3ffd626792edb06ab1fe41c591f7cd099c59336c46a1081f"
+"rust/just/format.just" = "sha256:4d8caa2ee5be52073cfd55e94f93a73c4944854b19b47e83a183198bfe291434"
