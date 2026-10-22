@@ -16,6 +16,12 @@ members = [
 ]
 resolver = "3"
 
+# One version for every crate: a release tag names it, and the release
+# workflow refuses a tag that does not match.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
 [workspace.dependencies]
 # Workspace member crates
 chunker = { path = "crates/gnosis-chunker" }
