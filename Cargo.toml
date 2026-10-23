@@ -19,7 +19,7 @@ resolver = "3"
 # One version for every crate: a release tag names it, and the release
 # workflow refuses a tag that does not match.
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 publish = false
