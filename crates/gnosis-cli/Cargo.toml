@@ -3,6 +3,7 @@ name = "gnosis-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "Local semantic search and related-notes for a markdown knowledge base"
 
 [[bin]]

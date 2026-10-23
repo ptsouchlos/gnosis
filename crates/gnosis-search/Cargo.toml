@@ -3,6 +3,7 @@ name = "search"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "Vector scoring and ranking shared across gnosis front-ends"
 
 [dependencies]

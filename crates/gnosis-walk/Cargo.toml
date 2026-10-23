@@ -3,6 +3,7 @@ name = "walk"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "Vault file discovery interface for gnosis"
 
 [dependencies]

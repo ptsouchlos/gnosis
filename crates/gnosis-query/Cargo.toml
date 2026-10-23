@@ -3,6 +3,7 @@ name = "query"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "The retrieval pipeline for gnosis: two channels, fused, shared by every frontend"
 
 [dependencies]

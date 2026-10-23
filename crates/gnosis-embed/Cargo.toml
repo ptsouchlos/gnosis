@@ -3,6 +3,7 @@ name = "embed"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "Embedder trait and embedding config shared across gnosis front-ends"
 
 [dependencies]
