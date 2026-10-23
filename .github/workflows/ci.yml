@@ -68,3 +68,8 @@ jobs:
       - name: Build
         shell: bash
         run: just wasm-build "$RUNNER_TEMP/gnosis-wasm"
+      # Fails on a new dependency whose license is not accepted, before a
+      # release does.
+      - name: Third-party notices
+        shell: bash
+        run: just wasm-notices "$RUNNER_TEMP/THIRD_PARTY_NOTICES.txt"

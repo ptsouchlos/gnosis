@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install the wasm toolchain CI builds the query client with: wasm-pack,
-# wasm-bindgen (with its test runner) and binaryen's wasm-opt, each pinned by
-# version and SHA-256, on x86_64 Linux.
+# wasm-bindgen (with its test runner), binaryen's wasm-opt and cargo-about for
+# its third-party notices, each pinned by version and SHA-256, on x86_64 Linux.
 #
 # wasm-bindgen must equal the `wasm-bindgen` crate pin in
 # crates/gnosis-wasm/Cargo.toml; the CLI refuses to work across versions.
@@ -36,6 +36,10 @@ cp "$tmp/wasm-bindgen-0.2.129-x86_64-unknown-linux-musl/wasm-bindgen" \
 fetch https://github.com/WebAssembly/binaryen/releases/download/version_116/binaryen-version_116-x86_64-linux.tar.gz \
     c55b74f3109cdae97490faf089b0286d3bba926bb6ea5ed00c8c784fc53718fd
 cp "$tmp/binaryen-version_116/bin/wasm-opt" "$dir/"
+
+fetch https://github.com/EmbarkStudios/cargo-about/releases/download/0.9.2/cargo-about-0.9.2-x86_64-unknown-linux-musl.tar.gz \
+    9099a59e820c38a68b9d65f300662a567d56562f9a10f6aa4c7e86c17c2566af
+cp "$tmp/cargo-about-0.9.2-x86_64-unknown-linux-musl/cargo-about" "$dir/"
 
 if [ -n "${GITHUB_PATH:-}" ]; then
     echo "$dir" >>"$GITHUB_PATH"

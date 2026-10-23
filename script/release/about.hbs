@@ -1,0 +1,26 @@
+Third-party notices for the gnosis wasm query client
+
+The query client is compiled from gnosis (MIT; see LICENSE) and statically
+links the crates below. Each license is followed by its text as the crates
+ship it. A crate that ships no license file gets the license's standard text;
+its authors, listed with it, are the copyright holders.
+
+{{#each overview}}
+{{{name}}}: {{count}} crate{{#if (gt count 1)}}s{{/if}}
+{{/each}}
+{{#each licenses}}
+
+================================================================================
+{{{name}}} ({{{id}}})
+
+Used by:
+{{#each used_by}}
+  {{{crate.name}}} {{{crate.version}}}{{#if crate.repository}} <{{{crate.repository}}}>{{/if}}
+{{#if crate.authors}}
+    by {{#each crate.authors}}{{#unless @first}}, {{/unless}}{{{this}}}{{/each}}
+{{/if}}
+{{/each}}
+--------------------------------------------------------------------------------
+
+{{{text}}}
+{{/each}}

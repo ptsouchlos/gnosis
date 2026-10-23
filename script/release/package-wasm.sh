@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Package the wasm query client as a release asset: the files the Obsidian
 # plugin vendors, at the archive's root, plus a GNOSIS_REV naming the commit and
-# the tag. Writes gnosis-wasm-<tag>.tar.gz and its .sha256 into <out-dir>.
+# the tag, gnosis's LICENSE, and the notices for the crates it links. Writes
+# gnosis-wasm-<tag>.tar.gz and its .sha256 into <out-dir>.
 #
 # The plugin unpacks this into vendor/gnosis-wasm/ as is, so it holds exactly
 # what that directory commits: wasm-pack's npm package.json and .gitignore are
@@ -23,6 +24,8 @@ rm -f "$stage/.gitignore" "$stage/package.json"
     git -C "$root" rev-parse HEAD
     printf 'release %s\n' "$tag"
 } >"$stage/GNOSIS_REV"
+cp "$root/LICENSE" "$stage/LICENSE"
+"$root/script/release/notices.sh" "$stage/THIRD_PARTY_NOTICES.txt"
 
 mkdir -p "$out"
 name="gnosis-wasm-$tag.tar.gz"
