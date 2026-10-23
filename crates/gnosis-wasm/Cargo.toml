@@ -3,6 +3,7 @@ name = "gnosis-wasm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "WebAssembly bindings for querying a portable gnosis artifact"
 
 [lib]

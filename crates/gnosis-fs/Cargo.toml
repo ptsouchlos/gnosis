@@ -3,6 +3,7 @@ name = "fs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "File access interface for gnosis's indexing pipeline"
 
 [dependencies]

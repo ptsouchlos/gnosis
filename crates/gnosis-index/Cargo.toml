@@ -3,6 +3,7 @@ name = "index"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 description = "Indexing pipeline orchestration for gnosis, generic over Store/Walker/Embedder/FileReader"
 
 [dependencies]
