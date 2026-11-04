@@ -448,6 +448,20 @@ impl SqliteStore {
         Ok(paths)
     }
 
+    /// Every document path of any of `kinds`, for Rust-side filtering in
+    /// `candidates_by_ids` (mirrors `paths_with_any_tag`).
+    fn paths_with_any_kind(&self, kinds: &[String]) -> Result<HashSet<String>> {
+        let sql = format!(
+            "SELECT path FROM documents_abs WHERE kind IN ({})",
+            in_placeholders(kinds.len())
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let paths = stmt
+            .query_map(rusqlite::params_from_iter(kinds), |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        Ok(paths)
+    }
+
     /// Build the full-text index when it is missing or was built by an older
     /// scheme.
     ///
@@ -525,11 +539,11 @@ impl SqliteStore {
 
     /// Every chunk in `space` as a scoring candidate, scoped per `filter`.
     /// Shared by `search_space`/`related_space`. Params are kept as a single
-    /// homogeneous `Vec<String>` (space, then roots, then tags) bound via
-    /// `params_from_iter` against fully anonymous `?` placeholders — mirrors
-    /// exactly how the pre-existing root/tag filtering already worked here,
-    /// just with `space` folded into the same list instead of being a fixed
-    /// SQL literal.
+    /// homogeneous `Vec<String>` (space, then modality, roots, tags, kinds,
+    /// paths) bound via `params_from_iter` against fully anonymous `?`
+    /// placeholders — mirrors exactly how the pre-existing root/tag filtering
+    /// already worked here, just with `space` folded into the same list
+    /// instead of being a fixed SQL literal.
     /// `modality` restricts to a single modality within the space (what
     /// `search_space` wants); `None` spans every modality (what
     /// `related_space` wants, since it traverses title proxies too).
@@ -562,6 +576,13 @@ impl SqliteStore {
                 in_placeholders(tags.len())
             ));
         }
+        let kinds = filter.kinds.filter(|k| !k.is_empty());
+        if let Some(kinds) = kinds {
+            sql.push_str(&format!(
+                " AND d.kind IN ({})",
+                in_placeholders(kinds.len())
+            ));
+        }
         if let Some(paths) = filter.paths {
             if paths.is_empty() {
                 return Ok(Vec::new());
@@ -578,6 +599,7 @@ impl SqliteStore {
         params.extend(modality.map(str::to_string));
         params.extend(roots.into_iter().flatten().cloned());
         params.extend(tags.into_iter().flatten().cloned());
+        params.extend(kinds.into_iter().flatten().cloned());
         params.extend(filter.paths.into_iter().flatten().cloned());
         let candidates: Vec<Candidate> = stmt
             .query_map(rusqlite::params_from_iter(params), map_row)?
@@ -612,6 +634,10 @@ impl SqliteStore {
         }
         if let Some(tags) = filter.tags.filter(|t| !t.is_empty()) {
             let allowed = self.paths_with_any_tag(tags)?;
+            candidates.retain(|c| allowed.contains(&c.path));
+        }
+        if let Some(kinds) = filter.kinds.filter(|k| !k.is_empty()) {
+            let allowed = self.paths_with_any_kind(kinds)?;
             candidates.retain(|c| allowed.contains(&c.path));
         }
         candidates.retain(|c| filter.allows_path(&c.path));
@@ -1013,6 +1039,13 @@ impl Store for SqliteStore {
                 in_placeholders(tags.len())
             ));
         }
+        let kinds = filter.kinds.filter(|k| !k.is_empty());
+        if let Some(kinds) = kinds {
+            sql.push_str(&format!(
+                " AND d.kind IN ({})",
+                in_placeholders(kinds.len())
+            ));
+        }
         if let Some(paths) = filter.paths {
             if paths.is_empty() {
                 return Ok(store::LexicalMatches {
@@ -1034,6 +1067,7 @@ impl Store for SqliteStore {
         let mut params: Vec<String> = vec![match_expr];
         params.extend(roots.into_iter().flatten().cloned());
         params.extend(tags.into_iter().flatten().cloned());
+        params.extend(kinds.into_iter().flatten().cloned());
         params.extend(filter.paths.into_iter().flatten().cloned());
         params.push(limit.to_string());
 
@@ -1074,10 +1108,10 @@ impl Store for SqliteStore {
         limit: usize,
         filter: &TextQuery,
     ) -> Result<Vec<Hit>> {
-        // Over-fetch only when filtering by root/tag, which ANN can't apply.
-        // Modality needs no over-fetch: the index is per-modality, so nothing
-        // is discarded after retrieval.
-        let k = if filter.from.is_some() || filter.tags.is_some() {
+        // Over-fetch only when filtering by root/tag/kind, which ANN can't
+        // apply. Modality needs no over-fetch: the index is per-modality, so
+        // nothing is discarded after retrieval.
+        let k = if filter.from.is_some() || filter.tags.is_some() || filter.kinds.is_some() {
             limit * 5
         } else {
             limit
@@ -1654,6 +1688,111 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// `kinds` restricts candidates to the named document kinds; an empty
+    /// list restricts nothing (mirrors `from`/`tags`).
+    #[test]
+    fn search_space_filters_by_kind() {
+        let (mut store, path) = temp_store();
+        write_full_doc(
+            &mut store,
+            "/vault/note.md",
+            "markdown",
+            &[chunk("text", "text", Some("note"), vec![1.0, 0.0])],
+            None,
+            None,
+        );
+        write_full_doc(
+            &mut store,
+            "/vault/photo.png",
+            "image",
+            &[chunk("text", "text", Some("photo"), vec![0.9, 0.1])],
+            Some(800),
+            Some(600),
+        );
+        write_full_doc(
+            &mut store,
+            "/vault/scan.pdf",
+            "pdf",
+            &[chunk("text", "text", Some("scan"), vec![0.8, 0.2])],
+            None,
+            None,
+        );
+
+        let kinds = vec!["image".to_string()];
+        let image_only = TextQuery {
+            kinds: Some(&kinds),
+            ..TextQuery::default()
+        };
+        let hits = store
+            .search_space(Space::Text, &[1.0, 0.0], 10, &image_only)
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+            vec!["/vault/photo.png"]
+        );
+
+        let none: Vec<String> = Vec::new();
+        let unscoped = TextQuery {
+            kinds: Some(&none),
+            ..TextQuery::default()
+        };
+        let hits = store
+            .search_space(Space::Text, &[1.0, 0.0], 10, &unscoped)
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+            vec!["/vault/note.md", "/vault/photo.png", "/vault/scan.pdf"]
+        );
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// The kind filter must apply *before* ANN truncation, not after: the
+    /// two markdown notes outrank the image for every query, so with limit 1
+    /// a post-retrieval filter would return nothing.
+    #[test]
+    fn kind_filter_survives_ann_truncation() {
+        let (mut store, path) = temp_store();
+        for (name, vector) in [
+            ("/vault/note1.md", vec![1.0, 0.0]),
+            ("/vault/note2.md", vec![0.95, 0.05]),
+        ] {
+            write_full_doc(
+                &mut store,
+                name,
+                "markdown",
+                &[chunk("text", "text", Some(name), vector)],
+                None,
+                None,
+            );
+        }
+        write_full_doc(
+            &mut store,
+            "/vault/photo.png",
+            "image",
+            &[chunk("text", "text", Some("photo"), vec![0.8, 0.2])],
+            Some(800),
+            Some(600),
+        );
+
+        store.rebuild_index(Space::Text, ScalarKind::F32).unwrap();
+
+        let kinds = vec!["image".to_string()];
+        let image_only = TextQuery {
+            kinds: Some(&kinds),
+            ..TextQuery::default()
+        };
+        let hits = store
+            .search_space(Space::Text, &[1.0, 0.0], 1, &image_only)
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+            vec!["/vault/photo.png"]
+        );
+
         let _ = std::fs::remove_dir_all(&path);
     }
 
@@ -2391,6 +2530,7 @@ mod tests {
                 &TextQuery {
                     from: Some(&roots),
                     tags: None,
+                    kinds: None,
                     paths: None,
                 },
             )

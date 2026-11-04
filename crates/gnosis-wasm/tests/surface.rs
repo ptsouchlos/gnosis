@@ -329,6 +329,39 @@ fn filters_match_a_root_label_and_a_tag() {
     );
 }
 
+/// The kind filter crosses the boundary like `from` and `tags` and restricts
+/// by the document's kind rather than where the query points: the same
+/// vector and the same query, and the fixture's only image comes back or
+/// does not depending on the list.
+#[wasm_bindgen_test]
+fn a_kind_filter_restricts_by_the_documents_kind() {
+    let index = open();
+    let vectors = vectors(&[("image", &[1.0, 0.2, 0.0])]);
+
+    // Pointed straight at the only image in the fixture.
+    let hits = paths(
+        index
+            .search("loaf", &vectors, 10, JsValue::UNDEFINED)
+            .expect("search"),
+    );
+    assert_eq!(hits, vec!["notes/loaf.png".to_string()], "got {hits:?}");
+
+    // A markdown scope must not return it: the kind is the document's, not
+    // the query's, and the vector still points straight at it.
+    let markdown = js_sys::JSON::parse(r#"{"kinds":["markdown"]}"#).expect("filter");
+    let hits = paths(index.search("loaf", &vectors, 10, markdown).expect("search"));
+    assert!(hits.is_empty(), "got {hits:?}");
+
+    // An image scope keeps it, and an empty scope restricts nothing.
+    let images = js_sys::JSON::parse(r#"{"kinds":["image"]}"#).expect("filter");
+    let hits = paths(index.search("loaf", &vectors, 10, images).expect("search"));
+    assert_eq!(hits, vec!["notes/loaf.png".to_string()], "got {hits:?}");
+
+    let none = js_sys::JSON::parse(r#"{"kinds":[]}"#).expect("filter");
+    let hits = paths(index.search("loaf", &vectors, 10, none).expect("search"));
+    assert_eq!(hits, vec!["notes/loaf.png".to_string()], "got {hits:?}");
+}
+
 /// Staleness is a report, not a repair: the client walks its vault, this says
 /// what the artifact disagrees with, and only the machine with the models can
 /// act on it.

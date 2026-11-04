@@ -178,6 +178,11 @@ impl ArtifactStore {
         {
             return false;
         }
+        if let Some(kinds) = filter.kinds.filter(|k| !k.is_empty())
+            && !kinds.iter().any(|k| k == &doc.kind)
+        {
+            return false;
+        }
         filter.allows_path(&doc.path)
     }
 

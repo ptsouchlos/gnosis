@@ -153,6 +153,7 @@ pub fn execute(ws: &Workspace, args: EvalArgs) -> Result<()> {
     let filter = TextQuery {
         from: None,
         tags: None,
+        kinds: None,
         paths: None,
     };
 

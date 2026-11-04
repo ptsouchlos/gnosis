@@ -50,7 +50,7 @@ pub struct Index {
     cfg: search::bm25::SearchConfig,
 }
 
-/// The `--from` / `--tag` filter, as a client sends it.
+/// The `--from` / `--tag` / `--kind` filter, as a client sends it.
 ///
 /// `from` matches a root *label* rather than a path: an artifact records what
 /// its vaults were called, not where they lived on the machine that built it.
@@ -59,6 +59,8 @@ pub struct Index {
 struct Filter {
     from: Vec<String>,
     tags: Vec<String>,
+    /// Document kinds to keep (`markdown`, `image`, `pdf`); empty = all.
+    kinds: Vec<String>,
 }
 
 impl Filter {
@@ -66,6 +68,7 @@ impl Filter {
         TextQuery {
             from: (!self.from.is_empty()).then_some(self.from.as_slice()),
             tags: (!self.tags.is_empty()).then_some(self.tags.as_slice()),
+            kinds: (!self.kinds.is_empty()).then_some(self.kinds.as_slice()),
             paths: None,
         }
     }

@@ -122,6 +122,7 @@ fn with_named(
     let scoped = TextQuery {
         from: filter.from,
         tags: filter.tags,
+        kinds: filter.kinds,
         paths: Some(&paths),
     };
     for hit in store.search_space(Space::Text, query_vec, limit, &scoped)? {
@@ -442,6 +443,17 @@ mod tests {
         }
     }
 
+    /// A fake has no document table, so a hit's kind is its file extension —
+    /// enough for the kind filter to do its job, the way `documents.kind` does
+    /// for the real store.
+    fn kind_of(path: &str) -> &'static str {
+        match path.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("") {
+            "png" => "image",
+            "pdf" => "pdf",
+            _ => "markdown",
+        }
+    }
+
     impl Store for FakeStore {
         /// `dense` is the whole corpus in rank order; `limit` cuts it, as an
         /// ANN search would, unless the filter names documents.
@@ -456,6 +468,11 @@ mod tests {
                 .dense
                 .iter()
                 .filter(|h| filter.allows_path(&h.path))
+                .filter(|h| {
+                    !filter.kinds.is_some_and(|kinds| {
+                        !kinds.is_empty() && !kinds.iter().any(|k| k == kind_of(&h.path))
+                    })
+                })
                 .take(limit)
                 .cloned()
                 .collect())
@@ -712,6 +729,38 @@ mod tests {
         assert!(
             !paths.contains(&"Notes/Who Not How.md".to_string()),
             "got {paths:?}"
+        );
+    }
+
+    /// The kind scope must survive the second `search_space` call
+    /// `with_named` issues for the named candidates; without it a note whose
+    /// name carries the query would slip through an image-scoped search.
+    #[test]
+    fn with_named_keeps_the_kind_scope() {
+        let s = store(
+            vec![hit("photo.png", 0.9), hit("notes.md", 0.8)],
+            Vec::new(),
+        );
+        let kinds = vec!["image".to_string()];
+        let filter = TextQuery {
+            kinds: Some(&kinds),
+            ..TextQuery::default()
+        };
+        let hits = run_query(
+            &s,
+            &mut FixedVector(vec![1.0, 0.0]),
+            "notes",
+            &[Space::Text],
+            10,
+            &filter,
+            &config(false),
+        )
+        .unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["photo.png"],
+            "an image-scoped query must not let the named note through"
         );
     }
 

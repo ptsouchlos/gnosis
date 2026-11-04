@@ -130,6 +130,9 @@ pub struct TextQuery<'a> {
     /// Restrict to documents having any of these tags. Empty/absent = no
     /// restriction.
     pub tags: Option<&'a [String]>,
+    /// Restrict to documents of any of these kinds (the document's `kind`:
+    /// `markdown`, `image`, `pdf`). Empty/absent = no restriction.
+    pub kinds: Option<&'a [String]>,
     /// Restrict to exactly these document paths, as hits report them. Unlike
     /// the other fields, an empty list matches nothing: it names documents
     /// rather than narrowing a corpus, and none named means none wanted.

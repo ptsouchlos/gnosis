@@ -1464,6 +1464,7 @@ mod tests {
                 &TextQuery {
                     from: Some(&roots),
                     tags: None,
+                    kinds: None,
                     paths: None,
                 },
             )
@@ -1479,6 +1480,7 @@ mod tests {
                 &TextQuery {
                     from: Some(&elsewhere),
                     tags: None,
+                    kinds: None,
                     paths: None,
                 },
             )
@@ -1494,6 +1496,7 @@ mod tests {
                 &TextQuery {
                     from: None,
                     tags: Some(&tags),
+                    kinds: None,
                     paths: None,
                 },
             )
@@ -1509,12 +1512,87 @@ mod tests {
                     &TextQuery {
                         from: None,
                         tags: Some(&missing),
+                        kinds: None,
                         paths: None,
                     },
                 )
                 .unwrap()
                 .is_empty()
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `--kind` means the same thing on both sides: the artifact excludes the
+    /// other kinds before it truncates, and an empty list restricts nothing,
+    /// like `--from` and `--tag`. The seeded store's text space is all
+    /// markdown, so the pdf gets a text chunk of its own to make the filter
+    /// observable there; its vector is orthogonal to the query, which is what
+    /// puts it behind the notes in the unfiltered result.
+    #[test]
+    fn an_artifact_filters_by_kind() {
+        let dir = temp_dir("kinds");
+        let mut store = seeded_store(&dir);
+        store
+            .replace_document(&DocWrite {
+                path: "/vault/scan.pdf",
+                kind: "pdf",
+                source_root: "/vault",
+                content_hash: b"pdf",
+                mtime: 42,
+                title: "Scan",
+                frontmatter: None,
+                indexed_at: 0,
+                chunks: &[ChunkWrite {
+                    ord: 0,
+                    space: "text".to_string(),
+                    modality: "text".to_string(),
+                    text: Some("delta epsilon".to_string()),
+                    heading_path: "Heading".to_string(),
+                    vector: vec![0.0, 0.0, 0.0, 1.0],
+                }],
+                links: &[],
+                tags: &[],
+                width: None,
+                height: None,
+            })
+            .unwrap();
+        let (manifest, shards) = build_one(&store, Quantization::F32, Compression::Deflate);
+        let artifact = ArtifactStore::new(open_artifact(&manifest, shards));
+        let query = [1.0, 0.0, 0.0, 0.0];
+
+        let paths = |kinds: &[&str]| {
+            let owned: Vec<String> = kinds.iter().map(|s| s.to_string()).collect();
+            artifact
+                .search_space(
+                    Space::Text,
+                    &query,
+                    10,
+                    &TextQuery {
+                        kinds: Some(&owned),
+                        ..TextQuery::default()
+                    },
+                )
+                .unwrap()
+                .iter()
+                .map(|h| h.path.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            paths(&["markdown"]),
+            vec!["near.md", "mid.md", "deep/far.md"],
+            "the pdf is excluded, and the notes keep their ranking"
+        );
+        assert_eq!(paths(&["pdf"]), vec!["scan.pdf"]);
+        assert!(paths(&["image"]).is_empty());
+        let mut all = paths(&[]);
+        assert_eq!(
+            all.len(),
+            4,
+            "an empty list restricts nothing"
+        );
+        all.sort();
+        assert_eq!(all, vec!["deep/far.md", "mid.md", "near.md", "scan.pdf"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

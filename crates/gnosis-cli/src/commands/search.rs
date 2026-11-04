@@ -26,6 +26,10 @@ pub struct SearchArgs {
     /// any, not all).
     #[arg(long)]
     pub tag: Vec<String>,
+    /// Restrict to documents of these kinds (repeatable): markdown, image,
+    /// pdf.
+    #[arg(long)]
+    pub kind: Vec<String>,
     /// Maximum number of results.
     #[arg(long, default_value_t = 10)]
     pub limit: usize,
@@ -130,9 +134,19 @@ pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
         .collect();
     let from_ref = (!from.is_empty()).then_some(from.as_slice());
     let tags_ref = (!args.tag.is_empty()).then_some(args.tag.as_slice());
+    for kind in &args.kind {
+        match kind.as_str() {
+            "markdown" | "image" | "pdf" => {}
+            other => bail!(
+                "unknown kind '{other}' — expected markdown, image, or pdf"
+            ),
+        }
+    }
+    let kinds_ref = (!args.kind.is_empty()).then_some(args.kind.as_slice());
     let filter = TextQuery {
         from: from_ref,
         tags: tags_ref,
+        kinds: kinds_ref,
         paths: None,
     };
 
@@ -199,4 +213,57 @@ pub(crate) fn root_label(root: &str) -> &str {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    /// A typo in `--kind` fails up front with a clear message, before any
+    /// query work — the store-level tests own the filtering semantics this
+    /// flag feeds, which a full `execute` run could not reach without
+    /// loading the embedder models.
+    #[test]
+    fn an_unknown_kind_is_rejected_before_any_query_work() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "gnosis-search-kind-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = Workspace {
+            config: Config::default(),
+            config_path: dir.join("gnosis.toml"),
+            db_path: dir.join("gnosis.db"),
+            global: false,
+        };
+        std::fs::File::create(&ws.db_path).unwrap();
+
+        let err = execute(
+            &ws,
+            SearchArgs {
+                query: "anything".to_string(),
+                r#in: vec![],
+                from: vec![],
+                tag: vec![],
+                kind: vec!["diagram".to_string()],
+                limit: 10,
+                full: false,
+                json: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unknown kind 'diagram' — expected markdown, image, or pdf"),
+            "got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
