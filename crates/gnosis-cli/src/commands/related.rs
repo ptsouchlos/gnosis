@@ -49,6 +49,7 @@ pub fn execute(ws: &Workspace, args: RelatedArgs) -> Result<()> {
     let filter = TextQuery {
         from: None,
         tags: tags_ref,
+        kinds: None,
         paths: None,
     };
 

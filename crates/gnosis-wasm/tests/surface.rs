@@ -114,6 +114,20 @@ fn info_reports_each_space_s_query_model_and_pooling() {
     );
 }
 
+/// A client scoping a query to a kind needs to know that kind can match
+/// anything at all: the fixture holds three notes and one image, and a `pdf:`
+/// scope must be able to say the index has none before spending a query on it.
+#[wasm_bindgen_test]
+fn info_reports_how_many_documents_each_kind_holds() {
+    let info = json(open().info().expect("info"));
+    let kinds = info["kinds"].as_array().expect("kinds");
+    assert_eq!(kinds.len(), 2);
+    assert_eq!(kinds[0]["kind"], "markdown");
+    assert_eq!(kinds[0]["documents"], 3);
+    assert_eq!(kinds[1]["kind"], "image");
+    assert_eq!(kinds[1]["documents"], 1);
+}
+
 /// A shard that does not match the manifest must not open. Half an artifact
 /// would answer queries from a mixture of two indexes, which is worse than
 /// refusing: nothing downstream could tell.
@@ -327,6 +341,43 @@ fn filters_match_a_root_label_and_a_tag() {
         !hits.contains(&"work/planner.md".to_string()),
         "got {hits:?}"
     );
+}
+
+/// The kind filter crosses the boundary like `from` and `tags` and restricts
+/// by the document's kind rather than where the query points: the same
+/// vector and the same query, and the fixture's only image comes back or
+/// does not depending on the list.
+#[wasm_bindgen_test]
+fn a_kind_filter_restricts_by_the_documents_kind() {
+    let index = open();
+    let vectors = vectors(&[("image", &[1.0, 0.2, 0.0])]);
+
+    // Pointed straight at the only image in the fixture.
+    let hits = paths(
+        index
+            .search("loaf", &vectors, 10, JsValue::UNDEFINED)
+            .expect("search"),
+    );
+    assert_eq!(hits, vec!["notes/loaf.png".to_string()], "got {hits:?}");
+
+    // A markdown scope must not return it: the kind is the document's, not
+    // the query's, and the vector still points straight at it.
+    let markdown = js_sys::JSON::parse(r#"{"kinds":["markdown"]}"#).expect("filter");
+    let hits = paths(
+        index
+            .search("loaf", &vectors, 10, markdown)
+            .expect("search"),
+    );
+    assert!(hits.is_empty(), "got {hits:?}");
+
+    // An image scope keeps it, and an empty scope restricts nothing.
+    let images = js_sys::JSON::parse(r#"{"kinds":["image"]}"#).expect("filter");
+    let hits = paths(index.search("loaf", &vectors, 10, images).expect("search"));
+    assert_eq!(hits, vec!["notes/loaf.png".to_string()], "got {hits:?}");
+
+    let none = js_sys::JSON::parse(r#"{"kinds":[]}"#).expect("filter");
+    let hits = paths(index.search("loaf", &vectors, 10, none).expect("search"));
+    assert_eq!(hits, vec!["notes/loaf.png".to_string()], "got {hits:?}");
 }
 
 /// Staleness is a report, not a repair: the client walks its vault, this says
