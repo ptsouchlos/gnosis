@@ -101,6 +101,16 @@ struct SpaceReport {
     chunks: usize,
 }
 
+/// How many documents of one kind the artifact holds, for a client deciding
+/// whether a kind-scoped query can match anything at all.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KindCount {
+    /// The document kind, as stored: `markdown`, `image`, `pdf`.
+    kind: String,
+    documents: usize,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct InfoReport {
@@ -109,6 +119,9 @@ struct InfoReport {
     created_unix: i64,
     documents: usize,
     chunks: usize,
+    /// How many documents each kind holds; kinds appear in the order their
+    /// first document does.
+    kinds: Vec<KindCount>,
     quantization: Quantization,
     compression: Compression,
     roots: Vec<String>,
@@ -325,6 +338,16 @@ impl Index {
                 .filter(|c| c.space == space)
                 .count()
         };
+        let mut kinds: Vec<KindCount> = Vec::new();
+        for entry in self.store.artifact().documents() {
+            match kinds.iter_mut().find(|c| c.kind == entry.kind) {
+                Some(count) => count.documents += 1,
+                None => kinds.push(KindCount {
+                    kind: entry.kind.clone(),
+                    documents: 1,
+                }),
+            }
+        }
         let spaces: Vec<SpaceReport> = manifest
             .spaces
             .iter()
@@ -348,6 +371,7 @@ impl Index {
             created_unix: manifest.created_unix,
             documents: self.store.artifact().documents().len(),
             chunks: self.store.artifact().chunks().len(),
+            kinds,
             quantization: manifest.quantization,
             compression: manifest.compression,
             roots: manifest.roots.clone(),

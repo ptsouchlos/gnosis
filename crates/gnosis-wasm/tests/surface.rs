@@ -114,6 +114,20 @@ fn info_reports_each_space_s_query_model_and_pooling() {
     );
 }
 
+/// A client scoping a query to a kind needs to know that kind can match
+/// anything at all: the fixture holds three notes and one image, and a `pdf:`
+/// scope must be able to say the index has none before spending a query on it.
+#[wasm_bindgen_test]
+fn info_reports_how_many_documents_each_kind_holds() {
+    let info = json(open().info().expect("info"));
+    let kinds = info["kinds"].as_array().expect("kinds");
+    assert_eq!(kinds.len(), 2);
+    assert_eq!(kinds[0]["kind"], "markdown");
+    assert_eq!(kinds[0]["documents"], 3);
+    assert_eq!(kinds[1]["kind"], "image");
+    assert_eq!(kinds[1]["documents"], 1);
+}
+
 /// A shard that does not match the manifest must not open. Half an artifact
 /// would answer queries from a mixture of two indexes, which is worse than
 /// refusing: nothing downstream could tell.
