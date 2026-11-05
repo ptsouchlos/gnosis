@@ -137,9 +137,7 @@ pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
     for kind in &args.kind {
         match kind.as_str() {
             "markdown" | "image" | "pdf" => {}
-            other => bail!(
-                "unknown kind '{other}' — expected markdown, image, or pdf"
-            ),
+            other => bail!("unknown kind '{other}' — expected markdown, image, or pdf"),
         }
     }
     let kinds_ref = (!args.kind.is_empty()).then_some(args.kind.as_slice());
@@ -231,10 +229,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .subsec_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "gnosis-search-kind-{}-{nanos}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("gnosis-search-kind-{}-{nanos}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let ws = Workspace {

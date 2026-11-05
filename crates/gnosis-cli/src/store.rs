@@ -1108,18 +1108,22 @@ impl Store for SqliteStore {
         limit: usize,
         filter: &TextQuery,
     ) -> Result<Vec<Hit>> {
-        // Over-fetch only when filtering by root/tag/kind, which ANN can't
+        // Over-fetch only when filtering by root/tag, which ANN can't
         // apply. Modality needs no over-fetch: the index is per-modality, so
         // nothing is discarded after retrieval.
-        let k = if filter.from.is_some() || filter.tags.is_some() || filter.kinds.is_some() {
+        let k = if filter.from.is_some() || filter.tags.is_some() {
             limit * 5
         } else {
             limit
         };
         let modality = search_modality(space);
         // A search over named documents scores exactly those: the ANN index
-        // could rank them all past `k`, and there are few enough to read.
-        if filter.paths.is_some() {
+        // could rank them all past `k`, and there are few enough to read. A
+        // kind scope takes the same route: its guarantee is that it applies
+        // before truncation (50 images in a 5,000-note vault must still
+        // return images), which an over-fetched ANN can't offer;
+        // `space_candidates` applies the kind filter in SQL instead.
+        if filter.paths.is_some() || filter.kinds.filter(|k| !k.is_empty()).is_some() {
             let candidates = self.space_candidates(space, Some(modality), filter)?;
             return Ok(search::rank(query, candidates, limit));
         }
@@ -1750,21 +1754,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
-    /// The kind filter must apply *before* ANN truncation, not after: the
-    /// two markdown notes outrank the image for every query, so with limit 1
-    /// a post-retrieval filter would return nothing.
+    /// The kind filter must apply *before* ANN truncation, not after: every
+    /// markdown note outranks the image for this query, and there are more
+    /// of them than the old over-fetch (`limit * 5`), so a post-retrieval
+    /// filter would return nothing for the image scope.
     #[test]
     fn kind_filter_survives_ann_truncation() {
         let (mut store, path) = temp_store();
-        for (name, vector) in [
-            ("/vault/note1.md", vec![1.0, 0.0]),
-            ("/vault/note2.md", vec![0.95, 0.05]),
-        ] {
+        for i in 0..12 {
+            let name = format!("/vault/note{i}.md");
+            // All strictly closer to the query than the image's vector.
+            let vector = [1.0 - (i as f32) * 0.001, 0.0];
             write_full_doc(
                 &mut store,
-                name,
+                &name,
                 "markdown",
-                &[chunk("text", "text", Some(name), vector)],
+                &[chunk("text", "text", Some(&name), vector.to_vec())],
                 None,
                 None,
             );
@@ -1778,6 +1783,8 @@ mod tests {
             Some(600),
         );
 
+        // Build the ANN index so the ANN route is available; a scoped search
+        // must not depend on how many neighbors it could over-fetch.
         store.rebuild_index(Space::Text, ScalarKind::F32).unwrap();
 
         let kinds = vec!["image".to_string()];
@@ -1791,6 +1798,18 @@ mod tests {
         assert_eq!(
             hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
             vec!["/vault/photo.png"]
+        );
+
+        // Sanity: unscoped, the nearest neighbor is note0, i.e. the image is
+        // a genuinely distant match, so the scoped hit is not trivially the
+        // first vector in the space. (The 12-note geometry above is what
+        // makes the truncation scenario meaningful.)
+        let hits = store
+            .search_space(Space::Text, &[1.0, 0.0], 1, &TextQuery::default())
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+            vec!["/vault/note0.md"]
         );
 
         let _ = std::fs::remove_dir_all(&path);

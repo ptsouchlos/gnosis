@@ -1586,11 +1586,7 @@ mod tests {
         assert_eq!(paths(&["pdf"]), vec!["scan.pdf"]);
         assert!(paths(&["image"]).is_empty());
         let mut all = paths(&[]);
-        assert_eq!(
-            all.len(),
-            4,
-            "an empty list restricts nothing"
-        );
+        assert_eq!(all.len(), 4, "an empty list restricts nothing");
         all.sort();
         assert_eq!(all, vec!["deep/far.md", "mid.md", "near.md", "scan.pdf"]);
         let _ = std::fs::remove_dir_all(dir);

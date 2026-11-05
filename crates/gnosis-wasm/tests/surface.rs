@@ -363,7 +363,11 @@ fn a_kind_filter_restricts_by_the_documents_kind() {
     // A markdown scope must not return it: the kind is the document's, not
     // the query's, and the vector still points straight at it.
     let markdown = js_sys::JSON::parse(r#"{"kinds":["markdown"]}"#).expect("filter");
-    let hits = paths(index.search("loaf", &vectors, 10, markdown).expect("search"));
+    let hits = paths(
+        index
+            .search("loaf", &vectors, 10, markdown)
+            .expect("search"),
+    );
     assert!(hits.is_empty(), "got {hits:?}");
 
     // An image scope keeps it, and an empty scope restricts nothing.
