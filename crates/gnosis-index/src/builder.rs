@@ -144,6 +144,25 @@ pub struct AddedImage {
     pub title: Option<String>,
 }
 
+/// What [`ArtifactBuilder::add_pdf`] tells the caller to do next.
+#[derive(Debug, Clone)]
+pub struct AddedPdf {
+    /// True when the PDF was carried over unchanged, so [`PdfPages`] is not
+    /// needed and nothing needs embedding.
+    pub reused: bool,
+}
+
+/// What [`ArtifactBuilder::set_pdf_pages`] hands back to embed.
+#[derive(Debug, Clone)]
+pub struct PdfPages {
+    /// The exact strings to embed, in chunk order, document prefix and page
+    /// label included — because that is what the native indexer embeds.
+    pub texts: Vec<String>,
+    /// The resolved title (metadata's `Title`, or the file stem) to embed for
+    /// the PDF's title proxy, when the build has an image space.
+    pub title: Option<String>,
+}
+
 /// A finished artifact, ready to write.
 #[derive(Debug)]
 pub struct Built {
@@ -404,11 +423,104 @@ impl ArtifactBuilder {
         })
     }
 
+    /// Offer one PDF to the index.
+    ///
+    /// `hash` is [`content_hash_bytes`] of the file; `mtime` is in seconds. An
+    /// unchanged PDF keeps its chunks and vectors, and a new or changed one is
+    /// a document of kind `pdf` whose chunks `set_pdf_pages` fills, after
+    /// which it owes their vectors.
+    pub fn add_pdf(&mut self, path: &str, hash: &str, mtime: i64) -> Result<AddedPdf> {
+        if let Some(pending) = self.reuse(path, hash, "pdf") {
+            self.documents.insert(path.to_string(), pending);
+            return Ok(AddedPdf { reused: true });
+        }
+        // The file's stem, as `gnosis index` titles a PDF whose metadata has
+        // no title: `set_pdf_pages` replaces it with the resolved one.
+        let title = std::path::Path::new(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(path)
+            .to_string();
+        self.documents.insert(
+            path.to_string(),
+            Pending {
+                entry: DocumentEntry {
+                    root: 0,
+                    path: path.to_string(),
+                    title: title.clone(),
+                    kind: "pdf".to_string(),
+                    content_hash: hash.to_string(),
+                    mtime,
+                    created_unix: None,
+                    links: Vec::new(),
+                    tags: Vec::new(),
+                },
+                chunks: Vec::new(),
+                needs_vectors: true,
+                is_image: false,
+                awaiting_title: self.spec.image.is_some().then(|| title.clone()),
+            },
+        );
+        Ok(AddedPdf { reused: false })
+    }
+
+    /// Fill in a new or changed PDF's extracted pages.
+    ///
+    /// `title` is the PDF metadata's `Title`, which is often empty; the file
+    /// stem is the fallback, and what `PdfPages` returns is the resolved
+    /// title. The pages come from the client's extraction worker, because the
+    /// extraction itself can trap the wasm instance that holds this builder.
+    pub fn set_pdf_pages(
+        &mut self,
+        path: &str,
+        title: &str,
+        pages: &[(u32, String)],
+    ) -> Result<PdfPages> {
+        let Some(pending) = self.documents.get_mut(path) else {
+            bail!("'{path}' was never added");
+        };
+        if pending.entry.kind != "pdf" {
+            bail!("'{path}' is not a PDF; use add_pdf");
+        }
+        let (title, chunks) =
+            crate::pdf_chunks(path, title, pages, self.spec.max_tokens, self.spec.overlap);
+        let texts: Vec<String> = chunks
+            .iter()
+            .map(|c| {
+                format!(
+                    "{}{}",
+                    self.spec.document_prefix,
+                    crate::join_lines(&c.heading_path, &c.text)
+                )
+            })
+            .collect();
+        let pdf_pages = PdfPages {
+            texts,
+            title: self.spec.image.is_some().then(|| title.clone()),
+        };
+        pending.entry.title = title.clone();
+        pending.awaiting_title = self.spec.image.is_some().then(|| title.clone());
+        pending.chunks = chunks
+            .into_iter()
+            .map(|c| ArtifactChunk {
+                doc_index: 0,
+                ord: c.ord as u32,
+                space: Space::Text,
+                modality: "text".to_string(),
+                heading_path: c.heading_path,
+                text: c.text,
+                vector: Vec::new(),
+            })
+            .collect();
+        pending.needs_vectors = true;
+        Ok(pdf_pages)
+    }
+
     /// Drop a document that was offered but cannot be completed — an image
-    /// that will not decode, say. `gnosis index` skips such a file and carries
-    /// on, and a client has to be able to as well: a document still waiting
-    /// for its vectors would otherwise stop `finish`. Returns whether it was
-    /// there.
+    /// that will not decode, a PDF that will not extract, say. `gnosis index`
+    /// skips such a file and carries on, and a client has to be able to as
+    /// well: a document still waiting for its vectors would otherwise stop
+    /// `finish`. Returns whether it was there.
     pub fn remove(&mut self, path: &str) -> bool {
         self.documents.remove(path).is_some()
     }
@@ -678,7 +790,7 @@ impl ArtifactBuilder {
             .filter(|c| {
                 c.doc_index == index
                     && match c.space {
-                        Space::Text => kind == "markdown",
+                        Space::Text => kind == "markdown" || kind == "pdf",
                         Space::Image => image_ok,
                     }
             })
@@ -933,6 +1045,169 @@ mod tests {
         assert!(!builder.remove("img/corrupt.png"), "already gone");
         let built = builder.finish(1).unwrap();
         assert_eq!(built.documents, 2);
+    }
+
+    #[test]
+    fn a_pdf_is_chunked_per_page_and_embedded_like_a_note() {
+        let mut builder = ArtifactBuilder::new(spec(false));
+        let added = builder.add_pdf("notes/doc.pdf", "abc", 10).unwrap();
+        assert!(!added.reused);
+        let pages = builder
+            .set_pdf_pages(
+                "notes/doc.pdf",
+                "",
+                &[
+                    (1, "first page words".to_string()),
+                    (2, "second page words".to_string()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            pages.texts,
+            ["Page 1\nfirst page words", "Page 2\nsecond page words"]
+        );
+        assert_eq!(pages.title, None, "no image space, so no title proxy");
+        builder
+            .set_vectors("notes/doc.pdf", &[1.0, 0.0, 0.0, 1.0])
+            .unwrap();
+        let built = builder.finish(1).unwrap();
+        let artifact = open(&built);
+
+        let doc = &artifact.documents()[0];
+        assert_eq!(doc.path, "notes/doc.pdf");
+        assert_eq!(doc.kind, "pdf");
+        assert_eq!(doc.title, "doc", "no metadata title, so the file stem");
+        assert_eq!(doc.content_hash, "abc");
+        assert_eq!(
+            artifact
+                .chunks()
+                .iter()
+                .map(|c| (c.ord, c.space, c.modality.as_str(), c.heading_path.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (0, Space::Text, "text", "Page 1"),
+                (1, Space::Text, "text", "Page 2"),
+            ]
+        );
+        assert_eq!(artifact.chunks()[0].vector, [1.0, 0.0]);
+        assert_eq!(artifact.chunks()[1].vector, [0.0, 1.0]);
+    }
+
+    #[test]
+    fn a_pdf_with_a_metadata_title_owes_a_title_proxy_when_there_is_an_image_space() {
+        let mut builder = ArtifactBuilder::new(spec(true));
+        builder.add_pdf("notes/doc.pdf", "abc", 10).unwrap();
+        let pages = builder
+            .set_pdf_pages(
+                "notes/doc.pdf",
+                "Quarterly Report",
+                &[(1, "the body".to_string())],
+            )
+            .unwrap();
+        assert_eq!(pages.texts, ["Page 1\nthe body"]);
+        assert_eq!(pages.title.as_deref(), Some("Quarterly Report"));
+        assert_eq!(builder.pending(), 1, "its vectors and its title proxy");
+        builder.set_vectors("notes/doc.pdf", &[1.0, 0.0]).unwrap();
+        builder
+            .set_title_vector("notes/doc.pdf", &[0.0, 1.0, 0.0])
+            .unwrap();
+        let built = builder.finish(1).unwrap();
+        assert_eq!(built.chunks, 2);
+        let artifact = open(&built);
+        assert_eq!(artifact.documents()[0].title, "Quarterly Report");
+        let proxy = artifact
+            .chunks()
+            .iter()
+            .find(|c| c.modality == "text_title")
+            .unwrap();
+        assert_eq!(proxy.text, "Quarterly Report");
+        assert_eq!(proxy.vector, [0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn a_pdf_whose_pages_hold_only_whitespace_gets_the_identity_chunk() {
+        let mut builder = ArtifactBuilder::new(spec(false));
+        builder.add_pdf("notes/silence.pdf", "abc", 10).unwrap();
+        let pages = builder
+            .set_pdf_pages(
+                "notes/silence.pdf",
+                "",
+                &[(1, "  \n\t ".to_string()), (2, "   ".to_string())],
+            )
+            .unwrap();
+        assert_eq!(
+            pages.texts,
+            ["silence"],
+            "the title alone, like a property-only note's identity chunk"
+        );
+        builder
+            .set_vectors("notes/silence.pdf", &[1.0, 0.0])
+            .unwrap();
+        let built = builder.finish(1).unwrap();
+        let artifact = open(&built);
+        assert_eq!(artifact.documents()[0].title, "silence");
+        assert_eq!(artifact.chunks().len(), 1);
+        let chunk = &artifact.chunks()[0];
+        assert_eq!(chunk.heading_path, "silence");
+        assert!(chunk.text.is_empty());
+    }
+
+    #[test]
+    fn a_rebuild_reuses_unchanged_pdfs_and_not_changed_ones() {
+        let mut first = ArtifactBuilder::new(spec(true));
+        first.add_pdf("notes/doc.pdf", "abc", 10).unwrap();
+        first
+            .set_pdf_pages("notes/doc.pdf", "Report", &[(1, "the body".to_string())])
+            .unwrap();
+        first.set_vectors("notes/doc.pdf", &[1.0, 0.0]).unwrap();
+        first
+            .set_title_vector("notes/doc.pdf", &[0.0, 1.0, 0.0])
+            .unwrap();
+        let built = first.finish(1).unwrap();
+        assert_eq!(built.chunks, 2);
+
+        let mut second = ArtifactBuilder::reusing(spec(true), open(&built)).unwrap();
+        assert!(second.add_pdf("notes/doc.pdf", "abc", 10).unwrap().reused);
+        assert_eq!(
+            second.pending(),
+            0,
+            "its chunks and title proxy are carried over"
+        );
+        let rebuilt = second.finish(2).unwrap();
+        assert_eq!(rebuilt.chunks, 2);
+        assert!(rebuilt.shards.is_empty(), "nothing to rewrite");
+        assert_eq!(rebuilt.unchanged.len(), built.shards.len());
+
+        let mut third = ArtifactBuilder::reusing(spec(true), open(&built)).unwrap();
+        assert!(
+            !third.add_pdf("notes/doc.pdf", "cafe", 30).unwrap().reused,
+            "changed bytes are not reused"
+        );
+    }
+
+    #[test]
+    fn a_pdf_that_will_not_extract_can_be_dropped_and_the_build_finishes() {
+        let mut builder = ArtifactBuilder::new(spec(false));
+        builder.add_document("a.md", "# Alpha\n\nbody", 10);
+        builder.set_vectors("a.md", &[1.0, 0.0]).unwrap();
+        builder.add_pdf("notes/broken.pdf", "bad", 20).unwrap();
+
+        let err = builder
+            .set_pdf_pages("notes/ghost.pdf", "", &[])
+            .expect_err("never added");
+        assert!(err.to_string().contains("was never added"), "{err}");
+        let err = builder
+            .set_pdf_pages("a.md", "", &[])
+            .expect_err("not a PDF");
+        assert!(
+            err.to_string().contains("is not a PDF; use add_pdf"),
+            "{err}"
+        );
+
+        assert!(builder.remove("notes/broken.pdf"));
+        assert!(!builder.remove("notes/broken.pdf"), "already gone");
+        let built = builder.finish(1).unwrap();
+        assert_eq!(built.documents, 1);
     }
 
     #[test]
