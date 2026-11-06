@@ -14,8 +14,9 @@ use store::artifact::{
 pub const TEXT_DIM: usize = 4;
 pub const IMAGE_DIM: usize = 3;
 
-/// Four documents: three notes and one image, so the fixture covers both
-/// spaces, a tag filter, a wikilink and a document with two chunks.
+/// Five documents: three notes, one image and one PDF, so the fixture covers
+/// both spaces, a tag filter, a wikilink, a document with two chunks, and a
+/// non-markdown document.
 pub fn documents() -> Vec<DocumentEntry> {
     vec![
         DocumentEntry {
@@ -58,6 +59,17 @@ pub fn documents() -> Vec<DocumentEntry> {
             kind: "image".into(),
             content_hash: "dd".repeat(32),
             mtime: 1_700_000_300,
+            created_unix: None,
+            links: Vec::new(),
+            tags: Vec::new(),
+        },
+        DocumentEntry {
+            root: 0,
+            path: "notes/sample.pdf".into(),
+            title: "Gnosis Sample Document".into(),
+            kind: "pdf".into(),
+            content_hash: "ee".repeat(32),
+            mtime: 1_700_000_500,
             created_unix: None,
             links: Vec::new(),
             tags: Vec::new(),
@@ -167,6 +179,40 @@ pub fn chunks() -> Vec<ArtifactChunk> {
             "Sourdough",
             "Sourdough",
             vec![0.2, 1.0, 0.0],
+        ),
+        // The PDF's page chunks ride the one unused text axis, the same way
+        // each note owns its own: dense queries aimed at the notes never
+        // touch the PDF, and equidistant queries leave the PDF to the
+        // lexical channel, which its own words answer.
+        chunk(
+            4,
+            0,
+            Space::Text,
+            "text",
+            "Page 1",
+            "The sample ledger opens with a quiet count of tide marks at dawn.",
+            vec![0.0, 0.0, 0.0, 1.0],
+        ),
+        chunk(
+            4,
+            1,
+            Space::Text,
+            "text",
+            "Page 2",
+            "A second spread lists the same marks again, once per evening hour.",
+            vec![0.0, 0.0, 0.0, 1.0],
+        ),
+        // Its title proxy takes the one unused image axis, so the image
+        // tests keep their two-note geometry while the PDF is reachable from
+        // a title query like any other document's.
+        chunk(
+            4,
+            2,
+            Space::Image,
+            "text_title",
+            "Gnosis Sample Document",
+            "Gnosis Sample Document",
+            vec![0.0, 0.0, 1.0],
         ),
     ]
 }
