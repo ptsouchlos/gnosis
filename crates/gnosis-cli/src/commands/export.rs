@@ -1816,10 +1816,17 @@ mod tests {
     /// A small vault on disk, covering the shapes that make the two paths
     /// disagree if anything about them differs: several chunks from one note,
     /// a property-only note (whose only chunk is synthetic), frontmatter with
-    /// links and tags, and a note with no body at all.
+    /// links and tags, a note with no body at all, and a PDF.
     fn parity_vault(dir: &std::path::Path) -> PathBuf {
         let vault = dir.join("vault");
         std::fs::create_dir_all(vault.join("notes")).unwrap();
+        // Compiled in like the parse crate's own tests use it, so the parity
+        // vault never depends on a checkout-relative fixture path.
+        std::fs::write(
+            vault.join("notes/sample.pdf"),
+            include_bytes!("../../../../tests/fixtures/sample.pdf"),
+        )
+        .unwrap();
 
         std::fs::write(
             vault.join("notes/sourdough.md"),
@@ -1888,7 +1895,7 @@ mod tests {
         let chunk_cfg = chunker::ChunkConfig::default();
         let mut args = index::IndexerArgs {
             store: &mut store,
-            walker: &crate::walk::FsWalker::new(false),
+            walker: &crate::walk::FsWalker::new(true),
             fs_reader: &crate::fs::StdFs,
             embedders: index::EmbedderSet {
                 text: &mut text,
@@ -1907,7 +1914,7 @@ mod tests {
             32,
         )
         .expect("indexing the parity vault");
-        assert_eq!(report.indexed, 4, "every note must index");
+        assert_eq!(report.indexed, 5, "every note and the PDF must index");
         // The one dated note travels into the artifact on both paths: the
         // shard comparison below fails if only one of them carries it.
         assert_eq!(store.document_dates().unwrap().len(), 1);
@@ -1938,20 +1945,39 @@ mod tests {
         files.sort_by_key(|p| std::cmp::Reverse(p.to_string_lossy().to_string()));
         for path in &files {
             let rel = format!("notes/{}", path.file_name().unwrap().to_string_lossy());
-            let text = std::fs::read_to_string(path).unwrap();
             let mtime = fs::FileReader::mtime(&crate::fs::StdFs, path);
-            let added = builder.add_document(&rel, &text, mtime);
-            assert!(!added.reused, "a fresh build reuses nothing");
-            let vectors: Vec<f32> = added.texts.iter().flat_map(|t| hash_vector(t)).collect();
-            builder
-                .set_vectors(&rel, &vectors)
-                .expect("setting vectors");
+            if path.extension().is_some_and(|ext| ext == "pdf") {
+                // The native extractor stands in for the client's worker: the
+                // builder gets the same pages and must embed the same texts
+                // the CLI's path embedded.
+                let bytes = std::fs::read(path).unwrap();
+                let parsed = parse::parse_pdf(&bytes).expect("a valid PDF must parse");
+                let added = builder
+                    .add_pdf(&rel, &index::builder::content_hash_bytes(&bytes), mtime)
+                    .expect("adding the pdf");
+                assert!(!added.reused, "a fresh build reuses nothing");
+                let pages = builder
+                    .set_pdf_pages(&rel, &parsed.title, &parsed.pages)
+                    .expect("setting the pages");
+                let vectors: Vec<f32> = pages.texts.iter().flat_map(|t| hash_vector(t)).collect();
+                builder
+                    .set_vectors(&rel, &vectors)
+                    .expect("setting vectors");
+            } else {
+                let text = std::fs::read_to_string(path).unwrap();
+                let added = builder.add_document(&rel, &text, mtime);
+                assert!(!added.reused, "a fresh build reuses nothing");
+                let vectors: Vec<f32> = added.texts.iter().flat_map(|t| hash_vector(t)).collect();
+                builder
+                    .set_vectors(&rel, &vectors)
+                    .expect("setting vectors");
+            }
         }
         let built = builder
             .finish(cli_manifest.created_unix)
             .expect("building the artifact");
 
-        assert_eq!(built.documents, 4);
+        assert_eq!(built.documents, 5);
         assert_eq!(
             built.chunks,
             cli_manifest.shards.iter().map(|s| s.chunks).sum::<usize>(),

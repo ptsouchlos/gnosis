@@ -9,7 +9,7 @@
 //! `Float32Array`s of vectors in, JSON out.
 
 use index::builder::{ArtifactBuilder, Built};
-use js_sys::{Float32Array, Map, Uint8Array};
+use js_sys::{Array, Float32Array, Map, Reflect, Uint8Array};
 use serde::Serialize;
 use store::artifact::Artifact;
 use wasm_bindgen::prelude::*;
@@ -53,6 +53,27 @@ struct AddedImage {
     /// True when the image was carried over unchanged; nothing is owed for it
     /// unless `title` says its title proxy is.
     reused: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+}
+
+/// What `addPdf` tells the client to do next.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AddedPdf {
+    /// True when the PDF was carried over unchanged, so `setPdfPages` is not
+    /// needed and nothing needs embedding.
+    reused: bool,
+}
+
+/// What `setPdfPages` hands back to embed.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PdfPages {
+    /// The exact strings to embed, in chunk order.
+    texts: Vec<String>,
+    /// The title to embed with CLIP's text tower for the PDF's title proxy,
+    /// when the spec has an image space.
     #[serde(skip_serializing_if = "Option::is_none")]
     title: Option<String>,
 }
@@ -141,9 +162,69 @@ impl Builder {
         })
     }
 
+    /// Offer one PDF to the index.
+    ///
+    /// `hash` is `contentHashBytes` of the file's bytes. An unchanged PDF is
+    /// carried over unchanged; a new or changed one is followed by
+    /// `setPdfPages` and `setVectors`.
+    #[wasm_bindgen(js_name = addPdf)]
+    pub fn add_pdf(&mut self, path: &str, hash: &str, mtime_ms: f64) -> Result<JsValue, JsError> {
+        let added = self
+            .inner_mut()?
+            .add_pdf(path, hash, (mtime_ms / 1000.0).floor() as i64)
+            .map_err(anyhow_err)?;
+        to_js(&AddedPdf {
+            reused: added.reused,
+        })
+    }
+
+    /// Fill in a new or changed PDF's extracted pages.
+    ///
+    /// `pages` is the extraction's `{ page, text }` objects, page numbers
+    /// and all; a `page` that is not a positive whole number — fractional,
+    /// negative, or `NaN` — bails with a `JsError` rather than becoming a
+    /// `Page 0` chunk. Returns the strings to embed, in chunk order, and
+    /// the resolved `title` for the PDF's title proxy when the spec has an
+    /// image space.
+    #[wasm_bindgen(js_name = setPdfPages)]
+    pub fn set_pdf_pages(
+        &mut self,
+        path: &str,
+        title: &str,
+        pages: &Array,
+    ) -> Result<JsValue, JsError> {
+        let mut extracted = Vec::with_capacity(pages.length() as usize);
+        for item in pages.iter() {
+            let page = Reflect::get(&item, &JsValue::from_str("page"))
+                .map_err(js_err)?
+                .as_f64()
+                .ok_or_else(|| JsError::new("'page' is not a number"))?;
+            let page = if page.fract() == 0.0 && page >= 1.0 && page <= u32::MAX as f64 {
+                page as u32
+            } else {
+                return Err(JsError::new(
+                    "'page' must be a positive whole number",
+                ));
+            };
+            let text = Reflect::get(&item, &JsValue::from_str("text"))
+                .map_err(js_err)?
+                .as_string()
+                .ok_or_else(|| JsError::new("'text' is not a string"))?;
+            extracted.push((page, text));
+        }
+        let pdf_pages = self
+            .inner_mut()?
+            .set_pdf_pages(path, title, &extracted)
+            .map_err(anyhow_err)?;
+        to_js(&PdfPages {
+            texts: pdf_pages.texts,
+            title: pdf_pages.title,
+        })
+    }
+
     /// Drop a document that was offered but cannot be completed, such as an
-    /// image that will not decode; `gnosis index` skips those too. Returns
-    /// whether it was there.
+    /// image that will not decode or a PDF that will not extract; `gnosis
+    /// index` skips those too. Returns whether it was there.
     #[wasm_bindgen(js_name = removeDocument)]
     pub fn remove_document(&mut self, path: &str) -> Result<bool, JsError> {
         Ok(self.inner_mut()?.remove(path))

@@ -387,31 +387,50 @@ pub(crate) fn join_lines(heading_path: &str, text: &str) -> String {
     }
 }
 
-/// One chunk standing for a document that produced none of its own.
+/// A PDF's extracted pages, chunked the way the document will be embedded,
+/// alongside its resolved title.
 ///
-/// Used for a PDF whose pages chunk to nothing; markdown reaches the same
-/// outcome through [`chunker::chunk_document`], where the decision is shared
-/// with every other frontend that builds an index. Either way the point is
-/// that a document with no chunks cannot be retrieved by any query, including
-/// its own exact name.
+/// Shared by the CLI's indexing path and the artifact builder, so the chunk
+/// boundaries and the identity-chunk decision are made once.
 ///
-/// Laid out exactly like a body chunk — the title as `heading_path` — so
-/// nothing downstream has to know this chunk is synthetic. It is a normal
-/// `text`/`text` chunk for the same reason: a distinct modality would exclude
-/// it from text search, which is the one thing it exists for.
-fn identity_chunk(args: &mut IndexerArgs, title: &str, text: String) -> Result<ChunkWrite> {
-    let mut vectors = args
-        .embedders
-        .text
-        .embed_document(&[join_lines(title, &text)])?;
-    Ok(ChunkWrite {
-        ord: 0,
-        space: "text".to_string(),
-        modality: "text".to_string(),
-        text: Some(text),
-        heading_path: title.to_string(),
-        vector: vectors.pop().unwrap_or_default(),
-    })
+/// `title` is the PDF metadata's `Title`, which is often empty; the file stem
+/// is the fallback, the only one that doesn't require guessing from body text.
+///
+/// A PDF whose pages hold no text at all is rejected by `parse_pdf` and never
+/// reaches here, but one whose pages hold only whitespace chunks to nothing —
+/// and would then be as unfindable as a property-only note. It gets the same
+/// identity chunk markdown gets through `chunk_document`: the title as
+/// `heading_path` and no body, laid out like a body chunk so nothing downstream
+/// has to know the chunk is synthetic.
+pub(crate) fn pdf_chunks(
+    path: &str,
+    title: &str,
+    pages: &[(u32, String)],
+    max_tokens: usize,
+    overlap: usize,
+) -> (String, Vec<chunker::Chunk>) {
+    let chunks = chunker::chunk_pages(pages, max_tokens, overlap);
+    let title = if title.is_empty() {
+        Path::new(path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string())
+    } else {
+        title.to_string()
+    };
+
+    if chunks.is_empty() {
+        return (
+            title.clone(),
+            vec![chunker::Chunk {
+                ord: 0,
+                heading_path: title,
+                text: String::new(),
+            }],
+        );
+    }
+
+    (title, chunks)
 }
 
 /// Persist a text-bearing document (markdown or PDF) from its
@@ -542,31 +561,19 @@ fn embed_pdf_chunks(
     chunk_cfg: &chunker::ChunkConfig,
 ) -> Result<(String, Vec<ChunkWrite>)> {
     let parsed = parse::parse_pdf(bytes)?;
-    let chunks = chunker::chunk_pages(&parsed.pages, chunk_cfg.max_tokens, chunk_cfg.overlap);
-
-    // PDF metadata often has no Title; the file stem is the only other signal.
-    let title = if parsed.title.is_empty() {
-        Path::new(path_str)
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| path_str.to_string())
-    } else {
-        parsed.title
-    };
-
-    // A PDF whose pages hold no text at all is rejected by `parse_pdf` and
-    // never reaches here, but one whose pages hold only whitespace chunks to
-    // nothing — and would then be as unfindable as a property-only note.
-    if chunks.is_empty() {
-        let chunk = identity_chunk(args, &title, String::new())?;
-        return Ok((title, vec![chunk]));
-    }
+    let (title, chunks) = pdf_chunks(
+        path_str,
+        &parsed.title,
+        &parsed.pages,
+        chunk_cfg.max_tokens,
+        chunk_cfg.overlap,
+    );
 
     // Prefix the page label, mirroring how markdown prefixes its heading
     // trail, so a chunk's embedding carries its own locator.
     let texts: Vec<String> = chunks
         .iter()
-        .map(|c| format!("{}\n{}", c.heading_path, c.text))
+        .map(|c| join_lines(&c.heading_path, &c.text))
         .collect();
     let vectors = args.embedders.text.embed_document(&texts)?;
 
