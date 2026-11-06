@@ -279,7 +279,7 @@ pub fn artifact() -> (String, Vec<(String, Vec<u8>)>) {
             space_info(
                 Space::Image,
                 "clip-vit-b-32-vision",
-                Some("clip-vit-b-32-text"),
+                Some("clip-vit-b-32"),
                 "mean",
                 "",
                 IMAGE_DIM,

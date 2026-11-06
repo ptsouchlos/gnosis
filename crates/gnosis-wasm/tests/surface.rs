@@ -109,7 +109,7 @@ fn info_reports_each_space_s_query_model_and_pooling() {
         "the stored vectors came from the vision tower"
     );
     assert_eq!(
-        spaces[1]["queryModel"], "clip-vit-b-32-text",
+        spaces[1]["queryModel"], "clip-vit-b-32",
         "a text query goes through the text tower instead"
     );
 }
