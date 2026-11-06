@@ -181,9 +181,11 @@ impl Builder {
     /// Fill in a new or changed PDF's extracted pages.
     ///
     /// `pages` is the extraction's `{ page, text }` objects, page numbers
-    /// and all. Returns the strings to embed, in chunk order, and the
-    /// resolved `title` for the PDF's title proxy when the spec has an image
-    /// space.
+    /// and all; a `page` that is not a positive whole number — fractional,
+    /// negative, or `NaN` — bails with a `JsError` rather than becoming a
+    /// `Page 0` chunk. Returns the strings to embed, in chunk order, and
+    /// the resolved `title` for the PDF's title proxy when the spec has an
+    /// image space.
     #[wasm_bindgen(js_name = setPdfPages)]
     pub fn set_pdf_pages(
         &mut self,
@@ -197,11 +199,18 @@ impl Builder {
                 .map_err(js_err)?
                 .as_f64()
                 .ok_or_else(|| JsError::new("'page' is not a number"))?;
+            let page = if page.fract() == 0.0 && page >= 1.0 && page <= u32::MAX as f64 {
+                page as u32
+            } else {
+                return Err(JsError::new(
+                    "'page' must be a positive whole number",
+                ));
+            };
             let text = Reflect::get(&item, &JsValue::from_str("text"))
                 .map_err(js_err)?
                 .as_string()
                 .ok_or_else(|| JsError::new("'text' is not a string"))?;
-            extracted.push((page as u32, text));
+            extracted.push((page, text));
         }
         let pdf_pages = self
             .inner_mut()?

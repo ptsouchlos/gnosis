@@ -470,6 +470,11 @@ impl ArtifactBuilder {
     /// stem is the fallback, and what `PdfPages` returns is the resolved
     /// title. The pages come from the client's extraction worker, because the
     /// extraction itself can trap the wasm instance that holds this builder.
+    ///
+    /// It is idempotent per path: calling it again for the same path
+    /// replaces the PDF's chunks and title, and re-owes its vectors, rather
+    /// than adding to them, so a client that retries a failed extraction
+    /// leaves the same document behind.
     pub fn set_pdf_pages(
         &mut self,
         path: &str,
@@ -1183,6 +1188,35 @@ mod tests {
             !third.add_pdf("notes/doc.pdf", "cafe", 30).unwrap().reused,
             "changed bytes are not reused"
         );
+        let pages = third
+            .set_pdf_pages(
+                "notes/doc.pdf",
+                "Second Edition",
+                &[(1, "revised body".to_string())],
+            )
+            .unwrap();
+        assert_eq!(pages.texts, ["Page 1\nrevised body"]);
+        assert_eq!(
+            pages.title.as_deref(),
+            Some("Second Edition"),
+            "the old title does not cover the revised pages"
+        );
+        assert_eq!(third.pending(), 1, "its vectors are owed again");
+        third.set_vectors("notes/doc.pdf", &[0.0, 1.0]).unwrap();
+        third
+            .set_title_vector("notes/doc.pdf", &[1.0, 0.0, 0.0])
+            .unwrap();
+        let rebuilt = third.finish(3).unwrap();
+        assert_eq!(rebuilt.chunks, 2);
+        let artifact = open(&rebuilt);
+        assert_eq!(artifact.documents()[0].title, "Second Edition");
+        let proxy = artifact
+            .chunks()
+            .iter()
+            .find(|c| c.modality == "text_title")
+            .unwrap();
+        assert_eq!(proxy.text, "Second Edition");
+        assert_eq!(proxy.vector, [1.0, 0.0, 0.0]);
     }
 
     #[test]
