@@ -47,9 +47,10 @@ jobs:
         shell: bash
         run: just test
 
-  # The query client the Obsidian plugin vendors: its tests in node, then the
-  # release build, whose size the log reports. Linux only: the pinned tools
-  # are x86_64 Linux binaries, and the bundle is the same on any host.
+  # The wasm bundles the Obsidian plugin vendors: the query client's tests and
+  # release build, whose size the log reports, and the PDF extraction bundle's
+  # build and trap boundary. Linux only: the pinned tools are x86_64 Linux
+  # binaries, and the bundles are the same on any host.
   wasm:
     runs-on: ubuntu-24.04
     steps:
@@ -68,6 +69,14 @@ jobs:
       - name: Build
         shell: bash
         run: just wasm-build "$RUNNER_TEMP/gnosis-wasm"
+      - name: Build the extraction bundle
+        shell: bash
+        run: just wasm-extract-build "$RUNNER_TEMP/gnosis-extract"
+      # The host runs each PDF in this bundle's own disposable instance because
+      # a malformed one traps rather than rejects: pin that boundary.
+      - name: Test the extraction boundary
+        shell: bash
+        run: node crates/gnosis-extract/tests/node/trap.mjs "$RUNNER_TEMP/gnosis-extract" tests/fixtures
       # Fails on a new dependency whose license is not accepted, before a
       # release does.
       - name: Third-party notices

@@ -4,6 +4,7 @@ members = [
   "crates/gnosis-chunker",
   "crates/gnosis-embed",
   "crates/gnosis-eval",
+  "crates/gnosis-extract",
   "crates/gnosis-fs",
   "crates/gnosis-index",
   "crates/gnosis-parse",

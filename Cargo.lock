@@ -1255,6 +1255,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gnosis-extract"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "js-sys",
+ "parse",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "gnosis-wasm"
 version = "0.2.0"
 dependencies = [
