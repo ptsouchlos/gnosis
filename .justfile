@@ -43,7 +43,12 @@ bench file_count="2000" image_count="200":
 wasm-build out="":
     script/wasm/build.sh {{ out }}
 
-[doc('Write the third-party notices for the crates the wasm query client links')]
+[doc('Build the wasm PDF extraction bundle (wasm-pack + wasm-opt) and report its size')]
+[group('wasm')]
+wasm-extract-build out="":
+    script/wasm/build-extract.sh {{ out }}
+
+[doc('Write the third-party notices for the crates the wasm bundles link')]
 [group('wasm')]
 wasm-notices out="target/THIRD_PARTY_NOTICES.txt":
     script/release/notices.sh {{ out }}

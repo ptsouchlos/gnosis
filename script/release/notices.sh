@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
-# Write the third-party notices for the wasm query client: every crate it links
-# for wasm32, grouped by license, each with the license text the crate ships.
-# Fails on a crate whose license is not in about.toml's accepted list, or whose
-# license cannot be determined.
+# Write the third-party notices for the wasm bundles: every crate the query
+# client links for wasm32, grouped by license, each with the license text the
+# crate ships. Fails on a crate whose license is not in about.toml's accepted
+# list, or whose license cannot be determined.
+#
+# The query client's graph is the superset the extraction bundle is covered by:
+# the extraction bundle links gnosis-parse, and the query client links it too,
+# through gnosis-index, so every crate the extraction bundle links is here.
+# That is why one file ships in both release archives.
 #
 # Needs cargo-about (script/ci/install-wasm-tools.sh installs the pinned one).
 #
