@@ -7,8 +7,9 @@ from your knowledge base without relying on a 3rd party API or service.
 
 ## Releasing
 
-A release publishes the wasm query client that the
-[Obsidian plugin](https://github.com/ptsouchlos/obsidian-gnosis) vendors.
+A release publishes the wasm bundles that the
+[Obsidian plugin](https://github.com/ptsouchlos/obsidian-gnosis) vendors: the
+query client, and the PDF extraction bundle it runs in a disposable worker.
 
 1. Bump `version` in the root `Cargo.toml`'s `[workspace.package]`, which every
    crate takes, and merge it.
@@ -20,9 +21,9 @@ A release publishes the wasm query client that the
    ```
 
 `.github/workflows/release.yml` refuses a tag that does not match the version.
-It builds the bundle and attaches `gnosis-wasm-<tag>.tar.gz` and its `.sha256`
-to a GitHub release, then asks the plugin to re-vendor it, which opens a pull
-request there.
+It builds both bundles and attaches `gnosis-wasm-<tag>.tar.gz` and
+`gnosis-extract-<tag>.tar.gz`, each with its `.sha256`, to a GitHub release,
+then asks the plugin to re-vendor them, which opens a pull request there.
 
 ---
 

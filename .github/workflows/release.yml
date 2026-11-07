@@ -1,7 +1,8 @@
 name: Release
 
-# Pushing a tag like v1.2.3 publishes a GitHub release carrying the wasm query
-# client, and asks the Obsidian plugin to re-vendor it.
+# Pushing a tag like v1.2.3 publishes a GitHub release carrying the wasm
+# bundles — the query client and the PDF extraction bundle — and asks the
+# Obsidian plugin to re-vendor them.
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
@@ -26,7 +27,7 @@ jobs:
       - name: Install the wasm tools
         shell: bash
         run: script/ci/install-wasm-tools.sh "$RUNNER_TEMP/wasm-tools"
-      - name: Package the wasm query client
+      - name: Package the wasm bundles
         shell: bash
         env:
           TAG: ${{ github.ref_name }}
@@ -42,7 +43,8 @@ jobs:
             echo "Release $TAG already exists; skipping."
           else
             gh release create "$TAG" --generate-notes --verify-tag \
-              "dist/gnosis-wasm-$TAG.tar.gz" "dist/gnosis-wasm-$TAG.tar.gz.sha256"
+              "dist/gnosis-wasm-$TAG.tar.gz" "dist/gnosis-wasm-$TAG.tar.gz.sha256" \
+              "dist/gnosis-extract-$TAG.tar.gz" "dist/gnosis-extract-$TAG.tar.gz.sha256"
           fi
 
   notify-plugin:
