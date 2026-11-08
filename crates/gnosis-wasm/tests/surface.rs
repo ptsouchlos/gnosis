@@ -405,7 +405,10 @@ fn staleness_separates_changed_added_removed_and_unknown() {
 
     let report = json(open().staleness(entries).expect("staleness"));
     assert_eq!(report["createdUnix"], 1_700_000_400_i64);
-    assert_eq!(report["unchanged"], 2, "sourdough's and the PDF's hashes matched");
+    assert_eq!(
+        report["unchanged"], 2,
+        "sourdough's and the PDF's hashes matched"
+    );
     assert_eq!(report["changed"].as_array().unwrap().len(), 2);
     assert_eq!(report["added"][0], "notes/brand-new.md");
     assert!(
