@@ -19,7 +19,7 @@
 
 mod support;
 
-use js_sys::{Float32Array, Map, Uint8Array};
+use js_sys::{Array, Float32Array, Map, Object, Reflect, Uint8Array};
 use wasm_bindgen::JsValue;
 use wasm_bindgen_test::*;
 
@@ -656,6 +656,34 @@ fn a_spec_without_prefixes_is_refused() {
     };
     let message = format!("{:?}", JsValue::from(err));
     assert!(message.contains("Prefix"), "got {message}");
+}
+
+/// A `page` that is not a positive whole number — zero, negative, fractional,
+/// or `NaN` — is refused rather than truncated into a `Page 0` chunk.
+#[wasm_bindgen_test]
+fn a_pdf_page_that_is_not_a_positive_whole_number_is_refused() {
+    for page in [0.0, -1.0, 1.5, f64::NAN] {
+        let mut builder = Builder::create(spec()).expect("create");
+        builder
+            .add_pdf("notes/doc.pdf", "abc", 0.0)
+            .expect("addPdf");
+        let item = Object::new();
+        Reflect::set(&item, &JsValue::from_str("page"), &JsValue::from_f64(page))
+            .expect("setting page");
+        Reflect::set(
+            &item,
+            &JsValue::from_str("text"),
+            &JsValue::from_str("body"),
+        )
+        .expect("setting text");
+        let pages = Array::new();
+        pages.push(&item);
+        let Err(err) = builder.set_pdf_pages("notes/doc.pdf", "", &pages) else {
+            panic!("a page of {page:?} must not become a chunk");
+        };
+        let msg = message(err.into());
+        assert!(msg.contains("whole number"), "got {msg}");
+    }
 }
 
 // ---- Builder: the image space ----------------------------------------------

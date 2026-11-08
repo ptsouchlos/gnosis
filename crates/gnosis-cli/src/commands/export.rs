@@ -1750,21 +1750,24 @@ mod tests {
     /// It declares a model's prefixes the way `TextEmbedder` does, so the
     /// trait's own `embed_document` applies them on the CLI's side and the
     /// builder has to apply the same ones on its side.
+    #[derive(Clone, Copy)]
     struct HashEmbedder {
         model: &'static str,
+        space: &'static str,
         query_prefix: &'static str,
         document_prefix: &'static str,
     }
 
     const HASH_BGE: HashEmbedder = HashEmbedder {
         model: "bge-small-en-v1.5",
+        space: "text",
         query_prefix: BGE_QUERY_INSTRUCTION,
         document_prefix: "",
     };
 
     impl embed::Embedder for HashEmbedder {
         fn space(&self) -> &str {
-            "text"
+            self.space
         }
         fn dim(&self) -> usize {
             4
@@ -1816,10 +1819,17 @@ mod tests {
     /// A small vault on disk, covering the shapes that make the two paths
     /// disagree if anything about them differs: several chunks from one note,
     /// a property-only note (whose only chunk is synthetic), frontmatter with
-    /// links and tags, and a note with no body at all.
+    /// links and tags, a note with no body at all, and a PDF.
     fn parity_vault(dir: &std::path::Path) -> PathBuf {
         let vault = dir.join("vault");
         std::fs::create_dir_all(vault.join("notes")).unwrap();
+        // Compiled in like the parse crate's own tests use it, so the parity
+        // vault never depends on a checkout-relative fixture path.
+        std::fs::write(
+            vault.join("notes/sample.pdf"),
+            include_bytes!("../../../../tests/fixtures/sample.pdf"),
+        )
+        .unwrap();
 
         std::fs::write(
             vault.join("notes/sourdough.md"),
@@ -1855,7 +1865,8 @@ mod tests {
     /// every decision the two paths could have made differently — chunk
     /// boundaries, the identity chunk, what gets embedded, title derivation,
     /// links and tags, content hashes, mtimes, document order, shard
-    /// assignment, quantization and compression. Only the manifest's
+    /// assignment, quantization and compression, in the text space and the
+    /// image space's title proxies alike. Only the manifest's
     /// `created_unix` is allowed to differ, and the test pins that too by
     /// passing the CLI's own timestamp.
     #[test]
@@ -1871,6 +1882,7 @@ mod tests {
         assert_builder_matches_cli(
             HashEmbedder {
                 model: "multilingual-e5-small",
+                space: "text",
                 query_prefix: "query: ",
                 document_prefix: "passage: ",
             },
@@ -1886,14 +1898,24 @@ mod tests {
         let mut store = SqliteStore::open(&dir.join("gnosis.db")).unwrap();
         let progress = progress::NoopProgress;
         let chunk_cfg = chunker::ChunkConfig::default();
+        // One model id stands in for both CLIP towers, the way the real CLI
+        // builds them both from `config.image.model`.
+        let clip = HashEmbedder {
+            model: "clip-vit-b-32",
+            space: "image",
+            query_prefix: "",
+            document_prefix: "",
+        };
+        let clip_vision: Box<dyn embed::Embedder> = Box::new(clip);
+        let clip_text: Box<dyn embed::Embedder> = Box::new(clip);
         let mut args = index::IndexerArgs {
             store: &mut store,
-            walker: &crate::walk::FsWalker::new(false),
+            walker: &crate::walk::FsWalker::new(true),
             fs_reader: &crate::fs::StdFs,
             embedders: index::EmbedderSet {
                 text: &mut text,
-                image: None,
-                image_text: None,
+                image: Some(clip_vision),
+                image_text: Some(clip_text),
             },
             progress: &progress,
         };
@@ -1907,7 +1929,7 @@ mod tests {
             32,
         )
         .expect("indexing the parity vault");
-        assert_eq!(report.indexed, 4, "every note must index");
+        assert_eq!(report.indexed, 5, "every note and the PDF must index");
         // The one dated note travels into the artifact on both paths: the
         // shard comparison below fails if only one of them carries it.
         assert_eq!(store.document_dates().unwrap().len(), 1);
@@ -1917,17 +1939,25 @@ mod tests {
             text.model,
             Quantization::I8,
             Compression::Deflate,
-            &[Space::Text],
+            &[Space::Text, Space::Image],
             256,
         )
         .expect("exporting");
 
         // The client's path: the same text, chunked and packed by the builder.
-        let spec = spec_for(
+        let mut spec = spec_for(
             &text,
             pooling,
             &vault.file_name().unwrap().to_string_lossy(),
         );
+        // The CLI indexed with an image space, so the builder must too —
+        // otherwise its title proxies have no counterpart and the shards
+        // cannot match.
+        spec.image = Some(index::builder::ImageSpec {
+            model: "clip-vit-b-32".to_string(),
+            query_id: "clip-vit-b-32".to_string(),
+            dim: 4,
+        });
         let mut builder = index::builder::ArtifactBuilder::new(spec);
         let mut files: Vec<PathBuf> = std::fs::read_dir(vault.join("notes"))
             .unwrap()
@@ -1938,20 +1968,49 @@ mod tests {
         files.sort_by_key(|p| std::cmp::Reverse(p.to_string_lossy().to_string()));
         for path in &files {
             let rel = format!("notes/{}", path.file_name().unwrap().to_string_lossy());
-            let text = std::fs::read_to_string(path).unwrap();
             let mtime = fs::FileReader::mtime(&crate::fs::StdFs, path);
-            let added = builder.add_document(&rel, &text, mtime);
-            assert!(!added.reused, "a fresh build reuses nothing");
-            let vectors: Vec<f32> = added.texts.iter().flat_map(|t| hash_vector(t)).collect();
-            builder
-                .set_vectors(&rel, &vectors)
-                .expect("setting vectors");
+            if path.extension().is_some_and(|ext| ext == "pdf") {
+                // The native extractor stands in for the client's worker: the
+                // builder gets the same pages and must embed the same texts
+                // the CLI's path embedded.
+                let bytes = std::fs::read(path).unwrap();
+                let parsed = parse::parse_pdf(&bytes).expect("a valid PDF must parse");
+                let added = builder
+                    .add_pdf(&rel, &index::builder::content_hash_bytes(&bytes), mtime)
+                    .expect("adding the pdf");
+                assert!(!added.reused, "a fresh build reuses nothing");
+                let pages = builder
+                    .set_pdf_pages(&rel, &parsed.title, &parsed.pages)
+                    .expect("setting the pages");
+                let vectors: Vec<f32> = pages.texts.iter().flat_map(|t| hash_vector(t)).collect();
+                builder
+                    .set_vectors(&rel, &vectors)
+                    .expect("setting vectors");
+                if let Some(title) = pages.title {
+                    builder
+                        .set_title_vector(&rel, &hash_vector(&title))
+                        .expect("setting the title vector");
+                }
+            } else {
+                let text = std::fs::read_to_string(path).unwrap();
+                let added = builder.add_document(&rel, &text, mtime);
+                assert!(!added.reused, "a fresh build reuses nothing");
+                let vectors: Vec<f32> = added.texts.iter().flat_map(|t| hash_vector(t)).collect();
+                builder
+                    .set_vectors(&rel, &vectors)
+                    .expect("setting vectors");
+                if let Some(title) = added.title {
+                    builder
+                        .set_title_vector(&rel, &hash_vector(&title))
+                        .expect("setting the title vector");
+                }
+            }
         }
         let built = builder
             .finish(cli_manifest.created_unix)
             .expect("building the artifact");
 
-        assert_eq!(built.documents, 4);
+        assert_eq!(built.documents, 5);
         assert_eq!(
             built.chunks,
             cli_manifest.shards.iter().map(|s| s.chunks).sum::<usize>(),
@@ -2111,6 +2170,7 @@ mod tests {
         let vault = parity_vault(&dir);
         let e5 = HashEmbedder {
             model: "multilingual-e5-small",
+            space: "text",
             query_prefix: "query: ",
             document_prefix: "passage: ",
         };
