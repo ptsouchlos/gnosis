@@ -58,17 +58,23 @@ check(
 
 // 2. A malformed content stream traps the call. A throw here is the expected
 //    outcome, not a defect: the trap is what the per-file worker relies on to
-//    contain the failure.
+//    contain the failure. The throw is specifically a RuntimeError — a wasm
+//    trap, not a JS error the bundle itself raised — which is what makes it
+//    safe to treat as "this instance is done" rather than as a bug to fix.
 await freshInstance();
 let trapped = false;
 let trapName = "";
 try {
   mod.extractPdf(malformed);
 } catch (e) {
-  trapped = true;
+  trapped = e instanceof WebAssembly.RuntimeError;
   trapName = e.constructor.name;
 }
-check("a malformed content stream traps the call", trapped, trapped ? trapName : "");
+check(
+  "a malformed content stream traps the call as a WebAssembly.RuntimeError",
+  trapped,
+  trapName,
+);
 
 // 3. The trap is confined to that instance: the process is alive and a fresh
 //    instance still extracts a valid PDF. This is the guarantee the plugin
