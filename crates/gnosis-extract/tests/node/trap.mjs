@@ -1,12 +1,12 @@
 // Does a malformed PDF trap the extraction — and only the extraction?
 //
-// `parse_pdf` is unwind-safe in a native build only because it wraps
-// `pdf-extract` in `catch_unwind`, so the panic it raises is caught before it
-// can reach the `panic = "abort"` handler. The `wasm-release` profile uses that
-// strategy, where `catch_unwind` cannot catch a panic — so a malformed content
-// stream does not return an error, it *traps* the call. The plugin (step 3)
-// runs each file's extraction in its own disposable instance for exactly this
-// reason, so a bad PDF is a handled per-file boundary rather than a crash.
+// In a native build `parse_pdf` turns a malformed PDF into a per-file error:
+// it wraps `pdf-extract` in `catch_unwind`, and the caught panic becomes that
+// error. This bundle is built with the `wasm-release` profile, whose
+// `panic = "abort"` makes a panic a trap that `catch_unwind` cannot catch — so
+// a malformed content stream does not return an error, it *traps* the call. The plugin runs each
+// file's extraction in its own disposable instance for exactly this reason,
+// so a bad PDF is a handled per-file boundary rather than a crash.
 // This test pins that boundary against the built package.
 //
 //   node tests/node/trap.mjs <pkg-dir> <fixture-dir>
@@ -71,8 +71,8 @@ try {
 check("a malformed content stream traps the call", trapped, trapped ? trapName : "");
 
 // 3. The trap is confined to that instance: the process is alive and a fresh
-//    instance still extracts a valid PDF. This is the guarantee step 3 builds
-//    on — one bad PDF costs only itself.
+//    instance still extracts a valid PDF. This is the guarantee the plugin
+//    builds on — one bad PDF costs only itself.
 await freshInstance();
 let recovered = false;
 try {

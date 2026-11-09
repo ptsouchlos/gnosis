@@ -3,9 +3,9 @@
 #
 # The extraction is a separate bundle from the query client because it is the
 # half of the PDF pipeline the host runs in a disposable worker instance —
-# `parse_pdf` is unwind-safe only because `pdf-extract`'s panic is caught before
-# it can reach the `panic = "abort"` handler, and the host does not want a
-# malformed PDF to be able to kill the instance it still holds queries in. The
+# under the wasm-release profile's `panic = "abort"` a panic is a trap that
+# `catch_unwind` cannot catch, and the host does not want a malformed PDF to
+# be able to kill the instance it still holds queries in. The
 # query client's linker would otherwise carry `pdf-extract` (and its `lopdf`
 # and friends) into every query, for the one feature most queries do not touch.
 #

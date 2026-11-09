@@ -7,11 +7,12 @@ It is a separate bundle from the query client rather than a second export on
 the same `cdylib` for two reasons. A Rust crate links as one `.wasm`, and the
 query client's linker would then carry `pdf-extract` — and its `lopdf` and the
 font-parsing crates it drags in — into every query, for the one feature (reading
-a PDF) that most queries do not touch. And `parse_pdf` is safe against a
-malformed PDF *only* because it wraps `pdf-extract` in `catch_unwind`; in the
-`wasm-release` profile that is `panic = "abort"`, where a panic is a trap. The
-catch still works — the panic dies inside its own frame — but a hostile PDF
-should not be able to share a fate with the instance the host still holds
+a PDF) that most queries do not touch. And `parse_pdf` is safe against a malformed PDF *only* in a native build: it
+wraps `pdf-extract` in `catch_unwind`, where the caught panic becomes a
+per-file error. This bundle is built with the `wasm-release` profile, which is
+`panic = "abort"` — there a panic is a trap that `catch_unwind` cannot catch,
+so a malformed PDF does not return an error, it kills the instance. A hostile
+PDF should not be able to share a fate with the instance the host still holds
 queries in. So the extraction runs in a disposable instance the host respawns
 per file, and a malformed PDF is a handled per-file boundary rather than a
 crash.

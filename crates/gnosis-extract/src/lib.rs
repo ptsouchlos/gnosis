@@ -1,15 +1,13 @@
 //! WebAssembly bindings that extract per-page text from PDF bytes.
 //!
 //! This is the half of the PDF pipeline that is allowed to crash a wasm
-//! instance. [`parse::parse_pdf`] runs `pdf-extract`, which is unwind-safe
-//! *only* because it wraps `catch_unwind` internally — the panic it catches
-//! never unwinds past its own frame. But the `wasm-release` profile builds
-//! with `panic = "abort"`, and in that profile a panic is a trap: it kills the
-//! whole instance. `parse_pdf`'s `catch_unwind` catches the panic *before* it
-//! reaches the abort handler, so the call itself is safe — what is not safe is
-//! sharing the instance with anything else the host still needs. A malformed
-//! PDF is a hostile input, and the host should not be able to lose its query
-//! client because one document was broken.
+//! instance. [`parse::parse_pdf`] runs `pdf-extract` inside `catch_unwind`,
+//! which in a native build turns a malformed PDF into a per-file error — but
+//! this crate is built with the `wasm-release` profile, whose `panic =
+//! "abort"` makes a panic a trap that `catch_unwind` cannot catch. Here a
+//! malformed PDF does not return an error: it traps the call and kills the
+//! whole instance. A malformed PDF is a hostile input, and the host should
+//! not be able to lose its query client because one document was broken.
 //!
 //! So the extraction runs in its own disposable instance: this crate, loaded in
 //! a worker the host respawns per file. The host feeds the bytes, gets back
