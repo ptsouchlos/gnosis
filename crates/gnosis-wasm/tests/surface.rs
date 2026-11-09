@@ -86,8 +86,8 @@ fn message(err: JsValue) -> String {
 #[wasm_bindgen_test]
 fn info_reports_each_space_s_query_model_and_pooling() {
     let info = json(open().info().expect("info"));
-    assert_eq!(info["documents"], 4);
-    assert_eq!(info["chunks"], 6);
+    assert_eq!(info["documents"], 5);
+    assert_eq!(info["chunks"], 9);
     assert_eq!(info["compression"], "deflate");
     assert_eq!(info["roots"][1], "work");
 
@@ -109,23 +109,26 @@ fn info_reports_each_space_s_query_model_and_pooling() {
         "the stored vectors came from the vision tower"
     );
     assert_eq!(
-        spaces[1]["queryModel"], "clip-vit-b-32-text",
+        spaces[1]["queryModel"], "clip-vit-b-32",
         "a text query goes through the text tower instead"
     );
 }
 
-/// A client scoping a query to a kind needs to know that kind can match
-/// anything at all: the fixture holds three notes and one image, and a `pdf:`
-/// scope must be able to say the index has none before spending a query on it.
+/// A client scoping a query to a kind needs to know how many documents that
+/// kind holds before spending a query on it: the fixture's three notes, one
+/// image and one PDF must each report under their own kind, listed in the
+/// order the documents appear in the artifact.
 #[wasm_bindgen_test]
 fn info_reports_how_many_documents_each_kind_holds() {
     let info = json(open().info().expect("info"));
     let kinds = info["kinds"].as_array().expect("kinds");
-    assert_eq!(kinds.len(), 2);
+    assert_eq!(kinds.len(), 3);
     assert_eq!(kinds[0]["kind"], "markdown");
     assert_eq!(kinds[0]["documents"], 3);
     assert_eq!(kinds[1]["kind"], "image");
     assert_eq!(kinds[1]["documents"], 1);
+    assert_eq!(kinds[2]["kind"], "pdf");
+    assert_eq!(kinds[2]["documents"], 1);
 }
 
 /// A shard that does not match the manifest must not open. Half an artifact
@@ -147,7 +150,7 @@ fn a_tampered_shard_refuses_to_open() {
 /// vector points nowhere near must still rank first on its text.
 ///
 /// Presence is not the assertion to make here. Brute-force dense retrieval
-/// over a four-document fixture returns everything within any sane limit, so
+/// over a five-document fixture returns everything within any sane limit, so
 /// every document is always *present*; what fusion changes is the order.
 #[wasm_bindgen_test]
 fn fusion_puts_a_lexical_only_match_first() {
@@ -391,16 +394,21 @@ fn staleness_separates_changed_added_removed_and_unknown() {
             {{"path":"notes/hydration.md","hash":"{}"}},
             {{"path":"work/planner.md","mtime":1700009999}},
             {{"path":"notes/loaf.png"}},
+            {{"path":"notes/sample.pdf","hash":"{}"}},
             {{"path":"notes/brand-new.md","hash":"ff"}}
         ]"#,
         "aa".repeat(32),
         "00".repeat(32),
+        "ee".repeat(32),
     ))
     .expect("entries");
 
     let report = json(open().staleness(entries).expect("staleness"));
     assert_eq!(report["createdUnix"], 1_700_000_400_i64);
-    assert_eq!(report["unchanged"], 1, "only sourdough's hash matched");
+    assert_eq!(
+        report["unchanged"], 2,
+        "sourdough's and the PDF's hashes matched"
+    );
     assert_eq!(report["changed"].as_array().unwrap().len(), 2);
     assert_eq!(report["added"][0], "notes/brand-new.md");
     assert!(
@@ -421,7 +429,7 @@ fn staleness_reports_a_document_the_vault_no_longer_has() {
         js_sys::JSON::parse(r#"[{"path":"notes/sourdough.md","hash":"ff"}]"#).expect("entries");
     let report = json(open().staleness(entries).expect("staleness"));
     let removed = report["removed"].as_array().expect("removed");
-    assert_eq!(removed.len(), 3, "got {report}");
+    assert_eq!(removed.len(), 4, "got {report}");
     assert!(
         removed.iter().any(|p| p == "notes/loaf.png"),
         "got {report}"
