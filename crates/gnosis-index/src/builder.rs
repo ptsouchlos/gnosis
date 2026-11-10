@@ -151,6 +151,9 @@ pub struct AddedPdf {
     /// True when the PDF was carried over unchanged, so [`PdfPages`] is not
     /// needed and nothing needs embedding.
     pub reused: bool,
+    /// The title to embed for the title proxy (the document's title in its
+    /// previous index), if one is still owed.
+    pub title: Option<String>,
 }
 
 /// What [`ArtifactBuilder::set_pdf_pages`] hands back to embed.
@@ -432,8 +435,12 @@ impl ArtifactBuilder {
     /// which it owes their vectors.
     pub fn add_pdf(&mut self, path: &str, hash: &str, mtime: i64) -> Result<AddedPdf> {
         if let Some(pending) = self.reuse(path, hash, DocKind::Pdf.as_str()) {
+            let title = pending.awaiting_title.clone();
             self.documents.insert(path.to_string(), pending);
-            return Ok(AddedPdf { reused: true });
+            return Ok(AddedPdf {
+                reused: true,
+                title,
+            });
         }
         // The file's stem, as `gnosis index` titles a PDF whose metadata has
         // no title: `set_pdf_pages` replaces it with the resolved one.
@@ -462,7 +469,10 @@ impl ArtifactBuilder {
                 awaiting_title: self.spec.image.is_some().then(|| title.clone()),
             },
         );
-        Ok(AddedPdf { reused: false })
+        Ok(AddedPdf {
+            reused: false,
+            title: None,
+        })
     }
 
     /// Fill in a new or changed PDF's extracted pages.
@@ -1226,6 +1236,46 @@ mod tests {
             .unwrap();
         assert_eq!(proxy.text, "Second Edition");
         assert_eq!(proxy.vector, [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_reused_pdf_whose_index_had_no_image_space_owes_its_title_proxy() {
+        let mut base = ArtifactBuilder::new(spec(false));
+        base.add_pdf("notes/doc.pdf", "abc", 10).unwrap();
+        base
+            .set_pdf_pages("notes/doc.pdf", "", &[(1, "the body".to_string())])
+            .unwrap();
+        base.set_vectors("notes/doc.pdf", &[1.0, 0.0]).unwrap();
+        let built = base.finish(1).unwrap();
+
+        let mut rebuild = ArtifactBuilder::reusing(spec(true), open(&built)).unwrap();
+        let added = rebuild.add_pdf("notes/doc.pdf", "abc", 10).unwrap();
+        assert!(added.reused);
+        assert_eq!(
+            added.title.as_deref(),
+            Some("doc"),
+            "the resolved title, owed even though the PDF is reused"
+        );
+        assert_eq!(rebuild.pending(), 1, "its title proxy is owed");
+        let err = rebuild
+            .finish(2)
+            .expect_err("the proxy is still owed");
+        assert!(err.to_string().contains("still waiting"), "{err}");
+
+        let mut paying = ArtifactBuilder::reusing(spec(true), open(&built)).unwrap();
+        assert!(paying.add_pdf("notes/doc.pdf", "abc", 10).unwrap().reused);
+        paying
+            .set_title_vector("notes/doc.pdf", &[0.0, 1.0, 0.0])
+            .unwrap();
+        let rebuilt = paying.finish(2).unwrap();
+        let artifact = open(&rebuilt);
+        let proxy = artifact
+            .chunks()
+            .iter()
+            .find(|c| c.modality == "text_title")
+            .unwrap();
+        assert_eq!(proxy.text, "doc");
+        assert_eq!(proxy.vector, [0.0, 1.0, 0.0]);
     }
 
     #[test]
