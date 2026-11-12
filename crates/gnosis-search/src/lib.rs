@@ -34,6 +34,11 @@ pub struct Hit {
     pub height: Option<i64>,
     /// What `score` is made of, within this hit's own space.
     pub parts: ScoreParts,
+    /// Whether this is a match only in the sense that something had to rank
+    /// here: its meaning is below its model's relevance floor and its keywords
+    /// match too little to make up for it. Set per space by
+    /// `query::run_query`; false wherever no floor applies.
+    pub weak: bool,
 }
 
 /// A hit's score, by where it came from: the four add up to `score`.
@@ -177,6 +182,7 @@ pub fn rank_related(
                     width: None,
                     height: None,
                     parts: Default::default(),
+                    weak: false,
                 },
                 BestMatches::default(),
             )
@@ -283,6 +289,7 @@ fn rank_by(
             width: None,
             height: None,
             parts: Default::default(),
+            weak: false,
         });
         if score > entry.score {
             entry.score = score;
@@ -879,6 +886,7 @@ mod tests {
                 width: None,
                 height: None,
                 parts: Default::default(),
+                weak: false,
             },
             Hit {
                 path: "b.md".into(),
@@ -890,6 +898,7 @@ mod tests {
                 width: None,
                 height: None,
                 parts: Default::default(),
+                weak: false,
             },
         ];
         let merged = merge_normalized(vec![hits], 10);
@@ -910,6 +919,7 @@ mod tests {
                 width: None,
                 height: None,
                 parts: Default::default(),
+                weak: false,
             },
             Hit {
                 path: "b.md".into(),
@@ -921,6 +931,7 @@ mod tests {
                 width: None,
                 height: None,
                 parts: Default::default(),
+                weak: false,
             },
         ];
         let image_hits = vec![
@@ -934,6 +945,7 @@ mod tests {
                 width: Some(10),
                 height: Some(10),
                 parts: Default::default(),
+                weak: false,
             },
             Hit {
                 path: "d.png".into(),
@@ -945,6 +957,7 @@ mod tests {
                 width: Some(20),
                 height: Some(20),
                 parts: Default::default(),
+                weak: false,
             },
         ];
         let merged = merge_normalized(vec![text_hits, image_hits], 10);
@@ -970,6 +983,7 @@ mod tests {
                 width: None,
                 height: None,
                 parts: Default::default(),
+                weak: false,
             })
             .collect();
         let other = vec![Hit {
@@ -982,6 +996,7 @@ mod tests {
             width: None,
             height: None,
             parts: Default::default(),
+            weak: false,
         }];
         assert_eq!(merge_normalized(vec![hits, other], 2).len(), 2);
     }
@@ -1003,6 +1018,7 @@ mod tests {
                 width: None,
                 height: None,
                 parts: Default::default(),
+                weak: false,
             },
             Hit {
                 path: "other.md".into(),
@@ -1014,6 +1030,7 @@ mod tests {
                 width: None,
                 height: None,
                 parts: Default::default(),
+                weak: false,
             },
         ];
         let image_hits = vec![
@@ -1027,6 +1044,7 @@ mod tests {
                 width: None,
                 height: None,
                 parts: Default::default(),
+                weak: false,
             },
             Hit {
                 path: "img.png".into(),
@@ -1038,6 +1056,7 @@ mod tests {
                 width: Some(1),
                 height: Some(1),
                 parts: Default::default(),
+                weak: false,
             },
         ];
         let merged = merge_normalized(vec![text_hits, image_hits], 10);
@@ -1073,6 +1092,7 @@ mod tests {
             width: None,
             height: None,
             parts: Default::default(),
+            weak: false,
         }
     }
 

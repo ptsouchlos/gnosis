@@ -11,6 +11,9 @@ use crate::workspace::{Workspace, expand_tilde};
 /// regardless of which branch prints.
 pub(crate) const HIT_INDENT: &str = "      ";
 
+/// Printed above the hits under their model's relevance floor.
+const WEAK_DIVIDER: &str = "    ── weak matches ──";
+
 /// Semantic search over the indexed content.
 #[derive(Debug, clap::Args)]
 pub struct SearchArgs {
@@ -174,7 +177,16 @@ pub fn execute(ws: &Workspace, args: SearchArgs) -> Result<()> {
     }
 
     let show_root = ws.global || ws.config.vaults.len() > 1;
-    for (i, hit) in hits.iter().enumerate() {
+    // Strong matches first, then the weak ones under a divider, each group in
+    // rank order: a weak hit is what had to rank somewhere, not an answer.
+    let (strong, weak): (Vec<&search::Hit>, Vec<&search::Hit>) = hits.iter().partition(|h| !h.weak);
+    if strong.is_empty() {
+        println!("No strong matches.");
+    }
+    for (i, hit) in strong.iter().chain(weak.iter()).enumerate() {
+        if i == strong.len() {
+            println!("{WEAK_DIVIDER}");
+        }
         let tag = if show_root {
             format!("[{}] ", root_label(&hit.source_root))
         } else {
