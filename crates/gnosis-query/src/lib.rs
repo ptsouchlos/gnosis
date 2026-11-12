@@ -57,6 +57,7 @@ pub fn run_query(
 ) -> Result<Vec<search::Hit>> {
     let mut per_space: Vec<Vec<search::Hit>> = Vec::with_capacity(spaces.len());
     for space in spaces.iter().copied() {
+        let floor = floor_for(store, space)?;
         let query_vec = embedder.embed_query(space, query)?;
         let mut dense = store.search_space(space, &query_vec, limit, filter)?;
 
@@ -69,7 +70,7 @@ pub fn run_query(
             // The title bonus is independent of the lexical channel, so it is
             // applied either way — `fuse_text_space` does it as part of fusing,
             // and the dense-only path does it here.
-            let ranked = if cfg.lexical {
+            let mut ranked = if cfg.lexical {
                 fuse_text_space(store, query, dense, limit, filter, cfg)?
             } else {
                 let terms = search::bm25::tokenize(query);
@@ -77,12 +78,77 @@ pub fn run_query(
                 let recency = recency_input(&dates, cfg);
                 search::boost_and_rank_with(dense, &terms, cfg.title_boost, recency.as_ref(), limit)
             };
+            if let Some(floor) = floor {
+                // `fuse_text_space` hands a query with no terms back as the
+                // dense ranking, unscaled; anything else it fused.
+                let fused = cfg.lexical && !search::bm25::tokenize(query).is_empty();
+                mark_weak(&mut ranked, floor, fused.then_some(cfg.dense_weight));
+            }
             per_space.push(ranked);
         } else {
+            if let Some(floor) = floor {
+                mark_weak(&mut dense, floor, None);
+            }
             per_space.push(dense);
         }
     }
+    // Before the merge, which rescales scores across spaces and leaves no
+    // cosine to hold to a floor.
     Ok(search::merge_normalized(per_space, limit))
+}
+
+/// The cosine under which a model's match is a weak one: what that model
+/// gives a query its index cannot answer.
+///
+/// Each model packs unrelated text at its own level, so this is a number per
+/// model, measured: on BEIR scifact and nfcorpus, the floor that keeps 95% of
+/// the best relevant hits above it, which leaves 76% of off-topic queries
+/// (bge-small) and 54% (multilingual-e5-small) with no strong hit at all. The
+/// figures are in the workspace's `docs/gnosis/relevance-floor.md`; change a
+/// value only with a new measurement. A model not listed has no floor and
+/// nothing it finds is called weak.
+pub fn relevance_floor(model: &str) -> Option<f32> {
+    match model {
+        "bge-small-en-v1.5" => Some(0.63),
+        "multilingual-e5-small" => Some(0.82),
+        _ => None,
+    }
+}
+
+/// The lexical score, normalized against BM25's ceiling, at which a hit's
+/// keywords alone make it strong: an exact-term match the embedder scores low
+/// is still an answer. Measured with the floors above.
+pub const STRONG_KEYWORDS: f32 = 0.5;
+
+/// The relevance floor of the model `space` is queried with, if it has one.
+fn floor_for(store: &dyn Store, space: Space) -> Result<Option<f32>> {
+    let key = match space {
+        Space::Text => "model.text",
+        // The query side of the image space: a text query goes through
+        // CLIP's text tower.
+        Space::Image => "model.image_text",
+    };
+    Ok(store.get_meta(key)?.as_deref().and_then(relevance_floor))
+}
+
+/// Mark the hits whose meaning is below `floor` and whose keywords match too
+/// little to make up for it.
+///
+/// `fused_weight` is the dense weight a fused ranking scaled each hit's parts
+/// by, or `None` when the parts are unscaled (no lexical channel, or a query
+/// with no terms), so the meaning is the cosine itself.
+fn mark_weak(hits: &mut [search::Hit], floor: f32, fused_weight: Option<f32>) {
+    for hit in hits {
+        let (cosine, keywords) = match fused_weight.map(|w| w.clamp(0.0, 1.0)) {
+            None => (hit.parts.meaning, 0.0),
+            // Keywords alone: meaning took no part, so there is nothing to
+            // hold to the floor.
+            Some(0.0) => continue,
+            Some(1.0) => (hit.parts.meaning, 0.0),
+            Some(w) => (hit.parts.meaning / w, hit.parts.keywords / (1.0 - w)),
+        };
+        hit.weak = cosine < floor && keywords < STRONG_KEYWORDS;
+    }
 }
 
 /// Add the notes whose file name carries every query term to the dense
@@ -211,6 +277,7 @@ pub fn fuse_text_space(
                 width: c.width,
                 height: c.height,
                 parts: Default::default(),
+                weak: false,
             }
         })
         .collect();
@@ -389,6 +456,9 @@ mod tests {
         corpus: Vec<(&'static str, &'static str)>,
         /// How often the vocabulary was walked.
         vocabulary_walks: std::cell::Cell<usize>,
+        /// The text space's model id, as `model.text` meta; `None` for an
+        /// index whose model has no relevance floor.
+        model: Option<&'static str>,
     }
 
     /// What `run_related` asks a store for, plus what it passed back out. The
@@ -425,7 +495,12 @@ mod tests {
             score,
             width: None,
             height: None,
-            parts: Default::default(),
+            // All of a dense hit is meaning, as `search::rank` leaves it.
+            parts: search::ScoreParts {
+                meaning: score,
+                ..Default::default()
+            },
+            weak: false,
         }
     }
 
@@ -525,8 +600,13 @@ mod tests {
         fn set_meta(&self, _k: &str, _v: &str) -> anyhow::Result<()> {
             unimplemented!("the pipeline does not write")
         }
-        fn get_meta(&self, _k: &str) -> anyhow::Result<Option<String>> {
-            unimplemented!("the pipeline does not read meta")
+        fn get_meta(&self, k: &str) -> anyhow::Result<Option<String>> {
+            Ok(match k {
+                "model.text" => self.model.map(str::to_string),
+                // No floor is measured for CLIP, so its id changes nothing.
+                "model.image_text" => None,
+                other => unimplemented!("the pipeline does not read {other}"),
+            })
         }
         fn stats(&self) -> anyhow::Result<Stats> {
             unimplemented!()
@@ -593,6 +673,7 @@ mod tests {
             related: None,
             corpus: Vec::new(),
             vocabulary_walks: Default::default(),
+            model: None,
             lexical: LexicalMatches {
                 stats: search::bm25::CorpusStats {
                     total_chunks: 100,
@@ -774,6 +855,7 @@ mod tests {
             related: None,
             corpus: Vec::new(),
             vocabulary_walks: Default::default(),
+            model: None,
             lexical: LexicalMatches {
                 stats: search::bm25::CorpusStats {
                     total_chunks: 0,
@@ -822,6 +904,7 @@ mod tests {
             related: Some(related),
             corpus: Vec::new(),
             vocabulary_walks: Default::default(),
+            model: None,
             lexical: LexicalMatches {
                 stats: search::bm25::CorpusStats {
                     total_chunks: 0,
@@ -1135,5 +1218,82 @@ mod tests {
     fn a_short_unknown_term_is_not_expanded() {
         let s = corpus_store(vec![("a.md", "the cat sat")]);
         assert!(keyword_search(&s, "cot", &fuzzy_config(true)).is_empty());
+    }
+
+    /// A store whose index was built with `model`.
+    fn store_with_model(
+        model: &'static str,
+        dense: Vec<search::Hit>,
+        candidates: Vec<Candidate>,
+    ) -> FakeStore {
+        FakeStore {
+            model: Some(model),
+            ..store(dense, candidates)
+        }
+    }
+
+    fn weak_paths(hits: &[search::Hit]) -> Vec<&str> {
+        hits.iter()
+            .filter(|h| h.weak)
+            .map(|h| h.path.as_str())
+            .collect()
+    }
+
+    fn query(s: &FakeStore, text: &str, lexical: bool) -> Vec<search::Hit> {
+        run_query(
+            s,
+            &mut FixedVector(vec![1.0, 0.0]),
+            text,
+            &[Space::Text],
+            10,
+            &TextQuery::default(),
+            &config(lexical),
+        )
+        .unwrap()
+    }
+
+    /// The floor is on the raw cosine: bge-small's is 0.63, so 0.60 is weak
+    /// and 0.70 is not.
+    #[test]
+    fn meaning_below_the_model_s_floor_is_weak() {
+        let s = store_with_model(
+            "bge-small-en-v1.5",
+            vec![hit("answer.md", 0.70), hit("noise.md", 0.60)],
+            Vec::new(),
+        );
+        assert_eq!(weak_paths(&query(&s, "anything", false)), ["noise.md"]);
+    }
+
+    /// Fused, a hit's meaning is scaled by the dense weight; the floor still
+    /// applies to the cosine underneath, and keywords that match well make
+    /// up for meaning that does not.
+    #[test]
+    fn a_strong_keyword_match_is_not_weak_however_low_its_meaning() {
+        let s = store_with_model(
+            "bge-small-en-v1.5",
+            vec![hit("named.md", 0.50), hit("noise.md", 0.60)],
+            vec![candidate("named.md", "hnsw hnsw hnsw graph")],
+        );
+        let hits = query(&s, "hnsw", true);
+        assert_eq!(weak_paths(&hits), ["noise.md"], "{hits:#?}");
+    }
+
+    /// A query with no terms falls back to the dense ranking unscaled, so its
+    /// meaning is the cosine itself: 0.60 is weak, not 0.60 / 0.9.
+    #[test]
+    fn a_query_with_no_terms_is_judged_on_its_raw_cosine() {
+        let s = store_with_model(
+            "bge-small-en-v1.5",
+            vec![hit("answer.md", 0.70), hit("noise.md", 0.60)],
+            Vec::new(),
+        );
+        assert_eq!(weak_paths(&query(&s, "?!", true)), ["noise.md"]);
+    }
+
+    /// An unmeasured model has no floor, and nothing is called weak.
+    #[test]
+    fn a_model_with_no_measured_floor_flags_nothing() {
+        let s = store_with_model("all-MiniLM-L6-v2", vec![hit("a.md", 0.10)], Vec::new());
+        assert!(weak_paths(&query(&s, "anything", false)).is_empty());
     }
 }
