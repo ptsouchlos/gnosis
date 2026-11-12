@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "chunker"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "pulldown-cmark",
  "serde",
@@ -882,7 +882,7 @@ checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
 
 [[package]]
 name = "embed"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -957,7 +957,7 @@ dependencies = [
 
 [[package]]
 name = "eval"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "exr"
@@ -1080,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "fs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
 ]
@@ -1226,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "gnosis-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1256,7 +1256,7 @@ dependencies = [
 
 [[package]]
 name = "gnosis-extract"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "js-sys",
@@ -1268,7 +1268,7 @@ dependencies = [
 
 [[package]]
 name = "gnosis-wasm"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "index",
@@ -1665,7 +1665,7 @@ checksum = "89194689a993ab15268672e99e7b0e19da2da3268ac682e8f02d29d4d1434cd7"
 
 [[package]]
 name = "index"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2313,7 +2313,7 @@ dependencies = [
 
 [[package]]
 name = "parse"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "pdf-extract",
@@ -2470,7 +2470,7 @@ dependencies = [
 
 [[package]]
 name = "progress"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "pulldown-cmark"
@@ -2531,7 +2531,7 @@ dependencies = [
 
 [[package]]
 name = "query"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "search",
@@ -2935,7 +2935,7 @@ checksum = "d68f2ec51b097e4c1a75b681a8bec621909b5e91f15bb7b840c4f2f7b01148b2"
 
 [[package]]
 name = "search"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
 ]
@@ -3131,7 +3131,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "store"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3722,7 +3722,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "walk"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
 ]
