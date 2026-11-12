@@ -64,6 +64,9 @@ struct AddedPdf {
     /// True when the PDF was carried over unchanged, so `setPdfPages` is not
     /// needed and nothing needs embedding.
     reused: bool,
+    /// The title to embed for the proxy, if one is still owed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
 }
 
 /// What `setPdfPages` hands back to embed.
@@ -175,6 +178,7 @@ impl Builder {
             .map_err(anyhow_err)?;
         to_js(&AddedPdf {
             reused: added.reused,
+            title: added.title,
         })
     }
 
