@@ -30,7 +30,7 @@ pub fn parse_pdf(bytes: &[u8]) -> Result<ParsedPdf> {
     let pages: Vec<(u32, String)> = pages
         .into_iter()
         .enumerate()
-        .map(|(i, text)| (i as u32 + 1, text))
+        .map(|(i, text)| (i as u32 + 1, join_letter_spaced(&text)))
         .collect();
 
     if pages.iter().all(|(_, text)| text.trim().is_empty()) {
@@ -41,6 +41,59 @@ pub fn parse_pdf(bytes: &[u8]) -> Result<ParsedPdf> {
         title: metadata_title(bytes).unwrap_or_default(),
         pages,
     })
+}
+
+/// Give a letter-spaced line its words back.
+///
+/// A PDF that places every glyph on its own — a code listing in a monospace
+/// font is the usual case — extracts as `i n t   m a i n`: one space between
+/// letters, more between words. Chunked as is, the gaps collapse to single
+/// spaces and the line becomes a string of letters that embeds as noise and
+/// sits close to every query, so it ranks for queries it has nothing to do
+/// with. In such a line a single space is no gap at all and a longer run is
+/// a word break.
+///
+/// A line counts as letter-spaced when at least four in five of its
+/// space-separated pieces are one character long, there are at least six of
+/// them, and no piece holds three letters or more: prose with a stray initial,
+/// an inline `x = y + z` or a table of contents' dot leaders stays as written.
+/// Leading indentation is kept. A capital split from the rest of its
+/// word ("D avid") is a different defect and is left alone: without a
+/// dictionary it cannot be told from "A cat".
+fn join_letter_spaced(page: &str) -> String {
+    page.split('\n')
+        .map(join_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn join_line(line: &str) -> String {
+    let body = line.trim_start_matches(' ');
+    let pieces: Vec<&str> = body.split(' ').filter(|p| !p.is_empty()).collect();
+    let singles = pieces.iter().filter(|p| p.chars().count() == 1).count();
+    // A piece with a word in it means the spaces in this line are real, however
+    // many single characters it also holds: a table of contents' dot leaders.
+    let has_word = pieces
+        .iter()
+        .any(|p| p.chars().filter(|c| c.is_alphabetic()).count() >= 3);
+    if has_word || singles < 6 || singles * 5 < pieces.len() * 4 {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len());
+    out.push_str(&line[..line.len() - body.len()]);
+    let mut spaces = 0;
+    for c in body.chars() {
+        if c == ' ' {
+            spaces += 1;
+            continue;
+        }
+        if spaces >= 2 {
+            out.push(' ');
+        }
+        spaces = 0;
+        out.push(c);
+    }
+    out
 }
 
 /// Run `pdf_extract`'s page extraction, turning a panic into an error.
@@ -159,5 +212,45 @@ mod tests {
     #[test]
     fn an_empty_string_decodes_to_empty() {
         assert_eq!(decode_pdf_string(b""), "");
+    }
+
+    /// Lines from a code listing whose every glyph is placed on its own: one
+    /// space between letters, three between words.
+    #[test]
+    fn a_letter_spaced_line_gets_its_words_back() {
+        assert_eq!(
+            join_letter_spaced("i n t   m a i n ( )   {"),
+            "int main() {"
+        );
+        assert_eq!(
+            join_letter_spaced("        a u t o   R   =   s t d : : c o s ( p i / 4 ) ;"),
+            "        auto R = std::cos(pi/4);",
+        );
+    }
+
+    #[test]
+    fn each_line_is_judged_on_its_own() {
+        let page = "We'll test out these changes with a simple scene.\n\nh i t t a b l e _ l i s t   w o r l d ;\n";
+        assert_eq!(
+            join_letter_spaced(page),
+            "We'll test out these changes with a simple scene.\n\nhittable_list world;\n",
+        );
+    }
+
+    /// Ordinary text keeps every space, even with single letters in it.
+    #[test]
+    fn prose_and_inline_math_are_left_alone() {
+        for line in [
+            "Version 4.0.0, 2024-07-26",
+            "where x = y + z and a is a constant",
+            "1  Overview",
+            "Peter Shirley, Trevor D avid B lack",
+            "I am a b c",
+            // A table of contents' dot leaders are single characters too.
+            "2.4 The pop and steal functions. . . . . . . . . . . . . . . . 7",
+            "Digital Artist – 9 9 9 9 1 2 3 4",
+        ] {
+            assert_eq!(join_letter_spaced(line), line);
+        }
     }
 }
