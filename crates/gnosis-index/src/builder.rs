@@ -1242,8 +1242,7 @@ mod tests {
     fn a_reused_pdf_whose_index_had_no_image_space_owes_its_title_proxy() {
         let mut base = ArtifactBuilder::new(spec(false));
         base.add_pdf("notes/doc.pdf", "abc", 10).unwrap();
-        base
-            .set_pdf_pages("notes/doc.pdf", "", &[(1, "the body".to_string())])
+        base.set_pdf_pages("notes/doc.pdf", "", &[(1, "the body".to_string())])
             .unwrap();
         base.set_vectors("notes/doc.pdf", &[1.0, 0.0]).unwrap();
         let built = base.finish(1).unwrap();
@@ -1257,9 +1256,7 @@ mod tests {
             "the resolved title, owed even though the PDF is reused"
         );
         assert_eq!(rebuild.pending(), 1, "its title proxy is owed");
-        let err = rebuild
-            .finish(2)
-            .expect_err("the proxy is still owed");
+        let err = rebuild.finish(2).expect_err("the proxy is still owed");
         assert!(err.to_string().contains("still waiting"), "{err}");
 
         let mut paying = ArtifactBuilder::reusing(spec(true), open(&built)).unwrap();
