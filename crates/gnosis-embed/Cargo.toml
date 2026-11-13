@@ -11,4 +11,4 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
-toml = "0.8"
+toml = "1.2"
