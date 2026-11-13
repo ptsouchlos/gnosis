@@ -14,8 +14,8 @@ jobs:
   release:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: ptsouchlos/infra/.github/actions/setup-rust@v1
+      - uses: actions/checkout@v7.0.1
+      - uses: ptsouchlos/infra/.github/actions/setup-rust@v1.8.0
         with:
           components: ""
           targets: wasm32-unknown-unknown
@@ -55,7 +55,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - id: app
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@v3.3.0
         with:
           app-id: ${{ vars.INFRA_BOT_APP_ID }}
           private-key: ${{ secrets.INFRA_BOT_PRIVATE_KEY }}
