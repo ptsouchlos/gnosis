@@ -19,11 +19,9 @@ jobs:
         with:
           components: ""
           targets: wasm32-unknown-unknown
-      - name: Check the tag against the workspace version
-        shell: bash
-        env:
-          TAG: ${{ github.ref_name }}
-        run: script/release/check-version.sh "$TAG"
+      - uses: ptsouchlos/infra/.github/actions/check-version@v1
+        with:
+          require-tag: "true"
       - name: Install the wasm tools
         shell: bash
         run: script/ci/install-wasm-tools.sh "$RUNNER_TEMP/wasm-tools"
