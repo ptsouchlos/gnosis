@@ -6,6 +6,7 @@ workflows:
     '.github/workflows/ci.yml':
         - 'actions/checkout@v7.0.1'
         - 'ptsouchlos/infra@v1.8.0'
+    '.github/workflows/crap.yml': []
     '.github/workflows/infra-update.yml': []
     '.github/workflows/release.yml':
         - 'actions/checkout@v7.0.1'
