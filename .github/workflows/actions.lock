@@ -11,7 +11,9 @@ workflows:
     '.github/workflows/release.yml':
         - 'actions/checkout@v7.0.1'
         - 'actions/create-github-app-token@v3.3.0'
+        - 'ptsouchlos/infra@v1'
         - 'ptsouchlos/infra@v1.8.0'
+    '.github/workflows/rust-advisories.yml': []
     '.github/workflows/verify-lockfile.yml':
         - 'actions/checkout@v7.0.1'
 dependencies:
@@ -37,6 +39,11 @@ dependencies:
         repo_id: 258510356
         uses:
             - 'extractions/setup-crate@0551596312d4008a6dfbc4d3c38fa20eaef46d2d'
+    'ptsouchlos/infra@v1':
+        ref: 'v1'
+        commit: 'sha1-3a9101079fe67a0bfe77c220f3ffbe20c55a7d96'
+        owner_id: 6591180
+        repo_id: 1270714317
     'ptsouchlos/infra@v1.8.0':
         ref: 'v1.8.0'
         commit: 'sha1-5d7323ded6e542c428b3a575085f99150df41bb8'

@@ -1,0 +1,13 @@
+name: Rust advisories
+
+on:
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    uses: ptsouchlos/infra/.github/workflows/rust-advisories.yml@v1
