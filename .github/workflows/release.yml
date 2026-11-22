@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: ptsouchlos/infra/.github/actions/setup-rust@v1.8.0
+      - uses: ptsouchlos/infra/.github/actions/setup-rust@v1.10.0
         with:
           components: ""
           targets: wasm32-unknown-unknown
