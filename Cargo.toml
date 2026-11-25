@@ -46,7 +46,7 @@ blake3 = "1.8.5"
 # zlib binding so the same code compresses natively and decompresses in wasm,
 # and held at the version `image` already pulls in so the binary carries one
 # copy rather than two.
-miniz_oxide = "0.8.9"
+miniz_oxide = "0.9.1"
 pdf-extract = "0.12.1"
 pulldown-cmark = "0.13.4"
 serde = { version = "1", features = ["derive"] }
