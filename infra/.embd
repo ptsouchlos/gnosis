@@ -1,6 +1,6 @@
 [metadata]
 remote = "https://github.com/ptsouchlos/infra"
-commit_hash = "bd388ccd8b65e9ff786b9379ebe66491e97ac562"
+commit_hash = "a9a3b4a18ee2669fd5c3701372bb1af4aae71681"
 allow_untracked = true
 include = [
     "just/**",
@@ -8,7 +8,7 @@ include = [
 ]
 
 [metadata.tracking]
-tag = "v1.11.0"
+tag = "v1.11.1"
 
 [files]
 "just/shells.just" = "sha256:ca031066da941b192b18859a4c8ebda1ecfe91ff14f57fe31489c6e83cb3bfa7"
